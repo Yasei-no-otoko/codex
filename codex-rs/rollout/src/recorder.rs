@@ -1104,7 +1104,10 @@ pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Resu
         .map_err(|err| IoError::other(format!("invalid session metadata history_mode: {err}")))
 }
 
-fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
+/// Removes retired `ghost_snapshot` response items before rollout-line deserialization.
+///
+/// Returns `true` when the entire line is a top-level ghost snapshot and should be skipped.
+pub fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
     match value.get("type").and_then(Value::as_str) {
         Some("response_item") => value
             .get("payload")

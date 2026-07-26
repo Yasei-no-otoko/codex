@@ -189,14 +189,20 @@ fn scan_model_context_segment(
         Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
         None => ReverseJsonlScanner::new(file)?,
     };
-    while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
-        let ScanOutcome::Parsed(line) = outcome else {
+    while let Some(outcome) = scanner.scan_next::<serde_json::Value>()? {
+        let ScanOutcome::Parsed(mut value) = outcome else {
             continue;
         };
-        // Each physical segment contributes only its local delta. Its head metadata is replaced
-        // with the requested thread's canonical SessionMeta after replay.
+        if codex_rollout::strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        let Ok(line) = serde_json::from_value::<RolloutLine>(value) else {
+            continue;
+        };
+        // Metadata updates can append SessionMeta records at the physical tail. Ignore every
+        // segment marker; the requested thread's canonical head metadata is injected after replay.
         if matches!(&line.item, RolloutItem::SessionMeta(_)) {
-            break;
+            continue;
         }
         match scan.push(line.item) {
             ModelContextScanProgress::Continue => {}
