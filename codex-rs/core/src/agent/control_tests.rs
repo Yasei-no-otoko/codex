@@ -60,6 +60,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
@@ -148,6 +149,58 @@ fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
         phase,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+fn user_text_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn legacy_turn_started(turn_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: turn_id.to_string(),
+        trace_id: None,
+        started_at: None,
+        model_context_window: Some(128_000),
+        collaboration_mode_kind: Default::default(),
+    }))
+}
+
+fn legacy_user_message_event(message: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: message.to_string(),
+        ..Default::default()
+    }))
+}
+
+fn legacy_turn_complete(turn_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: turn_id.to_string(),
+        last_agent_message: None,
+        error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    }))
+}
+
+fn legacy_compacted(message: &str, replacement_text: &str) -> RolloutItem {
+    RolloutItem::Compacted(CompactedItem {
+        message: message.to_string(),
+        replacement_history: Some(vec![user_text_message(replacement_text)]),
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    })
 }
 
 #[test]
@@ -1153,6 +1206,81 @@ async fn ephemeral_spawn_does_not_persist_agent_graph_edge() {
     assert!(
         harness.manager.get_thread(child_thread_id).await.is_ok(),
         "ephemeral child should remain live"
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_last_n_from_legacy_parent_keeps_turns_before_compaction() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let turn_context = parent_thread.session.new_default_turn().await;
+    let latest_turn_id = turn_context.sub_id.clone();
+    let latest_turn_context = turn_context.to_turn_context_item();
+    let mut older_turn_context = latest_turn_context.clone();
+    older_turn_context.turn_id = Some("older-turn".to_string());
+    let parent_spawn_call_id = "spawn-call-legacy-last-n".to_string();
+    parent_thread
+        .session
+        .persist_rollout_items(&[
+            legacy_turn_started("older-turn"),
+            RolloutItem::ResponseItem(user_text_message("first parent turn")),
+            legacy_user_message_event("first parent turn"),
+            RolloutItem::TurnContext(older_turn_context),
+            legacy_compacted("checkpoint", "first turn summary"),
+            legacy_turn_complete("older-turn"),
+            legacy_turn_started(&latest_turn_id),
+            RolloutItem::ResponseItem(user_text_message("second parent turn")),
+            legacy_user_message_event("second parent turn"),
+            RolloutItem::TurnContext(latest_turn_context),
+            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
+            legacy_turn_complete(&latest_turn_id),
+        ])
+        .await;
+    parent_thread.ensure_rollout_materialized().await;
+    parent_thread
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+
+    let child_thread_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                fork_mode: Some(SpawnAgentForkMode::LastNTurns(2)),
+                ..Default::default()
+            },
+        )
+        .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("flush child rollout");
+    let response_items = std::fs::read_to_string(
+        child_thread
+            .rollout_path()
+            .expect("child rollout should exist"),
+    )
+    .expect("read child rollout")
+    .lines()
+    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse rollout line"))
+    .filter_map(|line| match line.item {
+        RolloutItem::ResponseItem(item) => Some(item),
+        _ => None,
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        history_contains_text(&response_items, "first parent turn"),
+        "legacy last-N fork should load turns that precede the latest compaction"
+    );
+    assert!(
+        history_contains_text(&response_items, "second parent turn"),
+        "legacy last-N fork should retain the newest requested turn"
     );
 }
 
