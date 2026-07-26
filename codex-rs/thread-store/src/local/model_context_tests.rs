@@ -16,9 +16,11 @@ use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
@@ -79,6 +81,97 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
     assert!(context.items.iter().any(|item| {
         matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
     }));
+}
+
+#[tokio::test]
+async fn loads_latest_legacy_checkpoint_without_window_metadata() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1008);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-07",
+        uuid,
+        [
+            turn_started("turn-1"),
+            legacy_user_message("older turn"),
+            turn_context(home.path(), "turn-1"),
+            legacy_compacted("older checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+            turn_started("turn-2"),
+            legacy_user_message("latest turn"),
+            turn_context(home.path(), "turn-2"),
+            legacy_compacted("latest checkpoint", Some(Vec::new())),
+            turn_complete("turn-2"),
+        ],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load legacy model context");
+    assert!(context.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::Compacted(compacted)
+                if compacted.message == "latest checkpoint"
+                    && compacted.window_number == Some(2)
+        )
+    }));
+    assert!(!context.items.iter().any(|item| {
+        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "older checkpoint")
+    }));
+    assert!(context.items.iter().any(|item| {
+        matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
+    }));
+}
+
+#[tokio::test]
+async fn paginated_checkpoint_without_window_number_falls_back_to_full_history() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1012);
+    let path = write_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-00-11",
+        uuid,
+        [
+            turn_started("turn-1"),
+            user_message("turn"),
+            completed_user_message("turn-1", "turn"),
+            turn_context(home.path(), "turn-1"),
+            legacy_compacted("checkpoint without window number", Some(Vec::new())),
+            turn_complete("turn-1"),
+        ],
+    );
+
+    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+}
+
+#[tokio::test]
+async fn legacy_rollback_after_checkpoint_falls_back_to_full_history() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1010);
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-09",
+        uuid,
+        [
+            turn_started("turn-1"),
+            legacy_user_message("turn"),
+            turn_context(home.path(), "turn-1"),
+            legacy_compacted("checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ],
+    );
+
+    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
 }
 
 #[tokio::test]
@@ -429,6 +522,19 @@ fn write_paginated_rollout<const N: usize>(
     path
 }
 
+fn write_legacy_rollout<const N: usize>(
+    home: &Path,
+    timestamp: &str,
+    uuid: Uuid,
+    items: [RolloutItem; N],
+) -> PathBuf {
+    let path =
+        write_session_file_with_history_mode(home, timestamp, uuid, ThreadHistoryMode::Legacy)
+            .expect("write session file");
+    append_items(path.as_path(), items);
+    path
+}
+
 fn write_ordinaled_paginated_rollout<const N: usize>(
     home: &Path,
     timestamp: &str,
@@ -580,6 +686,13 @@ fn user_message(message: &str) -> RolloutItem {
     )
 }
 
+fn legacy_user_message(message: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: message.to_string(),
+        ..Default::default()
+    }))
+}
+
 fn contextual_user_message() -> RolloutItem {
     user_message("<environment_context>context only</environment_context>")
 }
@@ -655,4 +768,12 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
         previous_window_id: None,
         window_id: None,
     })
+}
+
+fn legacy_compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
+    let RolloutItem::Compacted(mut compacted) = compacted(message, replacement_history) else {
+        unreachable!("compacted helper always returns a compacted item");
+    };
+    compacted.window_number = None;
+    RolloutItem::Compacted(compacted)
 }

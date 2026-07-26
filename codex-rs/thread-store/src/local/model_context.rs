@@ -1,4 +1,7 @@
+use std::fs::File;
 use std::io;
+use std::path::Path;
+use std::path::PathBuf;
 
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMetaLine;
@@ -25,14 +28,14 @@ mod tests;
 
 /// Loads rollout items needed to reconstruct the latest model-visible context.
 ///
-/// Paginated JSONL rollouts use a reverse scan. When it finds both a usable replacement-
-/// history checkpoint and the completed user-turn context needed for resume metadata, the returned
-/// replay starts with the canonical `SessionMeta` followed by that newest suffix. When no
-/// bounded cutoff is available, the scan continues to the beginning and returns the complete
-/// replay it already accumulated.
+/// Plain Legacy JSONL rollouts use a reverse scan. When it finds both a usable replacement-history
+/// checkpoint and the completed user-turn context needed for resume metadata, the returned replay
+/// starts with the canonical head `SessionMeta` followed by that newest suffix. When no bounded
+/// cutoff is available, the scan continues to the beginning and returns the complete replay it
+/// already accumulated.
 ///
-/// Compressed segments are decoded before applying their original JSONL offsets. Legacy rollouts
-/// keep the existing full-history path.
+/// Compressed Legacy rollouts keep the full-history path. Paginated rollouts retain their
+/// lineage-aware reverse scan, including decoded compressed segments.
 pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
@@ -65,17 +68,44 @@ pub(super) async fn load_latest_model_context(
         });
     }
 
-    let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated) {
-        let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
-        scan_model_context_from_lineage(lineage, session_meta).await?
-    } else {
-        read_thread::load_history_items(path.as_path()).await?
+    let is_compressed = path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"));
+    let items = match session_meta.meta.history_mode {
+        ThreadHistoryMode::Legacy if is_compressed => {
+            read_thread::load_history_items(path.as_path()).await?
+        }
+        ThreadHistoryMode::Legacy => scan_model_context_from_rollout(path, session_meta).await?,
+        ThreadHistoryMode::Paginated => {
+            let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+            scan_model_context_from_lineage(lineage, session_meta).await?
+        }
     };
 
     Ok(StoredModelContext {
         thread_id: params.thread_id,
         items,
     })
+}
+
+async fn scan_model_context_from_rollout(
+    rollout_path: PathBuf,
+    session_meta: SessionMetaLine,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_model_context_from_rollout_blocking(rollout_path.as_path(), session_meta)
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to join model context scan: {err}"),
+    })?;
+    match scan {
+        Ok(items) => Ok(items),
+        Err(err) => Err(ThreadStoreError::Internal {
+            message: format!("failed to scan legacy model context rollout: {err}"),
+        }),
+    }
 }
 
 /// Loads startup context from a fork's frozen inherited prefix.
@@ -130,7 +160,7 @@ fn scan_model_context_from_lineage_blocking(
     lineage: &RolloutLineage,
     session_meta: SessionMetaLine,
 ) -> io::Result<Vec<RolloutItem>> {
-    let mut scan = ModelContextScan::default();
+    let mut scan = ModelContextScan::new(ThreadHistoryMode::Paginated);
     'segments: for segment in lineage.segments().iter().rev() {
         let file = codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
         let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
@@ -153,10 +183,54 @@ fn scan_model_context_from_lineage_blocking(
         }
     }
 
+    Ok(finish_model_context_scan(scan, session_meta))
+}
+
+fn scan_model_context_from_rollout_blocking(
+    rollout_path: &Path,
+    session_meta: SessionMetaLine,
+) -> io::Result<Vec<RolloutItem>> {
+    let mut scan = ModelContextScan::new(ThreadHistoryMode::Legacy);
+    scan_model_context_segment(&mut scan, rollout_path, /*end_byte_offset*/ None)?;
+
+    Ok(finish_model_context_scan(scan, session_meta))
+}
+
+fn scan_model_context_segment(
+    scan: &mut ModelContextScan,
+    rollout_path: &Path,
+    end_byte_offset: Option<u64>,
+) -> io::Result<bool> {
+    let file = File::open(rollout_path)?;
+    let mut scanner = match end_byte_offset {
+        Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
+        None => ReverseJsonlScanner::new(file)?,
+    };
+    while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
+        let ScanOutcome::Parsed(line) = outcome else {
+            continue;
+        };
+        // Each physical segment contributes only its local delta. Its head metadata is replaced
+        // with the requested thread's canonical SessionMeta after replay.
+        if matches!(&line.item, RolloutItem::SessionMeta(_)) {
+            break;
+        }
+        match scan.push(line.item) {
+            ModelContextScanProgress::Continue => {}
+            ModelContextScanProgress::Complete => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+fn finish_model_context_scan(
+    scan: ModelContextScan,
+    session_meta: SessionMetaLine,
+) -> Vec<RolloutItem> {
     let canonical_meta = session_meta.clone();
     let mut items = scan.finish(session_meta);
     if !matches!(items.first(), Some(RolloutItem::SessionMeta(_))) {
         items.insert(0, RolloutItem::SessionMeta(canonical_meta));
     }
-    Ok(items)
+    items
 }
