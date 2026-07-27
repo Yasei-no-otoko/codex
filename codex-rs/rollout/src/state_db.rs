@@ -417,18 +417,39 @@ pub async fn list_threads_db(
     };
     match page {
         Ok(mut page) => {
-            // Relationship-filtered listings intentionally treat persisted state as authoritative.
-            if relation_filter.is_some() {
-                return Some(page);
-            }
             let mut valid_items = Vec::with_capacity(page.items.len());
             for item in page.items {
-                if let Some(existing_path) =
-                    crate::compression::existing_rollout_path(item.rollout_path.as_path()).await
-                {
-                    let mut item = item;
-                    item.rollout_path = existing_path;
-                    valid_items.push(item);
+                let existing_path =
+                    crate::compression::existing_rollout_path(item.rollout_path.as_path()).await;
+                if let Some(existing_path) = existing_path {
+                    let visible = match crate::list::state_db_rollout_path_is_visible(
+                        sqlite.home(),
+                        item.id,
+                        item.rollout_path.as_path(),
+                    )
+                    .await
+                    {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(err) => {
+                            warn!(
+                                "state db path visibility check failed for thread {}: {}",
+                                item.id, err
+                            );
+                            false
+                        }
+                    };
+                    if visible {
+                        let mut item = item;
+                        item.rollout_path = existing_path;
+                        valid_items.push(item);
+                    } else {
+                        warn!(
+                            "state db list_threads dropped hidden thread {}: {}",
+                            item.id,
+                            item.rollout_path.display()
+                        );
+                    }
                 } else {
                     warn!(
                         "state db list_threads returned stale rollout path for thread {}: {}",

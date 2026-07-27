@@ -28,6 +28,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_state::Phase2JobClaimOutcome;
 use codex_utils_absolute_path::test_support::PathExt;
@@ -746,6 +748,24 @@ async fn seed_stage1_candidate(
     let line = RolloutLine {
         timestamp: updated_at.to_rfc3339(),
         ordinal: None,
+        item: RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: thread_id.into(),
+                id: thread_id,
+                timestamp: updated_at.to_rfc3339(),
+                cwd: codex_home.to_path_buf(),
+                originator: "test".to_string(),
+                cli_version: "test".to_string(),
+                source: SessionSource::Cli,
+                model_provider: Some("test-provider".to_string()),
+                ..Default::default()
+            },
+            git: None,
+        }),
+    };
+    let user_line = RolloutLine {
+        timestamp: updated_at.to_rfc3339(),
+        ordinal: None,
         item: RolloutItem::ResponseItem(ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -756,8 +776,9 @@ async fn seed_stage1_candidate(
             internal_chat_message_metadata_passthrough: None,
         }),
     };
-    let jsonl = serde_json::to_string(&line)?;
-    tokio::fs::write(&rollout_path, format!("{jsonl}\n")).await?;
+    let metadata_jsonl = serde_json::to_string(&line)?;
+    let user_jsonl = serde_json::to_string(&user_line)?;
+    tokio::fs::write(&rollout_path, format!("{metadata_jsonl}\n{user_jsonl}\n")).await?;
 
     let mut metadata_builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,

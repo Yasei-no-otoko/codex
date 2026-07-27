@@ -64,7 +64,15 @@ pub(super) async fn load_latest_model_context(
         .file_name()
         .and_then(|file_name| file_name.to_str())
         .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"));
-    let items = if is_compressed {
+    let items = if session_meta.meta.history_base.is_some() {
+        // A reference may itself be compressed. Resolve and materialize every physical segment
+        // under the shared writer locks before scanning so cold resume never falls back to the
+        // child-only compressed file.
+        let (lineage, _writer_guards) = store
+            .resolve_rollout_lineage_for_reference_locked(params.thread_id)
+            .await?;
+        scan_model_context_from_lineage(lineage, session_meta).await?
+    } else if is_compressed {
         read_thread::load_history_items(path.as_path()).await?
     } else {
         match session_meta.meta.history_mode {
@@ -155,7 +163,7 @@ fn scan_model_context_from_lineage_blocking(
     lineage: &RolloutLineage,
     session_meta: SessionMetaLine,
 ) -> io::Result<Vec<RolloutItem>> {
-    let mut scan = ModelContextScan::new(ThreadHistoryMode::Paginated);
+    let mut scan = ModelContextScan::new(lineage.history_mode());
     for segment in lineage.segments().iter().rev() {
         if scan_model_context_segment(
             &mut scan,

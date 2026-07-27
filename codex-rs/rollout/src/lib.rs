@@ -19,6 +19,7 @@ pub(crate) mod search;
 pub(crate) mod session_index;
 mod sqlite_metrics;
 pub mod state_db;
+mod thread_writer_lock;
 
 pub(crate) use codex_protocol::protocol;
 
@@ -62,6 +63,7 @@ pub use list::find_thread_path_by_id_str;
 pub use list::find_thread_path_by_id_str as find_conversation_path_by_id_str;
 pub use list::get_threads;
 pub use list::get_threads_in_root;
+pub use list::is_rollout_path_managed;
 pub use list::parse_cursor;
 pub use list::read_head_for_summary;
 pub use list::read_session_meta_line;
@@ -93,6 +95,12 @@ pub use session_index::find_thread_names_by_ids;
 pub use session_index::remove_thread_name_entries;
 pub use state_db::StateDbHandle;
 pub use state_db::sqlite_telemetry_recorder;
+pub use thread_writer_lock::THREAD_WRITER_COORDINATION_LOCK_FILE;
+pub use thread_writer_lock::THREAD_WRITER_LOCK_DIR;
+pub use thread_writer_lock::THREAD_WRITER_TOPOLOGY_LOCK_FILE;
+pub use thread_writer_lock::ThreadWriterLockCoordinator;
+pub use thread_writer_lock::ThreadWriterLockGuard;
+pub use thread_writer_lock::ThreadWriterTopologyLockGuard;
 
 #[cfg(test)]
 mod tests;

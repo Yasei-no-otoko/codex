@@ -420,6 +420,8 @@ pub(crate) enum ForkPersistence {
     Referenced {
         history_base: Option<HistoryPosition>,
         inherited_item_count: usize,
+        inherited_preview: Option<String>,
+        inherited_first_user_message: Option<String>,
     },
 }
 

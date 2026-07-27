@@ -32,9 +32,10 @@ pub enum ModelContextScanProgress {
 /// the complete replay and so we can return that directly.
 ///
 /// Legacy compactions did not persist a `window_number`. After finding a safe cutoff, the scanner
-/// therefore continues to the beginning without retaining older items, counts the discarded
-/// compactions, and writes that count onto the surviving checkpoint. This preserves the legacy
-/// auto-compaction ordinal without copying superseded replacement histories.
+/// therefore continues to the beginning without retaining older items, counts the scanned compacted
+/// records, and writes that total (including the surviving checkpoint itself) onto the surviving
+/// checkpoint. This preserves the legacy auto-compaction ordinal without copying superseded
+/// replacement histories.
 ///
 /// `TurnContextItem` does not identify whether it came from a user turn, so one only counts after
 /// the same turn also proves a user-turn boundary: a paginated

@@ -185,6 +185,16 @@ impl MemoryStartupContext {
         self.thread_id
     }
 
+    pub(crate) async fn read_thread_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Vec<codex_protocol::protocol::RolloutItem>> {
+        Ok(self
+            .thread_manager
+            .read_stored_thread_history(thread_id, /*include_archived*/ true)
+            .await?)
+    }
+
     pub(crate) fn state_db(&self) -> Option<Arc<StateRuntime>> {
         self.thread.state_db()
     }

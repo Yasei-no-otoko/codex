@@ -4351,6 +4351,8 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            preview: None,
+            first_user_message: None,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
@@ -7172,6 +7174,8 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            preview: None,
+            first_user_message: None,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
@@ -7251,6 +7255,8 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            preview: None,
+            first_user_message: None,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
@@ -9650,6 +9656,8 @@ async fn attach_in_memory_thread_store(
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            preview: None,
+            first_user_message: None,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),

@@ -96,8 +96,18 @@ pub struct CreateThreadParams {
     pub multi_agent_version: Option<MultiAgentVersion>,
     /// Persisted thread history contract selected when the thread was created.
     pub history_mode: ThreadHistoryMode,
-    /// Exclusive prefix of another paginated rollout inherited by this thread.
+    /// Exclusive prefix of another rollout inherited by this thread.
+    ///
+    /// Legacy references set `end_ordinal_exclusive` to the documented `0`
+    /// sentinel; their byte offset is authoritative. Paginated references keep
+    /// the ordinal and byte boundary pair.
     pub history_base: Option<HistoryPosition>,
+    /// Summary inherited from a reference-backed legacy parent.
+    ///
+    /// These values are written into the child's canonical SessionMeta at the same
+    /// durability boundary as `history_base`; they are not replayed ancestor items.
+    pub preview: Option<String>,
+    pub first_user_message: Option<String>,
     /// First rollout ordinal that belongs to this subagent's projected history.
     pub subagent_history_start_ordinal: Option<u64>,
     /// Initial context-window identity captured when the thread was created.

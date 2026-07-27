@@ -151,3 +151,63 @@ fn scans_record_spanning_three_read_chunks() -> std::io::Result<()> {
 
     assert_records(&mut scanner, &["third", &large_value, "first"])
 }
+
+#[test]
+fn reports_record_offsets_for_terminated_and_unterminated_tails() -> std::io::Result<()> {
+    let first = serde_json::to_string(&record("first"))?;
+    let second = serde_json::to_string(&record("second"))?;
+    let terminated = format!("{first}\n{second}\n");
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(terminated.clone().into_bytes()))?;
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
+    assert_eq!(
+        scanner.last_record_end_offset(),
+        Some(terminated.len() as u64)
+    );
+    assert_eq!(scanner.last_record_terminated_by_newline(), Some(true));
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
+    assert_eq!(
+        scanner.last_record_end_offset(),
+        Some((first.len() + 1) as u64)
+    );
+    assert_eq!(scanner.last_record_terminated_by_newline(), Some(true));
+
+    let unterminated = format!("{first}\n{second}");
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(unterminated.clone().into_bytes()))?;
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
+    assert_eq!(
+        scanner.last_record_end_offset(),
+        Some(unterminated.len() as u64)
+    );
+    assert_eq!(scanner.last_record_terminated_by_newline(), Some(false));
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
+    assert_eq!(
+        scanner.last_record_end_offset(),
+        Some((first.len() + 1) as u64)
+    );
+    assert_eq!(scanner.last_record_terminated_by_newline(), Some(true));
+    Ok(())
+}
+
+#[test]
+fn reports_offsets_across_frozen_prefix_and_blank_lines() -> std::io::Result<()> {
+    let first = serde_json::to_string(&record("first"))?;
+    let second = serde_json::to_string(&record("second"))?;
+    let prefix = format!("{first}\n{second}\n\n");
+    let mut input = prefix.clone().into_bytes();
+    input.extend_from_slice(b"{\"value\":\"later\"}\n");
+    let mut scanner = ReverseJsonlScanner::new_at(Cursor::new(input), prefix.len() as u64)?;
+
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
+    assert_eq!(
+        scanner.last_record_end_offset(),
+        Some(prefix.len() as u64 - 1)
+    );
+    assert_eq!(scanner.last_record_terminated_by_newline(), Some(true));
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
+    assert_eq!(
+        scanner.last_record_end_offset(),
+        Some((first.len() + 1) as u64)
+    );
+    assert_eq!(scanner.last_record_terminated_by_newline(), Some(true));
+    Ok(())
+}
