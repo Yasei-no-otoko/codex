@@ -805,7 +805,7 @@ async fn build_thread_item(
     {
         return None;
     }
-    // Apply filters: must have session meta and a discoverable preview.
+    // Apply filters: must have session meta and either a discoverable preview or a valid history_base.
     if summary.saw_session_meta && (summary.preview.is_some() || summary.has_history_base) {
         let HeadTailSummary {
             thread_id,
