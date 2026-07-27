@@ -1782,6 +1782,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_empty_reference_resume_historyless_avoids_summary_lineage_reentry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for compressed in [false, true] {
+            let home = TempDir::new()?;
+            let config = test_config(home.path());
+            let parent_uuid = Uuid::from_u128(432);
+            let child_uuid = Uuid::from_u128(433);
+            let parent_id = ThreadId::from_string(&parent_uuid.to_string())?;
+            let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+            let parent_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-32-00",
+                parent_uuid,
+                "",
+                Some("test-provider"),
+                None,
+                ThreadHistoryMode::Legacy,
+            )?;
+            let parent_cutoff = std::fs::metadata(&parent_path)?.len();
+            let child_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-33-00",
+                child_uuid,
+                "",
+                Some("test-provider"),
+                Some(parent_uuid),
+                ThreadHistoryMode::Legacy,
+            )?;
+            set_history_base_in_session_file(
+                &child_path,
+                &HistoryPosition {
+                    thread_id: parent_id,
+                    end_ordinal_exclusive: 0,
+                    end_byte_offset: parent_cutoff,
+                },
+            )?;
+
+            let explicit_path = if compressed {
+                let child_compressed = compress_session_file(&child_path)?;
+                compress_session_file(&parent_path)?;
+                child_compressed
+            } else {
+                child_path
+            };
+            let store = LocalThreadStore::new(config, /*state_db*/ None);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.resume_thread(ResumeThreadParams {
+                    thread_id: child_id,
+                    rollout_path: Some(explicit_path),
+                    history: Some(Arc::new(Vec::new())),
+                    include_archived: false,
+                    metadata: thread_metadata(),
+                }),
+            )
+            .await
+            .expect(
+                "empty explicit reference historyless resume must not reenter summary lineage",
+            )?;
+
+            let history = store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id: child_id,
+                    include_archived: false,
+                })
+                .await?;
+            let messages = history
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
+                        Some(event.message.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(messages, vec!["", ""]);
+            store.shutdown_thread(child_id).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn explicit_resume_rejects_mismatched_rollout_id_before_preheld_lineage() {
         for supplied_history in [false, true] {
             let home = TempDir::new().expect("temp dir");

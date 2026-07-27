@@ -3,7 +3,6 @@ use super::helpers::matching_rollout_file_name;
 use super::helpers::scoped_rollout_path;
 use super::helpers::touch_modified_time;
 use crate::ArchiveThreadParams;
-use crate::ReadThreadParams;
 use crate::StoredThread;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -16,91 +15,96 @@ pub(super) async fn unarchive_thread(
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let state_db_ctx = store.state_db().await;
-    {
-        let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
-        let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-        if store
-            .live_recorders
-            .lock()
-            .await
-            .get(&thread_id)
-            .is_some_and(|entry| entry.writer_lock.is_some())
-        {
-            return Err(ThreadStoreError::Conflict {
-                message: format!("thread {thread_id} already has an active writer"),
-            });
-        }
-        let _writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
-        let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
-        let archived_path = find_archived_thread_path_by_id_str(
-            store.config.codex_home.as_path(),
-            &thread_id.to_string(),
-            state_db_ctx.as_deref(),
-        )
+    let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
+    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    if store
+        .live_recorders
+        .lock()
         .await
-        .map_err(|err| ThreadStoreError::InvalidRequest {
-            message: format!("failed to locate archived thread id {thread_id}: {err}"),
-        })?
-        .ok_or_else(|| ThreadStoreError::InvalidRequest {
-            message: format!("no archived rollout found for thread id {thread_id}"),
-        })?;
+        .get(&thread_id)
+        .is_some_and(|entry| entry.writer_lock.is_some())
+    {
+        return Err(ThreadStoreError::Conflict {
+            message: format!("thread {thread_id} already has an active writer"),
+        });
+    }
+    let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
+    let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
+    let archived_path = find_archived_thread_path_by_id_str(
+        store.config.codex_home.as_path(),
+        &thread_id.to_string(),
+        state_db_ctx.as_deref(),
+    )
+    .await
+    .map_err(|err| ThreadStoreError::InvalidRequest {
+        message: format!("failed to locate archived thread id {thread_id}: {err}"),
+    })?
+    .ok_or_else(|| ThreadStoreError::InvalidRequest {
+        message: format!("no archived rollout found for thread id {thread_id}"),
+    })?;
 
-        let canonical_archived_path = scoped_rollout_path(
-            store
-                .config
-                .codex_home
-                .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
-            archived_path.as_path(),
-            "archived",
-        )?;
-        let file_name = matching_rollout_file_name(
-            canonical_archived_path.as_path(),
-            thread_id,
-            archived_path.as_path(),
-        )?;
-        let Some((year, month, day)) = rollout_date_parts(&file_name) else {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!(
-                    "rollout path `{}` missing filename timestamp",
-                    archived_path.display()
-                ),
-            });
-        };
-
-        let dest_dir = store
+    let canonical_archived_path = scoped_rollout_path(
+        store
             .config
             .codex_home
-            .join(codex_rollout::SESSIONS_SUBDIR)
-            .join(year)
-            .join(month)
-            .join(day);
-        std::fs::create_dir_all(&dest_dir).map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to unarchive thread: {err}"),
-        })?;
-        let restored_path = dest_dir.join(&file_name);
-        std::fs::rename(&canonical_archived_path, &restored_path).map_err(|err| {
-            ThreadStoreError::Internal {
-                message: format!("failed to unarchive thread: {err}"),
-            }
-        })?;
-        touch_modified_time(restored_path.as_path()).map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to update unarchived thread timestamp: {err}"),
-        })?;
+            .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
+        archived_path.as_path(),
+        "archived",
+    )?;
+    let file_name = matching_rollout_file_name(
+        canonical_archived_path.as_path(),
+        thread_id,
+        archived_path.as_path(),
+    )?;
+    let Some((year, month, day)) = rollout_date_parts(&file_name) else {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout path `{}` missing filename timestamp",
+                archived_path.display()
+            ),
+        });
+    };
 
-        if let Some(ctx) = state_db_ctx.as_ref() {
-            let _ = ctx
-                .mark_unarchived(thread_id, restored_path.as_path())
-                .await;
+    let dest_dir = store
+        .config
+        .codex_home
+        .join(codex_rollout::SESSIONS_SUBDIR)
+        .join(year)
+        .join(month)
+        .join(day);
+    std::fs::create_dir_all(&dest_dir).map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to unarchive thread: {err}"),
+    })?;
+    let restored_path = dest_dir.join(&file_name);
+    std::fs::rename(&canonical_archived_path, &restored_path).map_err(|err| {
+        ThreadStoreError::Internal {
+            message: format!("failed to unarchive thread: {err}"),
         }
+    })?;
+    touch_modified_time(restored_path.as_path()).map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to update unarchived thread timestamp: {err}"),
+    })?;
+
+    if let Some(ctx) = state_db_ctx.as_ref() {
+        let _ = ctx
+            .mark_unarchived(thread_id, restored_path.as_path())
+            .await;
     }
 
-    super::read_thread::read_thread(
+    let source_writer_lock = writer_guards
+        .pop()
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: format!("missing writer lock for unarchiving thread {thread_id}"),
+        })?;
+
+    super::read_thread::read_thread_by_rollout_path_with_preheld_source_guards(
         store,
-        ReadThreadParams {
-            thread_id,
-            include_archived: false,
-            include_history: false,
-        },
+        restored_path,
+        thread_id,
+        false,
+        false,
+        &_live_writer_guard,
+        source_writer_lock,
     )
     .await
 }

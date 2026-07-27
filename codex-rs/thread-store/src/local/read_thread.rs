@@ -146,7 +146,7 @@ pub(super) async fn read_thread_by_rollout_path_with_preheld_source_guards(
     source_writer_guard: WriterLockGuard,
 ) -> ThreadStoreResult<StoredThread> {
     let path = resolve_requested_rollout_path(store, rollout_path).await?;
-    read_thread_from_preheld_source_path(
+    let mut thread = read_thread_from_preheld_source_path(
         store,
         ReadThreadParams {
             thread_id: expected_thread_id,
@@ -156,7 +156,39 @@ pub(super) async fn read_thread_by_rollout_path_with_preheld_source_guards(
         path,
         source_writer_guard,
     )
-    .await
+    .await?;
+    if let Some(metadata) = read_sqlite_metadata(store, thread.thread_id).await {
+        if thread.history_mode == ThreadHistoryMode::Paginated {
+            thread.name = sqlite_thread_name(&metadata);
+        }
+        thread.recency_at = metadata.recency_at;
+        thread.is_pinned = metadata.is_pinned;
+        thread.git_info = if thread.history_mode == ThreadHistoryMode::Paginated {
+            // A paginated rollout only has the initial Git tuple. Do not turn an explicit
+            // SQLite clear back into the stale rollout value while reading by path.
+            git_info_from_parts(
+                metadata.git_sha,
+                metadata.git_branch,
+                metadata.git_origin_url,
+            )
+        } else {
+            let (fallback_sha, fallback_branch, fallback_origin_url) = match thread.git_info.take()
+            {
+                Some(info) => (
+                    info.commit_hash.map(|sha| sha.0),
+                    info.branch,
+                    info.repository_url,
+                ),
+                None => (None, None, None),
+            };
+            git_info_from_parts(
+                metadata.git_sha.or(fallback_sha),
+                metadata.git_branch.or(fallback_branch),
+                metadata.git_origin_url.or(fallback_origin_url),
+            )
+        };
+    }
+    Ok(thread)
 }
 
 async fn read_thread_from_preheld_source_path(
