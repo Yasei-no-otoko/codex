@@ -2,6 +2,8 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -12,6 +14,7 @@ use codex_rollout::find_thread_path_by_id_str;
 use codex_rollout::read_session_meta_line;
 use codex_rollout::read_thread_item_from_rollout;
 use codex_state::ThreadMetadata;
+use tracing::warn;
 
 use super::LocalThreadStore;
 use super::helpers::distinct_thread_metadata_title;
@@ -22,12 +25,17 @@ use super::helpers::set_thread_name;
 use super::helpers::sqlite_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
 use super::live_writer;
+use super::rollout_lineage::RolloutLineage;
+use super::writer_lock::WriterLockGuard;
 use crate::ReadThreadParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::error::reject_paginated_history_mode;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::BufReader;
 
 pub(super) async fn read_thread(
     store: &LocalThreadStore,
@@ -49,29 +57,62 @@ pub(super) async fn read_thread(
             )
             .await)
     {
+        let external_rollout =
+            !rollout_path_is_managed(store, metadata.rollout_path.as_path()).await;
+        if external_rollout {
+            validate_external_rollout_path(store, thread_id, metadata.rollout_path.as_path())
+                .await?;
+        }
         let metadata_sandbox_policy = metadata.sandbox_policy.clone();
         let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
         if !params.include_history
             && let Some(rollout_path) = thread.rollout_path.clone()
-            && let Ok(mut rollout_thread) = read_thread_from_rollout_path(store, rollout_path).await
-            && rollout_thread.thread_id == thread_id
-            && (params.include_archived || rollout_thread.archived_at.is_none())
-            && !rollout_thread.preview.is_empty()
         {
-            rollout_thread.recency_at = thread.recency_at;
-            rollout_thread.is_pinned = thread.is_pinned;
-            if thread.name.is_some() {
-                rollout_thread.name = thread.name;
+            let rollout_thread_result =
+                read_thread_from_rollout_path(store, rollout_path.clone()).await;
+            // External rows are fail-closed after the header check above. Managed rows retain
+            // the historical metadata-only fallback when a rollout is temporarily unreadable.
+            let mut rollout_thread = match (external_rollout, rollout_thread_result) {
+                (true, result) => result?,
+                (false, Ok(thread)) => thread,
+                (false, Err(_)) => {
+                    reject_paginated_history(&thread, params.include_history)?;
+                    attach_history_if_requested(store, &mut thread, params.include_history).await?;
+                    enrich_legacy_reference_summary(store, &mut thread).await?;
+                    return Ok(thread);
+                }
+            };
+            if rollout_thread.thread_id == thread_id {
+                validate_reference_rollout_path(store, thread_id, rollout_path.as_path()).await?;
+            } else if external_rollout {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "external rollout {} belongs to thread {}, not {}",
+                        rollout_path.display(),
+                        rollout_thread.thread_id,
+                        thread_id
+                    ),
+                });
             }
-            rollout_thread.git_info = thread.git_info;
-            rollout_thread.permission_profile = permission_profile_from_metadata_value(
-                &metadata_sandbox_policy,
-                rollout_thread.cwd.as_path(),
-            );
-            thread = rollout_thread;
+            if (params.include_archived || rollout_thread.archived_at.is_none())
+                && !rollout_thread.preview.is_empty()
+            {
+                rollout_thread.recency_at = thread.recency_at;
+                rollout_thread.is_pinned = thread.is_pinned;
+                if thread.name.is_some() {
+                    rollout_thread.name = thread.name;
+                }
+                rollout_thread.git_info = thread.git_info;
+                rollout_thread.permission_profile = permission_profile_from_metadata_value(
+                    &metadata_sandbox_policy,
+                    rollout_thread.cwd.as_path(),
+                );
+                thread = rollout_thread;
+            }
         }
         reject_paginated_history(&thread, params.include_history)?;
-        attach_history_if_requested(&mut thread, params.include_history).await?;
+        attach_history_if_requested(store, &mut thread, params.include_history).await?;
+        enrich_legacy_reference_summary(store, &mut thread).await?;
         return Ok(thread);
     }
 
@@ -81,15 +122,263 @@ pub(super) async fn read_thread(
             message: format!("no rollout found for thread id {thread_id}"),
         })?;
 
-    let mut thread = read_thread_from_rollout_path(store, path).await?;
+    let mut thread = read_thread_from_rollout_path(store, path.clone()).await?;
+    validate_reference_rollout_path(store, thread.thread_id, path.as_path()).await?;
     if !params.include_archived && thread.archived_at.is_some() {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!("thread {} is archived", thread.thread_id),
         });
     }
     reject_paginated_history(&thread, params.include_history)?;
-    attach_history_if_requested(&mut thread, params.include_history).await?;
+    attach_history_if_requested(store, &mut thread, params.include_history).await?;
+    enrich_legacy_reference_summary(store, &mut thread).await?;
     Ok(thread)
+}
+
+pub(super) async fn read_thread_by_rollout_path_with_preheld_source_guards(
+    store: &LocalThreadStore,
+    rollout_path: std::path::PathBuf,
+    expected_thread_id: codex_protocol::ThreadId,
+    include_archived: bool,
+    include_history: bool,
+    source_writer_guard: WriterLockGuard,
+) -> ThreadStoreResult<StoredThread> {
+    let path = resolve_requested_rollout_path(store, rollout_path).await?;
+    let mut thread = read_thread_from_preheld_source_path(
+        store,
+        ReadThreadParams {
+            thread_id: expected_thread_id,
+            include_archived,
+            include_history,
+        },
+        path,
+        source_writer_guard,
+    )
+    .await?;
+    if let Some(metadata) = read_sqlite_metadata(store, thread.thread_id).await {
+        if thread.history_mode == ThreadHistoryMode::Paginated {
+            thread.name = sqlite_thread_name(&metadata);
+        }
+        thread.recency_at = metadata.recency_at;
+        thread.is_pinned = metadata.is_pinned;
+        thread.git_info = if thread.history_mode == ThreadHistoryMode::Paginated {
+            // A paginated rollout only has the initial Git tuple. Do not turn an explicit
+            // SQLite clear back into the stale rollout value while reading by path.
+            git_info_from_parts(
+                metadata.git_sha,
+                metadata.git_branch,
+                metadata.git_origin_url,
+            )
+        } else {
+            let (fallback_sha, fallback_branch, fallback_origin_url) = match thread.git_info.take()
+            {
+                Some(info) => (
+                    info.commit_hash.map(|sha| sha.0),
+                    info.branch,
+                    info.repository_url,
+                ),
+                None => (None, None, None),
+            };
+            git_info_from_parts(
+                metadata.git_sha.or(fallback_sha),
+                metadata.git_branch.or(fallback_branch),
+                metadata.git_origin_url.or(fallback_origin_url),
+            )
+        };
+    }
+    Ok(thread)
+}
+
+async fn read_thread_from_preheld_source_path(
+    store: &LocalThreadStore,
+    params: ReadThreadParams,
+    path: std::path::PathBuf,
+    source_writer_guard: WriterLockGuard,
+) -> ThreadStoreResult<StoredThread> {
+    let thread_id = params.thread_id;
+    let mut thread = read_thread_from_rollout_path(store, path.clone()).await?;
+    if thread.thread_id != thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout {} belongs to thread {}, not {}",
+                path.display(),
+                thread.thread_id,
+                thread_id
+            ),
+        });
+    }
+    validate_reference_rollout_path(store, thread.thread_id, path.as_path()).await?;
+    if !params.include_archived && thread.archived_at.is_some() {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!("thread {} is archived", thread.thread_id),
+        });
+    }
+    reject_paginated_history(&thread, params.include_history)?;
+    if params.include_history {
+        let source_writer_guard = source_writer_guard.clone();
+        let items = load_history_items_for_thread_with_preheld_source_guard(
+            store,
+            thread_id,
+            path.as_path(),
+            source_writer_guard,
+        )
+        .await?;
+        thread.history = Some(StoredThreadHistory { thread_id, items });
+    }
+    enrich_legacy_reference_summary_with_source_guard(
+        store,
+        &mut thread,
+        Some(source_writer_guard),
+    )
+    .await?;
+    Ok(thread)
+}
+
+pub(super) async fn enrich_legacy_reference_summary(
+    store: &LocalThreadStore,
+    thread: &mut StoredThread,
+) -> ThreadStoreResult<()> {
+    enrich_legacy_reference_summary_with_source_guard(store, thread, None).await
+}
+
+pub(super) async fn enrich_legacy_reference_summary_with_source_guard(
+    store: &LocalThreadStore,
+    thread: &mut StoredThread,
+    source_writer_guard: Option<WriterLockGuard>,
+) -> ThreadStoreResult<()> {
+    if thread.history_mode != ThreadHistoryMode::Legacy {
+        return Ok(());
+    }
+    // SQLite/list callers already have the durable child summary. Do not turn a hot list page
+    // into an ancestor scan merely because the thread is reference-backed.
+    if !thread.preview.is_empty() {
+        return Ok(());
+    }
+    if let Some(history) = thread.history.as_ref() {
+        let mut summary = LegacyLineageSummary::default();
+        for item in &history.items {
+            if !observe_legacy_summary_item(&mut summary, item) {
+                break;
+            }
+        }
+        apply_legacy_summary(thread, summary);
+        persist_legacy_summary_to_state_db(store, thread).await;
+        return Ok(());
+    }
+    let Some(path) = thread.rollout_path.clone() else {
+        return Ok(());
+    };
+    let path =
+        if let Some(existing_path) = codex_rollout::existing_rollout_path(path.as_path()).await {
+            existing_path
+        } else {
+            let Some(path) =
+                resolve_rollout_path(store, thread.thread_id, /*include_archived*/ true).await?
+            else {
+                return Ok(());
+            };
+            path
+        };
+    let meta = read_session_meta_line(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {err}", path.display()),
+        })?;
+    if meta.meta.history_base.is_none() {
+        return Ok(());
+    }
+    let mut durable_preview = meta
+        .meta
+        .preview
+        .as_deref()
+        .map(std::string::ToString::to_string);
+    let mut durable_first_user_message = meta
+        .meta
+        .first_user_message
+        .as_deref()
+        .map(std::string::ToString::to_string);
+    if (durable_preview.is_none() || durable_first_user_message.is_none())
+        && let Ok(head) = codex_rollout::read_head_for_summary(path.as_path()).await
+    {
+        for value in head {
+            durable_preview = durable_preview.or_else(|| {
+                value
+                    .get("preview")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+            durable_first_user_message = durable_first_user_message.or_else(|| {
+                value
+                    .get("first_user_message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+            if durable_preview.is_some() && durable_first_user_message.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some(preview) = durable_preview {
+        thread.preview = preview;
+        if durable_first_user_message.is_some() {
+            thread.first_user_message = durable_first_user_message;
+        }
+        return Ok(());
+    }
+    let (lineage, _writer_guards) = match source_writer_guard {
+        Some(source_writer_guard) => {
+            store
+                .resolve_rollout_lineage_for_reference_locked_with_source_tokens(
+                    thread.thread_id,
+                    source_writer_guard,
+                )
+                .await?
+        }
+        None => {
+            store
+                .resolve_rollout_lineage_for_reference_locked(thread.thread_id)
+                .await?
+        }
+    };
+    let summary = summarize_legacy_lineage(&lineage).await?;
+    apply_legacy_summary(thread, summary);
+    persist_legacy_summary_to_state_db(store, thread).await;
+    Ok(())
+}
+
+fn apply_legacy_summary(thread: &mut StoredThread, summary: LegacyLineageSummary) {
+    if let Some(preview) = summary.preview {
+        thread.preview = preview;
+    }
+    if summary.first_user_message.is_some() {
+        thread.first_user_message = summary.first_user_message;
+    }
+}
+
+async fn persist_legacy_summary_to_state_db(store: &LocalThreadStore, thread: &StoredThread) {
+    let Some(state_db) = store.state_db().await else {
+        return;
+    };
+    let Ok(Some(mut metadata)) = state_db.get_thread(thread.thread_id).await else {
+        return;
+    };
+    let mut changed = false;
+    if !thread.preview.is_empty() && metadata.preview.as_deref() != Some(thread.preview.as_str()) {
+        metadata.preview = Some(thread.preview.clone());
+        changed = true;
+    }
+    if let Some(first_user_message) = thread.first_user_message.as_ref()
+        && metadata.first_user_message.as_ref() != Some(first_user_message)
+    {
+        metadata.first_user_message = Some(first_user_message.clone());
+        changed = true;
+    }
+    if changed && let Err(err) = state_db.upsert_thread(&metadata).await {
+        warn!(
+            "failed to persist reference-backed summary for {}: {err}",
+            thread.thread_id
+        );
+    }
 }
 
 async fn sqlite_rollout_path_can_load_history_for_thread(
@@ -115,7 +404,8 @@ pub(super) async fn read_thread_by_rollout_path(
     include_history: bool,
 ) -> ThreadStoreResult<StoredThread> {
     let path = resolve_requested_rollout_path(store, rollout_path).await?;
-    let mut thread = read_thread_from_rollout_path(store, path).await?;
+    let mut thread = read_thread_from_rollout_path(store, path.clone()).await?;
+    validate_reference_rollout_path(store, thread.thread_id, &path).await?;
     if !include_archived && thread.archived_at.is_some() {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!("thread {} is archived", thread.thread_id),
@@ -153,8 +443,130 @@ pub(super) async fn read_thread_by_rollout_path(
         };
     }
     reject_paginated_history(&thread, include_history)?;
-    attach_history_if_requested(&mut thread, include_history).await?;
+    attach_history_if_requested(store, &mut thread, include_history).await?;
+    enrich_legacy_reference_summary(store, &mut thread).await?;
     Ok(thread)
+}
+
+/// A reference child must be read from the managed rollout that owns its thread id. Otherwise an
+/// arbitrary external file with the same id could supply the child metadata while lineage
+/// resolution follows a different file under Codex home and splices unrelated history into it.
+/// Plain and compressed siblings are normalized through `existing_rollout_path` so materializing
+/// a managed reference does not make a valid path fail this check.
+async fn validate_reference_rollout_path(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    supplied_path: &std::path::Path,
+) -> ThreadStoreResult<()> {
+    if reference_rollout_path_is_managed(store, thread_id, supplied_path).await? {
+        return Ok(());
+    }
+    Err(ThreadStoreError::InvalidRequest {
+        message: format!(
+            "reference rollout for thread {thread_id} must resolve to its managed Codex home path"
+        ),
+    })
+}
+
+/// Return whether a rollout path for a reference-backed child is the canonical managed file.
+/// Legacy roots (which have no history base) are intentionally treated as managed-compatible so
+/// existing external copied rollouts remain readable. List callers can use this predicate to
+/// omit only externally supplied reference children without changing root compatibility.
+pub(super) async fn reference_rollout_path_is_managed(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    supplied_path: &std::path::Path,
+) -> ThreadStoreResult<bool> {
+    let supplied_meta =
+        read_session_meta_line(supplied_path)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to read session metadata {}: {err}",
+                    supplied_path.display()
+                ),
+            })?;
+    if supplied_meta.meta.history_base.is_none() {
+        return Ok(true);
+    }
+    let managed_path = resolve_rollout_path(store, thread_id, /*include_archived*/ true)
+        .await?
+        .ok_or_else(|| ThreadStoreError::InvalidRequest {
+            message: format!(
+                "reference rollout for thread {thread_id} is not present under Codex home"
+            ),
+        })?;
+    let supplied_path = codex_rollout::existing_rollout_path(supplied_path)
+        .await
+        .unwrap_or_else(|| supplied_path.to_path_buf());
+    let managed_path = codex_rollout::existing_rollout_path(managed_path.as_path())
+        .await
+        .unwrap_or(managed_path);
+    let supplied_path = std::fs::canonicalize(supplied_path.as_path()).map_err(|err| {
+        ThreadStoreError::InvalidRequest {
+            message: format!(
+                "failed to canonicalize reference rollout {}: {err}",
+                supplied_path.display()
+            ),
+        }
+    })?;
+    let managed_path = std::fs::canonicalize(managed_path.as_path()).map_err(|err| {
+        ThreadStoreError::InvalidRequest {
+            message: format!(
+                "failed to canonicalize managed rollout {}: {err}",
+                managed_path.display()
+            ),
+        }
+    })?;
+    let supplied_is_managed =
+        codex_rollout::is_rollout_path_managed(&store.config.codex_home, supplied_path.as_path())
+            .await;
+    let same_managed_rollout = managed_path == supplied_path;
+    Ok(supplied_is_managed && same_managed_rollout)
+}
+
+pub(super) async fn rollout_path_is_managed(
+    store: &LocalThreadStore,
+    path: &std::path::Path,
+) -> bool {
+    codex_rollout::is_rollout_path_managed(&store.config.codex_home, path).await
+}
+
+async fn validate_external_rollout_path(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    supplied_path: &std::path::Path,
+) -> ThreadStoreResult<()> {
+    let existing_path = codex_rollout::existing_rollout_path(supplied_path)
+        .await
+        .ok_or_else(|| ThreadStoreError::InvalidRequest {
+            message: format!(
+                "external rollout for thread {thread_id} is missing: {}",
+                supplied_path.display()
+            ),
+        })?;
+    let meta = read_session_meta_line(existing_path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::InvalidRequest {
+            message: format!(
+                "failed to read external rollout {}: {err}",
+                existing_path.display()
+            ),
+        })?;
+    if meta.meta.id != thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "external rollout {} belongs to thread {}, not {}",
+                existing_path.display(),
+                meta.meta.id,
+                thread_id
+            ),
+        });
+    }
+    if meta.meta.history_base.is_some() {
+        validate_reference_rollout_path(store, thread_id, existing_path.as_path()).await?;
+    }
+    Ok(())
 }
 
 fn reject_paginated_history(thread: &StoredThread, include_history: bool) -> ThreadStoreResult<()> {
@@ -164,10 +576,11 @@ fn reject_paginated_history(thread: &StoredThread, include_history: bool) -> Thr
     Ok(())
 }
 
-async fn resolve_requested_rollout_path(
+pub(super) async fn resolve_requested_rollout_path(
     store: &LocalThreadStore,
     rollout_path: std::path::PathBuf,
 ) -> ThreadStoreResult<std::path::PathBuf> {
+    let was_relative = rollout_path.is_relative();
     let path = if rollout_path.is_relative() {
         store.config.codex_home.join(rollout_path)
     } else {
@@ -200,12 +613,17 @@ async fn resolve_requested_rollout_path(
             ),
         });
     };
-    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to resolve rollout path `{}`: {err}", path.display()),
-    })
+    if was_relative {
+        std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::InvalidRequest {
+            message: format!("failed to resolve rollout path `{}`: {err}", path.display()),
+        })
+    } else {
+        Ok(path)
+    }
 }
 
 async fn attach_history_if_requested(
+    store: &LocalThreadStore,
     thread: &mut StoredThread,
     include_history: bool,
 ) -> ThreadStoreResult<()> {
@@ -218,7 +636,7 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
-    let items = load_history_items(&path).await?;
+    let items = load_history_items_for_thread(store, thread.thread_id, &path).await?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())
 }
@@ -319,6 +737,257 @@ pub(super) async fn load_history_items(
             message: format!("failed to load thread history {}: {err}", path.display()),
         })?;
     Ok(items)
+}
+
+async fn load_history_items_for_thread(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    path: &std::path::Path,
+) -> ThreadStoreResult<Vec<codex_protocol::protocol::RolloutItem>> {
+    let path = if let Some(existing_path) = codex_rollout::existing_rollout_path(path).await {
+        existing_path
+    } else {
+        resolve_rollout_path(store, thread_id, /*include_archived*/ true)
+            .await?
+            .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                message: format!("no rollout found for thread id {thread_id}"),
+            })?
+    };
+    let meta = read_session_meta_line(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {err}", path.display()),
+        })?;
+    if meta.meta.history_mode != ThreadHistoryMode::Legacy || meta.meta.history_base.is_none() {
+        return load_history_items(path.as_path()).await;
+    }
+
+    let (lineage, _writer_guards) = store
+        .resolve_rollout_lineage_for_reference_locked(thread_id)
+        .await?;
+    load_legacy_lineage_history(lineage, meta).await
+}
+
+async fn load_history_items_for_thread_with_preheld_source_guard(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    path: &std::path::Path,
+    source_writer_guard: WriterLockGuard,
+) -> ThreadStoreResult<Vec<codex_protocol::protocol::RolloutItem>> {
+    let path = if let Some(existing_path) = codex_rollout::existing_rollout_path(path).await {
+        existing_path
+    } else {
+        resolve_rollout_path(store, thread_id, /*include_archived*/ true)
+            .await?
+            .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                message: format!("no rollout found for thread id {thread_id}"),
+            })?
+    };
+    let meta = read_session_meta_line(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {err}", path.display()),
+        })?;
+    if meta.meta.history_mode != ThreadHistoryMode::Legacy || meta.meta.history_base.is_none() {
+        return load_history_items(path.as_path()).await;
+    }
+
+    let (lineage, _writer_guards) = store
+        .resolve_rollout_lineage_for_reference_locked_with_source_tokens(
+            thread_id,
+            source_writer_guard,
+        )
+        .await?;
+    load_legacy_lineage_history(lineage, meta).await
+}
+
+async fn load_legacy_lineage_history(
+    lineage: RolloutLineage,
+    requested_meta: SessionMetaLine,
+) -> ThreadStoreResult<Vec<codex_protocol::protocol::RolloutItem>> {
+    if lineage.history_mode() != ThreadHistoryMode::Legacy {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "invalid rollout history lineage for {}: source rollout is not legacy",
+                requested_meta.meta.id
+            ),
+        });
+    }
+    let last_segment_index = lineage.segments().len().saturating_sub(1);
+    let mut items = vec![codex_protocol::protocol::RolloutItem::SessionMeta(
+        requested_meta,
+    )];
+    let mut child_head_seen = false;
+    for (segment_index, segment) in lineage.segments().iter().enumerate() {
+        read_segment_prefix(
+            segment.rollout_path.as_path(),
+            segment.end.map(|end| end.end_byte_offset),
+            segment_index,
+            last_segment_index,
+            &mut child_head_seen,
+            &mut |item| {
+                items.push(item);
+                true
+            },
+        )
+        .await?;
+    }
+    Ok(items)
+}
+
+async fn read_segment_prefix(
+    path: &std::path::Path,
+    end_byte_offset: Option<u64>,
+    segment_index: usize,
+    last_segment_index: usize,
+    child_head_seen: &mut bool,
+    on_item: &mut impl FnMut(codex_protocol::protocol::RolloutItem) -> bool,
+) -> ThreadStoreResult<bool> {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "legacy reference rollout must be plain JSONL: {}",
+                path.display()
+            ),
+        });
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to open rollout {}: {err}", path.display()),
+        })?;
+    let file_len = file
+        .metadata()
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to stat rollout {}: {err}", path.display()),
+        })?
+        .len();
+    let end = end_byte_offset.unwrap_or(file_len);
+    if end > file_len {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "legacy history cutoff {} exceeds rollout {} length {}",
+                end,
+                path.display(),
+                file_len
+            ),
+        });
+    }
+    let mut reader = BufReader::new(file.take(end));
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut raw_line)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to read rollout {}: {err}", path.display()),
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        // A requested cutoff is validated at a newline. The uncapped requested-child segment can
+        // still have a partial cross-process tail, which must not enter logical history.
+        if !raw_line.ends_with(b"\n") {
+            break;
+        }
+        let mut value = match serde_json::from_slice::<serde_json::Value>(&raw_line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if codex_rollout::strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        let Ok(line) = serde_json::from_value::<RolloutLine>(value) else {
+            continue;
+        };
+        if matches!(
+            &line.item,
+            codex_protocol::protocol::RolloutItem::SessionMeta(_)
+        ) {
+            if segment_index != last_segment_index {
+                continue;
+            }
+            if !*child_head_seen {
+                *child_head_seen = true;
+                continue;
+            }
+        }
+        if !on_item(line.item) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Default)]
+struct LegacyLineageSummary {
+    preview: Option<String>,
+    first_user_message: Option<String>,
+}
+
+async fn summarize_legacy_lineage(
+    lineage: &RolloutLineage,
+) -> ThreadStoreResult<LegacyLineageSummary> {
+    let last_segment_index = lineage.segments().len().saturating_sub(1);
+    let mut child_head_seen = false;
+    let mut summary = LegacyLineageSummary::default();
+    for (segment_index, segment) in lineage.segments().iter().enumerate() {
+        let continue_scanning = read_segment_prefix(
+            segment.rollout_path.as_path(),
+            segment.end.map(|end| end.end_byte_offset),
+            segment_index,
+            last_segment_index,
+            &mut child_head_seen,
+            &mut |item| observe_legacy_summary_item(&mut summary, &item),
+        )
+        .await?;
+        if !continue_scanning {
+            break;
+        }
+    }
+    Ok(summary)
+}
+
+fn observe_legacy_summary_item(summary: &mut LegacyLineageSummary, item: &RolloutItem) -> bool {
+    let RolloutItem::EventMsg(event) = item else {
+        return true;
+    };
+    let preview = match event {
+        codex_protocol::protocol::EventMsg::UserMessage(user) => {
+            codex_protocol::protocol::user_message_preview(user)
+        }
+        codex_protocol::protocol::EventMsg::ItemCompleted(event) => {
+            if let codex_protocol::items::TurnItem::UserMessage(user) = &event.item {
+                codex_protocol::protocol::user_message_preview(&user.as_legacy_user_message_event())
+            } else {
+                None
+            }
+        }
+        codex_protocol::protocol::EventMsg::ThreadGoalUpdated(event) => {
+            let objective = event.goal.objective.trim();
+            (!objective.is_empty()).then(|| objective.to_string())
+        }
+        _ => None,
+    };
+    if let Some(preview) = preview {
+        summary.preview.get_or_insert_with(|| preview.clone());
+        if matches!(event, codex_protocol::protocol::EventMsg::UserMessage(_))
+            || matches!(
+                event,
+                codex_protocol::protocol::EventMsg::ItemCompleted(event)
+                    if matches!(event.item, codex_protocol::items::TurnItem::UserMessage(_))
+            )
+        {
+            summary.first_user_message.get_or_insert(preview);
+        }
+    }
+    summary.preview.is_none() || summary.first_user_message.is_none()
 }
 
 async fn read_sqlite_metadata(
@@ -469,7 +1138,12 @@ fn stored_thread_from_meta_line(
         rollout_path: Some(rollout_path),
         forked_from_id: meta_line.meta.forked_from_id,
         parent_thread_id: meta_line.meta.parent_thread_id,
-        preview: String::new(),
+        preview: meta_line
+            .meta
+            .preview
+            .as_deref()
+            .unwrap_or_default()
+            .to_string(),
         name: None,
         model_provider: meta_line
             .meta
@@ -495,7 +1169,11 @@ fn stored_thread_from_meta_line(
         approval_mode: AskForApproval::OnRequest,
         permission_profile: PermissionProfile::read_only(),
         token_usage: None,
-        first_user_message: None,
+        first_user_message: meta_line
+            .meta
+            .first_user_message
+            .as_deref()
+            .map(std::string::ToString::to_string),
         history: None,
     }
 }
@@ -523,6 +1201,7 @@ fn parse_rfc3339_non_optional(value: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -760,6 +1439,160 @@ mod tests {
             .expect("read thread");
 
         assert_eq!(thread.forked_from_id, Some(parent_thread_id));
+    }
+
+    #[tokio::test]
+    async fn reference_path_must_match_managed_rollout_for_thread_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let home = TempDir::new().expect("temp dir");
+        let external = TempDir::new().expect("external temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let source_uuid = Uuid::from_u128(229);
+        let child_uuid = Uuid::from_u128(230);
+        let source_id = ThreadId::from_string(&source_uuid.to_string()).expect("source id");
+        let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+        let source_path = write_session_file_with_fork(
+            home.path(),
+            home.path().join("sessions/2025/01/03"),
+            "2025-01-03T12-00-00",
+            source_uuid,
+            "source message",
+            Some("test-provider"),
+            None,
+            ThreadHistoryMode::Legacy,
+        )
+        .expect("source session file");
+        let child_path = write_session_file_with_fork(
+            home.path(),
+            home.path().join("sessions/2025/01/03"),
+            "2025-01-03T12-01-00",
+            child_uuid,
+            "child message",
+            Some("test-provider"),
+            Some(source_uuid),
+            ThreadHistoryMode::Legacy,
+        )
+        .expect("child session file");
+        let child_file_contents = fs::read_to_string(&child_path)?;
+        let mut lines = child_file_contents.lines().map(str::to_string);
+        let mut first: serde_json::Value = serde_json::from_str(&lines.next().expect("meta line"))?;
+        first["payload"]["history_base"] = serde_json::json!({
+            "thread_id": source_id,
+            "end_ordinal_exclusive": 0,
+            "end_byte_offset": fs::metadata(&source_path)?.len(),
+        });
+        let mut child_contents = serde_json::to_string(&first)?;
+        for line in lines {
+            child_contents.push('\n');
+            child_contents.push_str(line.as_str());
+        }
+        child_contents.push('\n');
+        fs::write(&child_path, child_contents)?;
+
+        let managed = store
+            .read_thread_by_rollout_path(child_path.clone(), false, false)
+            .await
+            .expect("managed reference path should be accepted");
+        assert_eq!(managed.thread_id, child_id);
+
+        let external_path = external.path().join("rollout-external.jsonl");
+        fs::copy(&child_path, &external_path)?;
+        let error = store
+            .read_thread_by_rollout_path(external_path, false, false)
+            .await
+            .expect_err("external reference path must not splice managed lineage");
+        assert!(error.to_string().contains("managed Codex home path"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_external_rollout_rows_are_fail_closed_except_matching_legacy_roots() {
+        for case in ["root", "reference", "malformed", "missing", "mismatch"] {
+            let home = TempDir::new().expect("home temp dir");
+            let external = TempDir::new().expect("external temp dir");
+            let config = test_config(home.path());
+            let runtime = codex_state::StateRuntime::init(
+                config.sqlite.clone(),
+                config.default_model_provider_id.clone(),
+            )
+            .await
+            .expect("state db should initialize");
+            let uuid = Uuid::from_u128(231 + case.as_bytes()[0] as u128);
+            let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+            let (rollout_path, expected_ok) = match case {
+                "missing" => (external.path().join("missing-rollout.jsonl"), false),
+                "mismatch" => {
+                    let other_uuid = Uuid::from_u128(260);
+                    let path =
+                        write_session_file(external.path(), "2025-01-03T12-02-00", other_uuid)
+                            .expect("mismatched rollout");
+                    (path, false)
+                }
+                "malformed" => {
+                    let path = external.path().join("malformed-rollout.jsonl");
+                    fs::write(&path, b"{not valid json\n").expect("malformed rollout");
+                    (path, false)
+                }
+                "reference" => {
+                    let path = write_session_file(external.path(), "2025-01-03T12-03-00", uuid)
+                        .expect("reference rollout");
+                    let parent_id = ThreadId::from_string(&Uuid::from_u128(261).to_string())
+                        .expect("parent id");
+                    let parent_path = write_session_file(
+                        external.path(),
+                        "2025-01-03T12-04-00",
+                        Uuid::from_u128(261),
+                    )
+                    .expect("parent rollout");
+                    crate::local::test_support::set_history_base_in_session_file(
+                        &path,
+                        &codex_protocol::protocol::HistoryPosition {
+                            thread_id: parent_id,
+                            end_ordinal_exclusive: 0,
+                            end_byte_offset: fs::metadata(parent_path)
+                                .expect("parent metadata")
+                                .len(),
+                        },
+                    )
+                    .expect("set reference history base");
+                    (path, false)
+                }
+                "root" => (
+                    write_session_file(external.path(), "2025-01-03T12-05-00", uuid)
+                        .expect("root rollout"),
+                    true,
+                ),
+                _ => unreachable!("known external rollout test case"),
+            };
+            let mut builder = ThreadMetadataBuilder::new(
+                thread_id,
+                rollout_path.clone(),
+                Utc::now(),
+                SessionSource::Cli,
+            );
+            builder.history_mode = ThreadHistoryMode::Legacy;
+            builder.model_provider = Some(config.default_model_provider_id.clone());
+            builder.cwd = home.path().to_path_buf();
+            let mut metadata = builder.build(config.default_model_provider_id.as_str());
+            metadata.preview = Some(format!("external {case}"));
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("state db upsert should succeed");
+
+            let store = LocalThreadStore::new(config, Some(runtime));
+            let result = store
+                .read_thread(ReadThreadParams {
+                    thread_id,
+                    include_archived: false,
+                    include_history: false,
+                })
+                .await;
+            assert_eq!(result.is_ok(), expected_ok, "case: {case}");
+            if expected_ok {
+                assert_eq!(result.expect("valid root").preview, "Hello from user");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1267,12 +2100,15 @@ mod tests {
     async fn read_thread_falls_back_to_sqlite_summary() {
         let home = TempDir::new().expect("temp dir");
         let external = TempDir::new().expect("external temp dir");
+        let managed = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("managed");
+        fs::create_dir_all(&managed).expect("managed directory");
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(214);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path = external
-            .path()
-            .join(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"));
+        let rollout_path = managed.join(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"));
         let runtime = codex_state::StateRuntime::init(
             config.sqlite.clone(),
             config.default_model_provider_id.clone(),
@@ -1328,13 +2164,15 @@ mod tests {
     #[tokio::test]
     async fn read_thread_sqlite_fallback_respects_include_archived() {
         let home = TempDir::new().expect("temp dir");
-        let external = TempDir::new().expect("external temp dir");
+        let managed = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("managed");
+        fs::create_dir_all(&managed).expect("managed directory");
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(216);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path = external
-            .path()
-            .join(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"));
+        let rollout_path = managed.join(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"));
         let runtime = codex_state::StateRuntime::init(
             config.sqlite.clone(),
             config.default_model_provider_id.clone(),

@@ -5,6 +5,7 @@ use codex_protocol::ThreadId;
 use tempfile::TempDir;
 
 use super::COORDINATION_LOCK_FILE;
+use super::TOPOLOGY_LOCK_FILE;
 use super::WRITER_LOCK_DIR;
 use super::WriterLockCoordinator;
 use crate::ThreadStoreError;
@@ -78,4 +79,26 @@ fn first_acquisition_removes_stale_locks_without_removing_active_locks() {
 
     drop(secondary_owner);
     drop(active_owner);
+}
+
+#[test]
+fn topology_barrier_conflicts_across_coordinators() {
+    let home = TempDir::new().expect("temp dir");
+    let primary = Arc::new(WriterLockCoordinator::new(home.path()));
+    let secondary = Arc::new(WriterLockCoordinator::new(home.path()));
+
+    let barrier = primary
+        .acquire_topology()
+        .expect("primary topology barrier should be acquired");
+    let topology_path = home.path().join(WRITER_LOCK_DIR).join(TOPOLOGY_LOCK_FILE);
+    assert!(topology_path.exists());
+    let err = secondary
+        .acquire_topology()
+        .expect_err("another coordinator must not enter the topology barrier");
+    assert!(matches!(err, ThreadStoreError::Conflict { .. }));
+
+    drop(barrier);
+    secondary
+        .acquire_topology()
+        .expect("released topology barrier should be reusable");
 }

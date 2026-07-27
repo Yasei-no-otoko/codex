@@ -42,6 +42,8 @@ pub(super) async fn create_thread(
         .with_multi_agent_version(params.multi_agent_version)
         .with_history_mode(params.history_mode)
         .with_history_base(params.history_base)
+        .with_preview(params.preview)
+        .with_first_user_message(params.first_user_message)
         .with_subagent_history_start_ordinal(params.subagent_history_start_ordinal)
         .with_initial_window_id(params.initial_window_id),
     )

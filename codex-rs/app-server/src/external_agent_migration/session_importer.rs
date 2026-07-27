@@ -325,6 +325,8 @@ impl ExternalAgentSessionImporter {
             multi_agent_version: Some(MultiAgentVersion::V1),
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
+            preview: None,
+            first_user_message: None,
             subagent_history_start_ordinal: None,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {

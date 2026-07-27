@@ -637,6 +637,19 @@ impl Session {
                                 ForkPersistence::Copied => None,
                                 ForkPersistence::Referenced { history_base, .. } => *history_base,
                             },
+                            preview: match &fork_persistence {
+                                ForkPersistence::Copied => None,
+                                ForkPersistence::Referenced {
+                                    inherited_preview, ..
+                                } => inherited_preview.clone(),
+                            },
+                            first_user_message: match &fork_persistence {
+                                ForkPersistence::Copied => None,
+                                ForkPersistence::Referenced {
+                                    inherited_first_user_message,
+                                    ..
+                                } => inherited_first_user_message.clone(),
+                            },
                             subagent_history_start_ordinal: None,
                             initial_window_id: initial_auto_compact_window_ids
                                 .window_id

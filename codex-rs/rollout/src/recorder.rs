@@ -48,6 +48,7 @@ use super::list::get_threads;
 use super::list::get_threads_in_root;
 use super::list::parse_cursor;
 use super::list::parse_timestamp_uuid_from_filename;
+use super::list::state_db_rollout_path_is_visible;
 use super::metadata;
 use super::ordinal::RolloutOrdinalState;
 use super::ordinal::ordinal_state_for_rollout;
@@ -105,6 +106,8 @@ pub enum RolloutRecorderParams {
         multi_agent_version: Option<MultiAgentVersion>,
         history_mode: ThreadHistoryMode,
         history_base: Option<HistoryPosition>,
+        preview: Option<String>,
+        first_user_message: Option<String>,
         subagent_history_start_ordinal: Option<u64>,
         initial_window_id: Option<String>,
     },
@@ -200,6 +203,8 @@ impl RolloutRecorderParams {
             multi_agent_version: None,
             history_mode: Default::default(),
             history_base: None,
+            preview: None,
+            first_user_message: None,
             subagent_history_start_ordinal: None,
             initial_window_id: None,
         }
@@ -250,12 +255,36 @@ impl RolloutRecorderParams {
         self
     }
 
+    /// Attach a frozen logical-history base for a reference child.
+    ///
+    /// The immediate source's cross-process filesystem writer guard must remain held until the
+    /// child's initial `SessionMeta` (including this value) is durable. Rewriting `history_base`
+    /// on an existing rollout additionally requires the affected thread locks and the topology
+    /// barrier; callers must not mutate the reference edge without those guards.
     pub fn with_history_base(mut self, history_base: Option<HistoryPosition>) -> Self {
         if let Self::Create {
             history_base: base, ..
         } = &mut self
         {
             *base = history_base;
+        }
+        self
+    }
+
+    pub fn with_preview(mut self, preview: Option<String>) -> Self {
+        if let Self::Create { preview: value, .. } = &mut self {
+            *value = preview;
+        }
+        self
+    }
+
+    pub fn with_first_user_message(mut self, first_user_message: Option<String>) -> Self {
+        if let Self::Create {
+            first_user_message: value,
+            ..
+        } = &mut self
+        {
+            *value = first_user_message;
         }
         self
     }
@@ -460,7 +489,7 @@ impl RolloutRecorder {
         }
 
         if matches!(repair_mode, ThreadListRepairMode::StateDbOnly) {
-            return Ok(state_db::list_threads_db(
+            let page = state_db::list_threads_db(
                 state_db_ctx.as_deref(),
                 sqlite,
                 page_size,
@@ -477,7 +506,8 @@ impl RolloutRecorder {
             )
             .await
             .map(Into::into)
-            .unwrap_or_default());
+            .unwrap_or_default();
+            return Ok(filter_state_db_visibility(codex_home, page).await);
         }
 
         let listing_has_metadata_filters = !allowed_sources.is_empty()
@@ -589,16 +619,25 @@ impl RolloutRecorder {
         if let Some(db_page) = db_page {
             if search_term.is_some() && (!db_page.items.is_empty() || cursor.is_some()) {
                 for item in &db_page.items {
-                    state_db::reconcile_rollout(
-                        state_db_ctx.as_deref(),
+                    if state_db_rollout_path_is_visible(
+                        config.codex_home(),
+                        item.id,
                         item.rollout_path.as_path(),
-                        default_provider,
-                        /*builder*/ None,
-                        &[],
-                        Some(archived),
-                        /*new_thread_memory_mode*/ None,
                     )
-                    .await;
+                    .await
+                    .unwrap_or(false)
+                    {
+                        state_db::reconcile_rollout(
+                            state_db_ctx.as_deref(),
+                            item.rollout_path.as_path(),
+                            default_provider,
+                            /*builder*/ None,
+                            &[],
+                            Some(archived),
+                            /*new_thread_memory_mode*/ None,
+                        )
+                        .await;
+                    }
                 }
                 if let Some(repaired_db_page) = state_db::list_threads_db(
                     state_db_ctx.as_deref(),
@@ -617,9 +656,13 @@ impl RolloutRecorder {
                 )
                 .await
                 {
-                    return Ok(repaired_db_page.into());
+                    return Ok(filter_state_db_visibility(
+                        config.codex_home(),
+                        repaired_db_page.into(),
+                    )
+                    .await);
                 }
-                return Ok(db_page.into());
+                return Ok(filter_state_db_visibility(config.codex_home(), db_page.into()).await);
             }
             if listing_has_metadata_filters {
                 for item in &db_page.items {
@@ -629,16 +672,25 @@ impl RolloutRecorder {
                     if fs_page_thread_ids.contains(&item.id) {
                         continue;
                     }
-                    state_db::reconcile_rollout(
-                        state_db_ctx.as_deref(),
+                    if state_db_rollout_path_is_visible(
+                        config.codex_home(),
+                        item.id,
                         item.rollout_path.as_path(),
-                        default_provider,
-                        /*builder*/ None,
-                        &[],
-                        Some(archived),
-                        /*new_thread_memory_mode*/ None,
                     )
-                    .await;
+                    .await
+                    .unwrap_or(false)
+                    {
+                        state_db::reconcile_rollout(
+                            state_db_ctx.as_deref(),
+                            item.rollout_path.as_path(),
+                            default_provider,
+                            /*builder*/ None,
+                            &[],
+                            Some(archived),
+                            /*new_thread_memory_mode*/ None,
+                        )
+                        .await;
+                    }
                 }
                 if sort_key == ThreadSortKey::RecencyAt {
                     if let Some(repaired_db_page) = state_db::list_threads_db(
@@ -658,9 +710,15 @@ impl RolloutRecorder {
                     )
                     .await
                     {
-                        return Ok(repaired_db_page.into());
+                        return Ok(filter_state_db_visibility(
+                            config.codex_home(),
+                            repaired_db_page.into(),
+                        )
+                        .await);
                     }
-                    return Ok(db_page.into());
+                    return Ok(
+                        filter_state_db_visibility(config.codex_home(), db_page.into()).await,
+                    );
                 }
                 codex_state::record_fallback(
                     "list_threads",
@@ -674,7 +732,7 @@ impl RolloutRecorder {
                 )
                 .await);
             }
-            return Ok(db_page.into());
+            return Ok(filter_state_db_visibility(config.codex_home(), db_page.into()).await);
         }
         if listing_has_metadata_filters {
             let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
@@ -811,6 +869,8 @@ impl RolloutRecorder {
                 multi_agent_version,
                 history_mode,
                 history_base,
+                preview,
+                first_user_message,
                 subagent_history_start_ordinal,
                 initial_window_id,
             } => {
@@ -854,6 +914,8 @@ impl RolloutRecorder {
                     memory_mode: (!config.generate_memories()).then_some("disabled".to_string()),
                     history_mode,
                     history_base,
+                    preview,
+                    first_user_message,
                     subagent_history_start_ordinal,
                     multi_agent_version,
                     context_window: initial_window_id.map(SessionContextWindow::new),
@@ -1104,7 +1166,10 @@ pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Resu
         .map_err(|err| IoError::other(format!("invalid session metadata history_mode: {err}")))
 }
 
-fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
+/// Removes retired `ghost_snapshot` response items before rollout-line deserialization.
+///
+/// Returns `true` when the entire line is a top-level ghost snapshot and should be skipped.
+pub fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
     match value.get("type").and_then(Value::as_str) {
         Some("response_item") => value
             .get("payload")
@@ -1950,6 +2015,27 @@ impl From<codex_state::ThreadsPage> for ThreadsPage {
             reached_scan_cap: false,
         }
     }
+}
+
+async fn filter_state_db_visibility(codex_home: &Path, mut page: ThreadsPage) -> ThreadsPage {
+    let mut visible_items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        let visible = match item.thread_id {
+            Some(thread_id) => {
+                state_db_rollout_path_is_visible(codex_home, thread_id, item.path.as_path())
+                    .await
+                    .unwrap_or(false)
+            }
+            // State DB rows always carry an id; retain malformed projections rather than
+            // changing the historical fallback for filesystem-derived items.
+            None => true,
+        };
+        if visible {
+            visible_items.push(item);
+        }
+    }
+    page.items = visible_items;
+    page
 }
 
 fn thread_item_from_state_metadata(

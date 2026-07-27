@@ -380,6 +380,8 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     memory_mode: None,
                     history_mode: Default::default(),
                     history_base: None,
+                    preview: None,
+                    first_user_message: None,
                     subagent_history_start_ordinal: None,
                     multi_agent_version: None,
                     context_window: None,

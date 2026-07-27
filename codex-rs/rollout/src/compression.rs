@@ -252,6 +252,9 @@ mod worker {
     use super::RolloutFile;
     use super::metrics;
     use super::path;
+    use crate::ThreadWriterLockCoordinator;
+    use codex_protocol::ThreadId;
+    use std::sync::Arc;
 
     const TEMP_SUFFIX: &str = ".tmp";
     const COMPRESSION_LEVEL: i32 = 3;
@@ -375,6 +378,7 @@ mod worker {
             else {
                 return Ok(CompressionStats::default());
             };
+            let writer_locks = Arc::new(ThreadWriterLockCoordinator::new(codex_home.as_path()));
             let mut stats = CompressionStats::default();
             for root in [
                 codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
@@ -383,8 +387,14 @@ mod worker {
                 if started_at.elapsed() >= WORKER_MAX_RUNTIME {
                     break;
                 }
-                compress_rollouts_in_root(root.as_path(), started_at, &reference_index, &mut stats)
-                    .await?;
+                compress_rollouts_in_root(
+                    root.as_path(),
+                    started_at,
+                    &reference_index,
+                    &writer_locks,
+                    &mut stats,
+                )
+                .await?;
             }
             Ok::<_, io::Error>(stats)
         }
@@ -425,6 +435,7 @@ mod worker {
         root: &Path,
         started_at: Instant,
         reference_index: &RolloutReferenceIndex,
+        writer_locks: &Arc<ThreadWriterLockCoordinator>,
         stats: &mut CompressionStats,
     ) -> io::Result<()> {
         if !tokio::fs::try_exists(root).await.unwrap_or(false) {
@@ -503,9 +514,12 @@ mod worker {
                 while jobs.len() >= MAX_CONCURRENT_COMPRESSION_JOBS {
                     collect_next_compression_job(&mut jobs, stats).await;
                 }
+                let writer_locks = Arc::clone(writer_locks);
+                let thread_id = meta.meta.id;
                 jobs.spawn_blocking(move || {
                     let started_at = Instant::now();
-                    let result = compress_rollout_if_cold_blocking(path.as_path());
+                    let result =
+                        compress_rollout_if_cold_blocking(path.as_path(), thread_id, writer_locks);
                     let duration = started_at.elapsed();
                     (path, duration, result)
                 });
@@ -518,11 +532,12 @@ mod worker {
     type CompressionJobResult = (PathBuf, Duration, io::Result<CompressionMeasurement>);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum CompressionOutcome {
+    pub(super) enum CompressionOutcome {
         Compressed,
         SkippedNotCold,
         SkippedChanged,
         SkippedAlreadyCompressed,
+        SkippedWriterBusy,
     }
 
     impl CompressionOutcome {
@@ -532,12 +547,13 @@ mod worker {
                 CompressionOutcome::SkippedNotCold => "skipped_not_cold",
                 CompressionOutcome::SkippedChanged => "skipped_changed",
                 CompressionOutcome::SkippedAlreadyCompressed => "skipped_already_compressed",
+                CompressionOutcome::SkippedWriterBusy => "skipped_writer_busy",
             }
         }
     }
 
-    struct CompressionMeasurement {
-        outcome: CompressionOutcome,
+    pub(super) struct CompressionMeasurement {
+        pub(super) outcome: CompressionOutcome,
         source_bytes: Option<u64>,
         compressed_bytes: Option<u64>,
     }
@@ -586,7 +602,8 @@ mod worker {
                     }
                     CompressionOutcome::SkippedNotCold
                     | CompressionOutcome::SkippedChanged
-                    | CompressionOutcome::SkippedAlreadyCompressed => {
+                    | CompressionOutcome::SkippedAlreadyCompressed
+                    | CompressionOutcome::SkippedWriterBusy => {
                         stats.skipped = stats.skipped.saturating_add(1);
                     }
                 }
@@ -616,7 +633,22 @@ mod worker {
         }
     }
 
-    fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement> {
+    pub(super) fn compress_rollout_if_cold_blocking(
+        path: &Path,
+        thread_id: ThreadId,
+        writer_locks: Arc<ThreadWriterLockCoordinator>,
+    ) -> io::Result<CompressionMeasurement> {
+        let _writer_lock = match writer_locks.acquire(thread_id) {
+            Ok(lock) => lock,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(CompressionMeasurement::new(
+                    CompressionOutcome::SkippedWriterBusy,
+                    None,
+                    None,
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         let before = match cold_file_state(path)? {
             ColdFileState::Cold(state) => state,
             ColdFileState::NotCold(state) => {

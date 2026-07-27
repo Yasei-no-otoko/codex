@@ -105,6 +105,13 @@ static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
 type CapturedOps = Vec<(ThreadId, Op)>;
 type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
 
+/// Metadata inherited by a reference-backed fork's canonical `SessionMeta`.
+#[derive(Clone, Debug, Default)]
+pub struct ForkInheritedMetadata {
+    pub preview: Option<String>,
+    pub first_user_message: Option<String>,
+}
+
 pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
     FORCE_TEST_THREAD_MANAGER_BEHAVIOR.store(enabled, Ordering::Relaxed);
 }
@@ -674,6 +681,17 @@ impl ThreadManager {
         self.state.get_thread(thread_id).await
     }
 
+    /// Load the complete logical replay history for a persisted thread.
+    pub async fn read_stored_thread_history(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> CodexResult<Vec<RolloutItem>> {
+        self.state
+            .read_stored_thread_history(thread_id, include_archived)
+            .await
+    }
+
     /// Updates metadata for loaded and cold threads through one entrypoint.
     ///
     /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered
@@ -1115,6 +1133,7 @@ impl ThreadManager {
         &self,
         config: Config,
         prepared: PreparedFork,
+        inherited_metadata: ForkInheritedMetadata,
         thread_source: Option<ThreadSource>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
@@ -1127,6 +1146,8 @@ impl ThreadManager {
         let fork_persistence = ForkPersistence::Referenced {
             history_base: prepared.history_base,
             inherited_item_count: prepared.model_context.len(),
+            inherited_preview: inherited_metadata.preview,
+            inherited_first_user_message: inherited_metadata.first_user_message,
         };
         let result = self
             .fork_thread_with_initial_history(
@@ -1268,6 +1289,8 @@ impl ThreadManagerState {
         }
     }
 
+    /// Read a persisted thread through the configured store, including any logical inherited
+    /// history represented by a reference-backed rollout.
     pub(crate) async fn read_stored_thread(
         &self,
         params: ReadThreadParams,
@@ -1290,6 +1313,29 @@ impl ThreadManagerState {
                     }
                 }
                 err => CodexErr::Fatal(format!("failed to read stored thread {thread_id}: {err}")),
+            })
+    }
+
+    /// Load the complete logical replay history for a persisted thread.
+    pub(crate) async fn read_stored_thread_history(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> CodexResult<Vec<RolloutItem>> {
+        let stored_thread = self
+            .read_stored_thread(ReadThreadParams {
+                thread_id,
+                include_archived,
+                include_history: true,
+            })
+            .await?;
+        stored_thread
+            .history
+            .map(|history| history.items)
+            .ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "stored thread {thread_id} did not include persisted history"
+                ))
             })
     }
 

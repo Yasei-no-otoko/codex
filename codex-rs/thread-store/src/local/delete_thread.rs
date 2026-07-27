@@ -31,11 +31,14 @@ pub(super) async fn delete_thread(
     let thread_id = params.thread_id;
     let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    // Hold the shared filesystem lock before taking the reference-index snapshot. A concurrent
+    // fork must not durable its child after this scan and before deletion acquires its lock.
+    let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
+    let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
     let reference_index = scan_reference_index(store).await?;
     if reference_index.reference_count(thread_id) > 0 {
         return Err(referenced_thread_error(thread_id));
     }
-    let mut writer_guards = store.acquire_paginated_writer_locks(&[thread_id]).await?;
     delete_thread_after_reference_check(store, thread_id, &mut writer_guards).await
 }
 
@@ -60,6 +63,11 @@ pub(super) async fn delete_threads(
         _live_writer_guards.push(store.live_writer_locks.lock(thread_id).await);
     }
 
+    // Acquire every target's shared filesystem lock before scanning references, and keep the
+    // guards through all validation and removal below. This closes the cross-process fork/delete
+    // window between a stale index snapshot and the destructive operation.
+    let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
+    let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
     let reference_index = scan_reference_index(store).await?;
     // References from children in this delete set are removed by the same request, so only
     // references from children outside the set should block it.
@@ -84,9 +92,6 @@ pub(super) async fn delete_threads(
         }
     }
 
-    let mut writer_guards = store
-        .acquire_paginated_writer_locks(&lock_thread_ids)
-        .await?;
     for thread_id in thread_ids {
         match delete_thread_after_reference_check(store, thread_id, &mut writer_guards).await {
             Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
@@ -232,6 +237,8 @@ fn delete_rollout_path(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::HistoryPosition;
     use codex_protocol::protocol::ThreadHistoryMode;
@@ -246,10 +253,12 @@ mod tests {
     use crate::ThreadPersistenceMetadata;
     use crate::ThreadStore;
     use crate::local::LocalThreadStore;
+    use crate::local::test_support::set_history_base_in_session_file;
     use crate::local::test_support::test_config;
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with;
+    use crate::local::test_support::write_session_file_with_fork;
     use crate::local::test_support::write_session_file_with_history_mode;
 
     #[tokio::test]
@@ -335,6 +344,172 @@ mod tests {
             )
         );
         assert!(source_path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_lifecycle_wait_does_not_block_unarchive() {
+        let home = TempDir::new().expect("temp dir");
+        let delete_store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let unarchive_store =
+            LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let parent_uuid = Uuid::from_u128(309);
+        let parent_thread_id =
+            ThreadId::from_string(&parent_uuid.to_string()).expect("valid parent thread id");
+        let parent_path = write_session_file(home.path(), "2025-01-03T12-00-00", parent_uuid)
+            .expect("parent session file");
+        let child_uuid = Uuid::from_u128(310);
+        let child_thread_id =
+            ThreadId::from_string(&child_uuid.to_string()).expect("valid child thread id");
+        let archived_child_path = write_session_file_with_fork(
+            home.path(),
+            home.path().join(ARCHIVED_SESSIONS_SUBDIR),
+            "2025-01-03T12-00-01",
+            child_uuid,
+            "Archived child message",
+            Some("test-provider"),
+            Some(parent_uuid),
+            ThreadHistoryMode::Legacy,
+        )
+        .expect("archived child session file");
+        set_history_base_in_session_file(
+            archived_child_path.as_path(),
+            &HistoryPosition {
+                thread_id: parent_thread_id,
+                end_ordinal_exclusive: 0,
+                end_byte_offset: std::fs::metadata(parent_path.as_path())
+                    .expect("parent rollout metadata")
+                    .len(),
+            },
+        )
+        .expect("child history base");
+
+        // Keep delete parked behind its lifecycle reservation. It must not acquire the global
+        // topology barrier until the reservation is released, so another thread can unarchive.
+        let lifecycle_reservation = delete_store
+            .live_writer_locks
+            .reserve_lifecycle(parent_thread_id)
+            .await;
+        let mut delete = Box::pin(delete_store.delete_thread(crate::DeleteThreadParams {
+            thread_id: parent_thread_id,
+        }));
+        tokio::select! {
+            biased;
+            result = &mut delete => panic!("delete completed before its lifecycle reservation was released: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let unarchive_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            unarchive_store.unarchive_thread(crate::ArchiveThreadParams {
+                thread_id: child_thread_id,
+            }),
+        )
+        .await
+        .expect("unarchive should not be blocked by delete's lifecycle wait")
+        .expect("unarchive should succeed while delete waits");
+        let restored_child_path = home
+            .path()
+            .join("sessions/2025/01/03")
+            .join(archived_child_path.file_name().expect("child file name"));
+        assert_eq!(
+            unarchive_result.rollout_path,
+            Some(restored_child_path.clone())
+        );
+        assert!(!archived_child_path.exists());
+        assert!(restored_child_path.exists());
+        drop(lifecycle_reservation);
+        let delete_result = delete.await;
+        assert!(matches!(
+            delete_result,
+            Err(crate::ThreadStoreError::InvalidRequest { .. })
+        ));
+        assert!(parent_path.exists());
+        assert!(restored_child_path.exists());
+    }
+
+    #[tokio::test]
+    async fn topology_barrier_blocks_unarchive_then_sessions_reference_preserves_parent() {
+        let home = TempDir::new().expect("temp dir");
+        let delete_store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let unarchive_store =
+            LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let parent_uuid = Uuid::from_u128(311);
+        let parent_thread_id =
+            ThreadId::from_string(&parent_uuid.to_string()).expect("valid parent thread id");
+        let parent_path = write_session_file(home.path(), "2025-01-03T12-00-00", parent_uuid)
+            .expect("parent session file");
+        let child_uuid = Uuid::from_u128(312);
+        let child_thread_id =
+            ThreadId::from_string(&child_uuid.to_string()).expect("valid child thread id");
+        let archived_child_path = write_session_file_with_fork(
+            home.path(),
+            home.path().join(ARCHIVED_SESSIONS_SUBDIR),
+            "2025-01-03T12-00-01",
+            child_uuid,
+            "Archived child message",
+            Some("test-provider"),
+            Some(parent_uuid),
+            ThreadHistoryMode::Legacy,
+        )
+        .expect("archived child session file");
+        set_history_base_in_session_file(
+            archived_child_path.as_path(),
+            &HistoryPosition {
+                thread_id: parent_thread_id,
+                end_ordinal_exclusive: 0,
+                end_byte_offset: std::fs::metadata(parent_path.as_path())
+                    .expect("parent rollout metadata")
+                    .len(),
+            },
+        )
+        .expect("child history base");
+
+        // A separate coordinator models another process holding the scan/rename barrier.
+        let topology_guard = delete_store
+            .writer_lock_coordinator
+            .acquire_topology()
+            .expect("reference scan should hold the topology barrier");
+        let unarchive_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            unarchive_store.unarchive_thread(crate::ArchiveThreadParams {
+                thread_id: child_thread_id,
+            }),
+        )
+        .await
+        .expect("unarchive should fail promptly on a busy topology barrier");
+        assert!(matches!(
+            unarchive_result,
+            Err(crate::ThreadStoreError::Conflict { .. })
+        ));
+        drop(topology_guard);
+
+        let restored_child = unarchive_store
+            .unarchive_thread(crate::ArchiveThreadParams {
+                thread_id: child_thread_id,
+            })
+            .await
+            .expect("unarchive should succeed after the delete barrier is released");
+        let restored_child_path = home
+            .path()
+            .join("sessions/2025/01/03")
+            .join(archived_child_path.file_name().expect("child file name"));
+        assert_eq!(
+            restored_child.rollout_path,
+            Some(restored_child_path.clone())
+        );
+        assert!(!archived_child_path.exists());
+        assert!(restored_child_path.exists());
+
+        let delete_again = delete_store
+            .delete_thread(crate::DeleteThreadParams {
+                thread_id: parent_thread_id,
+            })
+            .await;
+        assert!(matches!(
+            delete_again,
+            Err(crate::ThreadStoreError::InvalidRequest { .. })
+        ));
+        assert!(parent_path.exists());
+        assert!(restored_child_path.exists());
     }
 
     #[tokio::test]

@@ -50,6 +50,7 @@ use crate::StoredTurnStatus;
 use crate::ThreadPersistenceMetadata;
 use crate::ThreadSortKey;
 use crate::ThreadStore;
+use crate::ThreadStoreError;
 
 /// Separate Codex and SQLite homes must work together across startup backfill,
 /// thread listing, and projection-backed paginated history reads.
@@ -758,9 +759,20 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
         .expect("read compressed source timestamp");
 
     let (first, second) = tokio::join!(
-        prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
-        prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
+        store.prepare_fork(PrepareForkParams {
+            thread_id: source_thread_id,
+            boundary: ForkBoundary::Latest,
+        }),
+        store.prepare_fork(PrepareForkParams {
+            thread_id: source_thread_id,
+            boundary: ForkBoundary::Latest,
+        }),
     );
+    let prepared = match (first, second) {
+        (Ok(prepared), Err(ThreadStoreError::Conflict { .. }))
+        | (Err(ThreadStoreError::Conflict { .. }), Ok(prepared)) => prepared,
+        (first, second) => panic!("expected one paginated fork to conflict: {first:?}, {second:?}"),
+    };
     assert!(ancestor_path.exists());
     assert!(source_path.exists());
     assert!(!ancestor_compressed_path.exists());
@@ -777,17 +789,15 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
             .expect("read materialized source timestamp"),
         source_modified
     );
-    for prepared in [first, second] {
-        assert!(matches!(
-            prepared.model_context.first(),
-            Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == source_thread_id
+    assert!(matches!(
+        prepared.model_context.first(),
+        Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == source_thread_id
+    ));
+    for message in ["inherited ancestor message", "inherited source message"] {
+        assert!(contains_user_message(
+            prepared.model_context.as_slice(),
+            message
         ));
-        for message in ["inherited ancestor message", "inherited source message"] {
-            assert!(contains_user_message(
-                prepared.model_context.as_slice(),
-                message
-            ));
-        }
     }
 }
 
@@ -1860,6 +1870,8 @@ async fn create_paginated_subagent_thread(
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Paginated,
             history_base,
+            preview: None,
+            first_user_message: None,
             subagent_history_start_ordinal,
             initial_window_id: "window-1".to_string(),
             metadata: ThreadPersistenceMetadata {
