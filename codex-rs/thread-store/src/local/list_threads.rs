@@ -81,26 +81,30 @@ pub(super) async fn list_threads(
     for thread in items {
         let visible = if let Some(path) = thread.rollout_path.as_deref() {
             let managed_path = rollout_path_is_managed(store, path).await;
-            match codex_rollout::existing_rollout_path(path).await {
-                Some(existing_path) => {
-                    match read_session_meta_line(existing_path.as_path()).await {
-                        // A root copied outside CODEX_HOME remains compatible only when the header
-                        // proves both its identity and its lack of a lineage reference.
-                        Ok(meta) if meta.meta.id != thread.thread_id => managed_path,
-                        Ok(meta) if meta.meta.history_base.is_none() => true,
-                        Ok(_) => reference_rollout_path_is_managed(
-                            store,
-                            thread.thread_id,
-                            existing_path.as_path(),
-                        )
-                        .await
-                        .unwrap_or(false),
-                        // Managed stale rows retain metadata-only compatibility. External rows have
-                        // no safe fallback when their header cannot be verified.
-                        Err(_) => managed_path,
+            if managed_path {
+                true
+            } else {
+                match codex_rollout::existing_rollout_path(path).await {
+                    Some(existing_path) => {
+                        match read_session_meta_line(existing_path.as_path()).await {
+                            // A root copied outside CODEX_HOME remains compatible only when the header
+                            // proves both its identity and its lack of a lineage reference.
+                            Ok(meta) if meta.meta.id != thread.thread_id => managed_path,
+                            Ok(meta) if meta.meta.history_base.is_none() => true,
+                            Ok(_) => reference_rollout_path_is_managed(
+                                store,
+                                thread.thread_id,
+                                existing_path.as_path(),
+                            )
+                            .await
+                            .unwrap_or(false),
+                            // Managed stale rows retain metadata-only compatibility. External rows have
+                            // no safe fallback when their header cannot be verified.
+                            Err(_) => managed_path,
+                        }
                     }
+                    None => managed_path,
                 }
-                None => managed_path,
             }
         } else {
             true

@@ -39,7 +39,7 @@ impl WriterLockCoordinator {
                 }
             } else {
                 ThreadStoreError::Internal {
-                    message: format!("failed to acquire thread writer lock: {err}"),
+                    message: format!("failed to acquire thread writer lock for thread {thread_id}: {err}"),
                 }
             }
         })

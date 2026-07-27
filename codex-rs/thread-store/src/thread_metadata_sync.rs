@@ -264,13 +264,13 @@ impl ThreadMetadataSync {
                     {
                         update.memory_mode = Some(memory_mode);
                     }
-                    if let Some(preview) = meta_line.meta.preview.clone() {
+                    if let Some(preview) = meta_line.meta.preview.as_ref() {
                         self.preview_seen = true;
-                        update.preview = Some(preview.to_string());
+                        update.preview = Some(preview.clone());
                     }
-                    if let Some(first_user_message) = meta_line.meta.first_user_message.clone() {
+                    if let Some(first_user_message) = meta_line.meta.first_user_message.as_ref() {
                         self.first_user_message_seen = true;
-                        update.first_user_message = Some(first_user_message.to_string());
+                        update.first_user_message = Some(first_user_message.clone());
                     }
                 }
                 RolloutItem::TurnContext(turn_ctx) => {
