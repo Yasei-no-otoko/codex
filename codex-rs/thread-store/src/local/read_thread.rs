@@ -58,7 +58,8 @@ pub(super) async fn read_thread(
             )
             .await)
     {
-        let external_rollout = !rollout_path_is_managed(store, metadata.rollout_path.as_path());
+        let external_rollout =
+            !rollout_path_is_managed(store, metadata.rollout_path.as_path()).await;
         if external_rollout {
             validate_external_rollout_path(store, thread_id, metadata.rollout_path.as_path())
                 .await?;
@@ -461,40 +462,18 @@ pub(super) async fn reference_rollout_path_is_managed(
             ),
         }
     })?;
-    let sessions_root =
-        std::fs::canonicalize(store.config.codex_home.join(codex_rollout::SESSIONS_SUBDIR)).ok();
-    let archived_root = std::fs::canonicalize(
-        store
-            .config
-            .codex_home
-            .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
-    )
-    .ok();
-    let supplied_is_managed = [sessions_root.as_ref(), archived_root.as_ref()]
-        .into_iter()
-        .flatten()
-        .any(|root| supplied_path.starts_with(root));
+    let supplied_is_managed =
+        codex_rollout::is_rollout_path_managed(&store.config.codex_home, supplied_path.as_path())
+            .await;
     let same_managed_rollout = managed_path == supplied_path;
     Ok(supplied_is_managed && same_managed_rollout)
 }
 
-pub(super) fn rollout_path_is_managed(store: &LocalThreadStore, path: &std::path::Path) -> bool {
-    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    [
-        store.config.codex_home.clone(),
-        store.config.codex_home.join(codex_rollout::SESSIONS_SUBDIR),
-        store
-            .config
-            .codex_home
-            .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
-    ]
-    .into_iter()
-    .any(|root| {
-        path.starts_with(root.as_path())
-            || std::fs::canonicalize(root.as_path())
-                .ok()
-                .is_some_and(|canonical_root| candidate.starts_with(canonical_root))
-    })
+pub(super) async fn rollout_path_is_managed(
+    store: &LocalThreadStore,
+    path: &std::path::Path,
+) -> bool {
+    codex_rollout::is_rollout_path_managed(&store.config.codex_home, path).await
 }
 
 async fn validate_external_rollout_path(
@@ -2065,7 +2044,10 @@ mod tests {
     async fn read_thread_falls_back_to_sqlite_summary() {
         let home = TempDir::new().expect("temp dir");
         let external = TempDir::new().expect("external temp dir");
-        let managed = home.path().join("managed");
+        let managed = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("managed");
         fs::create_dir_all(&managed).expect("managed directory");
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(214);
@@ -2126,7 +2108,10 @@ mod tests {
     #[tokio::test]
     async fn read_thread_sqlite_fallback_respects_include_archived() {
         let home = TempDir::new().expect("temp dir");
-        let managed = home.path().join("managed");
+        let managed = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("managed");
         fs::create_dir_all(&managed).expect("managed directory");
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(216);

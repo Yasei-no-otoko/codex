@@ -416,6 +416,7 @@ mod tests {
         Ok(path)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn feedback_cold_path_rejects_external_reference_but_keeps_legacy_root()
     -> anyhow::Result<()> {
@@ -451,6 +452,18 @@ mod tests {
             Some(source_id),
         )
         .await?;
+        let archived_external_reference_path = {
+            use std::os::unix::fs::symlink;
+
+            let managed_dir = home
+                .path()
+                .join(codex_core::ARCHIVED_SESSIONS_SUBDIR)
+                .join("2025/01/05");
+            std::fs::create_dir_all(&managed_dir)?;
+            let managed_path = managed_dir.join("rollout-external-reference-link.jsonl");
+            symlink(&archived_external_reference_path, &managed_path)?;
+            managed_path
+        };
         for (id, path, archived) in [
             (root_id, root_path.clone(), false),
             (reference_id, reference_path, false),

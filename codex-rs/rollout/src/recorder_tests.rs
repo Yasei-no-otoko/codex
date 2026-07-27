@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::config::RolloutConfig;
+use crate::find_archived_thread_path_by_id_str;
 use crate::find_thread_path_by_id_str;
+use crate::is_rollout_path_managed;
 use chrono::TimeZone;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -224,9 +226,196 @@ async fn state_db_external_legacy_root_path_remains_compatible() -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn state_db_symlinked_rollouts_escape_managed_roots() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let source_id = ThreadId::from_string(&Uuid::from_u128(926).to_string())?;
+    let active_reference_id = Uuid::from_u128(927);
+    let archived_reference_id = Uuid::from_u128(928);
+    let active_root_id = Uuid::from_u128(929);
+    let archived_root_id = Uuid::from_u128(930);
+
+    let active_reference =
+        write_session_file(external.path(), "2025-01-05T10-06-00", active_reference_id)?;
+    let archived_reference = write_session_file(
+        external.path(),
+        "2025-01-05T10-07-00",
+        archived_reference_id,
+    )?;
+    let active_root = write_session_file(external.path(), "2025-01-05T10-08-00", active_root_id)?;
+    let archived_root =
+        write_session_file(external.path(), "2025-01-05T10-09-00", archived_root_id)?;
+    set_history_base(&active_reference, source_id)?;
+    set_history_base(&archived_reference, source_id)?;
+
+    let compressed_reference_id = Uuid::from_u128(931);
+    let compressed_reference = write_session_file(
+        external.path(),
+        "2025-01-05T10-10-00",
+        compressed_reference_id,
+    )?;
+    set_history_base(&compressed_reference, source_id)?;
+    let compressed_reference_path = compressed_reference.with_extension("jsonl.zst");
+    let input = File::open(&compressed_reference)?;
+    let output = File::create(&compressed_reference_path)?;
+    let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
+    std::io::copy(&mut std::io::BufReader::new(input), &mut encoder)?;
+    encoder.finish()?;
+    fs::remove_file(&compressed_reference)?;
+
+    let active_dir = home.path().join(SESSIONS_SUBDIR).join("2025/01/05");
+    let archived_dir = home
+        .path()
+        .join(ARCHIVED_SESSIONS_SUBDIR)
+        .join("2025/01/05");
+    fs::create_dir_all(&active_dir)?;
+    fs::create_dir_all(&archived_dir)?;
+    let active_reference_link = active_dir.join("rollout-active-reference.jsonl");
+    let archived_reference_link = archived_dir.join("rollout-archived-reference.jsonl");
+    let compressed_reference_link = active_dir.join("rollout-compressed-reference.jsonl.zst");
+    let active_root_link = active_dir.join("rollout-active-root.jsonl");
+    let archived_root_link = archived_dir.join("rollout-archived-root.jsonl");
+    symlink(&active_reference, &active_reference_link)?;
+    symlink(&archived_reference, &archived_reference_link)?;
+    symlink(&compressed_reference_path, &compressed_reference_link)?;
+    symlink(&active_root, &active_root_link)?;
+    symlink(&archived_root, &archived_root_link)?;
+
+    let config = test_config(home.path());
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), config.model_provider_id.clone())
+            .await?;
+    for (id, path, archived) in [
+        (
+            ThreadId::from_string(&active_reference_id.to_string())?,
+            active_reference_link.clone(),
+            false,
+        ),
+        (
+            ThreadId::from_string(&archived_reference_id.to_string())?,
+            archived_reference_link.clone(),
+            true,
+        ),
+        (
+            ThreadId::from_string(&active_root_id.to_string())?,
+            active_root_link.clone(),
+            false,
+        ),
+        (
+            ThreadId::from_string(&archived_root_id.to_string())?,
+            archived_root_link.clone(),
+            true,
+        ),
+    ] {
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            id,
+            path,
+            chrono::Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.history_mode = ThreadHistoryMode::Legacy;
+        builder.cwd = home.path().to_path_buf();
+        builder.model_provider = Some(config.model_provider_id.clone());
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.archived_at = archived.then(chrono::Utc::now);
+        runtime.upsert_thread(&metadata).await?;
+    }
+
+    assert!(
+        find_thread_path_by_id_str(
+            home.path(),
+            &active_reference_id.to_string(),
+            Some(&runtime),
+        )
+        .await?
+        .is_none()
+    );
+    assert!(
+        find_archived_thread_path_by_id_str(
+            home.path(),
+            &archived_reference_id.to_string(),
+            Some(&runtime),
+        )
+        .await?
+        .is_none()
+    );
+    let stale_id = ThreadId::from_string(&Uuid::from_u128(932).to_string())?;
+    let stale_path = home
+        .path()
+        .join(SESSIONS_SUBDIR)
+        .join("2025/01/05/rollout-missing.jsonl");
+    assert!(is_rollout_path_managed(home.path(), &stale_path).await);
+    assert!(state_db_rollout_path_is_visible(home.path(), stale_id, &stale_path).await?);
+    assert!(
+        !is_rollout_path_managed(home.path(), &home.path().join("rollout-missing.jsonl"),).await
+    );
+    assert!(
+        !is_rollout_path_managed(
+            home.path(),
+            &home
+                .path()
+                .join(SESSIONS_SUBDIR)
+                .join("2025/01/05/../outside/rollout-missing.jsonl"),
+        )
+        .await
+    );
+    let broken_link = active_dir.join("rollout-broken.jsonl");
+    symlink(external.path().join("does-not-exist.jsonl"), &broken_link)?;
+    assert!(!is_rollout_path_managed(home.path(), &broken_link).await);
+
+    assert!(
+        !state_db_rollout_path_is_visible(
+            home.path(),
+            ThreadId::from_string(&active_reference_id.to_string())?,
+            &active_reference_link,
+        )
+        .await?
+    );
+    assert!(
+        !state_db_rollout_path_is_visible(
+            home.path(),
+            ThreadId::from_string(&archived_reference_id.to_string())?,
+            &archived_reference_link,
+        )
+        .await?
+    );
+    assert!(
+        !state_db_rollout_path_is_visible(
+            home.path(),
+            ThreadId::from_string(&compressed_reference_id.to_string())?,
+            &compressed_reference_link,
+        )
+        .await?
+    );
+    assert!(
+        state_db_rollout_path_is_visible(
+            home.path(),
+            ThreadId::from_string(&active_root_id.to_string())?,
+            &active_root_link,
+        )
+        .await?
+    );
+    assert!(
+        state_db_rollout_path_is_visible(
+            home.path(),
+            ThreadId::from_string(&archived_root_id.to_string())?,
+            &archived_root_link,
+        )
+        .await?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn list_search_rejects_external_reference_without_reconciling_state_db() -> anyhow::Result<()>
 {
+    use std::os::unix::fs::symlink;
+
     let home = TempDir::new()?;
     let external = TempDir::new()?;
     let config = test_config(home.path());
@@ -240,9 +429,13 @@ async fn list_search_rejects_external_reference_without_reconciling_state_db() -
     let source_id = ThreadId::from_string(&Uuid::from_u128(924).to_string())?;
     let path = write_session_file(external.path(), "2025-01-05T10-02-00", uuid)?;
     set_history_base(&path, source_id)?;
+    let managed_dir = home.path().join(SESSIONS_SUBDIR).join("2025/01/05");
+    fs::create_dir_all(&managed_dir)?;
+    let managed_path = managed_dir.join("rollout-external-reference.jsonl");
+    symlink(&path, &managed_path)?;
     let mut builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
-        path.clone(),
+        managed_path.clone(),
         chrono::Utc::now(),
         SessionSource::Cli,
     );

@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::num::NonZero;
 use std::ops::ControlFlow;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -1377,7 +1378,8 @@ async fn find_thread_path_by_id_str_in_subdir(
             .await
         {
             Ok(Some(db_path)) => {
-                let db_path_is_managed = rollout_path_is_managed(codex_home, db_path.as_path());
+                let db_path_is_managed =
+                    is_rollout_path_managed(codex_home, db_path.as_path()).await;
                 let state_db_candidate_visible =
                     state_db_rollout_path_is_visible(codex_home, thread_id, db_path.as_path())
                         .await?;
@@ -1550,7 +1552,7 @@ pub(crate) async fn state_db_rollout_path_is_visible(
     thread_id: ThreadId,
     path: &Path,
 ) -> io::Result<bool> {
-    let managed = rollout_path_is_managed(codex_home, path);
+    let managed = is_rollout_path_managed(codex_home, path).await;
     let Some(existing_path) = compression::existing_rollout_path(path).await else {
         return Ok(managed);
     };
@@ -1564,20 +1566,41 @@ pub(crate) async fn state_db_rollout_path_is_visible(
     Ok(managed || meta.meta.history_base.is_none())
 }
 
-fn rollout_path_is_managed(codex_home: &Path, path: &Path) -> bool {
-    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    [
-        codex_home.to_path_buf(),
+/// Return whether a rollout path is represented by a file under Codex's managed session roots.
+///
+/// Existing plain or compressed representations are canonicalized before the root check. This
+/// makes a symlink inside `sessions` or `archived_sessions` that escapes the Codex home external
+/// instead of treating its lexical path as managed. Missing representations retain the legacy
+/// metadata-only compatibility for lexical paths directly under one of those roots, excluding
+/// parent-directory traversal and broken symlinks.
+pub async fn is_rollout_path_managed(codex_home: &Path, path: &Path) -> bool {
+    let roots = [
         codex_home.join(SESSIONS_SUBDIR),
         codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
-    ]
-    .into_iter()
-    .any(|root| {
-        path.starts_with(root.as_path())
-            || std::fs::canonicalize(root.as_path())
-                .ok()
-                .is_some_and(|canonical_root| candidate.starts_with(canonical_root))
-    })
+    ];
+    let Some(existing_path) = compression::existing_rollout_path(path).await else {
+        if matches!(
+            std::fs::symlink_metadata(path),
+            Ok(metadata) if metadata.file_type().is_symlink()
+        ) {
+            return false;
+        }
+        return roots.iter().any(|root| {
+            let Ok(relative) = path.strip_prefix(root) else {
+                return false;
+            };
+            !relative
+                .components()
+                .any(|component| component == Component::ParentDir)
+        });
+    };
+    let Ok(candidate) = std::fs::canonicalize(existing_path) else {
+        return false;
+    };
+    roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| candidate.starts_with(root))
 }
 
 async fn find_rollout_path_by_id_from_filenames(

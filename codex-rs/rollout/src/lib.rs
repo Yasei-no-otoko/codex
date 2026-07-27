@@ -63,6 +63,7 @@ pub use list::find_thread_path_by_id_str;
 pub use list::find_thread_path_by_id_str as find_conversation_path_by_id_str;
 pub use list::get_threads;
 pub use list::get_threads_in_root;
+pub use list::is_rollout_path_managed;
 pub use list::parse_cursor;
 pub use list::read_head_for_summary;
 pub use list::read_session_meta_line;

@@ -80,7 +80,7 @@ pub(super) async fn list_threads(
     let mut visible_items = Vec::with_capacity(items.len());
     for thread in items {
         let visible = if let Some(path) = thread.rollout_path.as_deref() {
-            let managed_path = rollout_path_is_managed(store, path);
+            let managed_path = rollout_path_is_managed(store, path).await;
             match codex_rollout::existing_rollout_path(path).await {
                 Some(existing_path) => {
                     match read_session_meta_line(existing_path.as_path()).await {
@@ -301,7 +301,12 @@ mod tests {
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(103);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path = home.path().join("rollout-title-search.jsonl");
+        let rollout_path = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("2025/01/03/rollout-title-search.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+            .expect("rollout directory");
         fs::write(&rollout_path, "").expect("placeholder rollout file");
 
         let runtime = codex_state::StateRuntime::init(
@@ -481,7 +486,12 @@ mod tests {
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(104);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path = home.path().join("rollout-paginated-name-search.jsonl");
+        let rollout_path = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("2025/01/03/rollout-paginated-name-search.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+            .expect("rollout directory");
         fs::write(&rollout_path, "").expect("placeholder rollout file");
 
         let runtime = codex_state::StateRuntime::init(
