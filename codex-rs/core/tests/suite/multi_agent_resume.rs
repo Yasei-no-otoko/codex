@@ -125,7 +125,7 @@ async fn wait_for_spawned_worker(
     test: &TestCodex,
     root_thread_id: ThreadId,
 ) -> Result<(ThreadId, Arc<CodexThread>)> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let discovery_deadline = Instant::now() + Duration::from_secs(10);
     let thread_id = loop {
         if let Some(thread_id) = test
             .thread_manager
@@ -136,17 +136,18 @@ async fn wait_for_spawned_worker(
         {
             break thread_id;
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= discovery_deadline {
             anyhow::bail!("timed out waiting for spawned worker");
         }
         sleep(Duration::from_millis(10)).await;
     };
     let thread = test.thread_manager.get_thread(thread_id).await?;
+    let completion_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if matches!(thread.agent_status().await, AgentStatus::Completed(_)) {
             return Ok((thread_id, thread));
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= completion_deadline {
             anyhow::bail!("timed out waiting for worker completion");
         }
         sleep(Duration::from_millis(10)).await;
