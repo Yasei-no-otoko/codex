@@ -185,6 +185,7 @@ async fn read_thread_from_preheld_source_path(
     }
     reject_paginated_history(&thread, params.include_history)?;
     if params.include_history {
+        let source_writer_guard = source_writer_guard.clone();
         let items = load_history_items_for_thread_with_preheld_source_guard(
             store,
             thread_id,
@@ -193,14 +194,27 @@ async fn read_thread_from_preheld_source_path(
         )
         .await?;
         thread.history = Some(StoredThreadHistory { thread_id, items });
-        enrich_legacy_reference_summary(store, &mut thread).await?;
     }
+    enrich_legacy_reference_summary_with_source_guard(
+        store,
+        &mut thread,
+        Some(source_writer_guard),
+    )
+    .await?;
     Ok(thread)
 }
 
 pub(super) async fn enrich_legacy_reference_summary(
     store: &LocalThreadStore,
     thread: &mut StoredThread,
+) -> ThreadStoreResult<()> {
+    enrich_legacy_reference_summary_with_source_guard(store, thread, None).await
+}
+
+pub(super) async fn enrich_legacy_reference_summary_with_source_guard(
+    store: &LocalThreadStore,
+    thread: &mut StoredThread,
+    source_writer_guard: Option<WriterLockGuard>,
 ) -> ThreadStoreResult<()> {
     if thread.history_mode != ThreadHistoryMode::Legacy {
         return Ok(());
@@ -281,9 +295,21 @@ pub(super) async fn enrich_legacy_reference_summary(
         }
         return Ok(());
     }
-    let (lineage, _writer_guards) = store
-        .resolve_rollout_lineage_for_reference_locked(thread.thread_id)
-        .await?;
+    let (lineage, _writer_guards) = match source_writer_guard {
+        Some(source_writer_guard) => {
+            store
+                .resolve_rollout_lineage_for_reference_locked_with_source_tokens(
+                    thread.thread_id,
+                    source_writer_guard,
+                )
+                .await?
+        }
+        None => {
+            store
+                .resolve_rollout_lineage_for_reference_locked(thread.thread_id)
+                .await?
+        }
+    };
     let summary = summarize_legacy_lineage(&lineage).await?;
     apply_legacy_summary(thread, summary);
     persist_legacy_summary_to_state_db(store, thread).await;
