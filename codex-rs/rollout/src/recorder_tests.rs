@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::config::RolloutConfig;
+use crate::find_thread_path_by_id_str;
 use chrono::TimeZone;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -134,6 +135,155 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
     Ok(path)
 }
 
+fn set_history_base(path: &Path, source_id: ThreadId) -> std::io::Result<()> {
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines();
+    let first = lines
+        .next()
+        .ok_or_else(|| std::io::Error::other("session file is missing metadata"))?;
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(first).map_err(std::io::Error::other)?;
+    metadata["payload"]["history_base"] = serde_json::json!({
+        "thread_id": source_id,
+        "end_ordinal_exclusive": 0,
+        "end_byte_offset": 1,
+    });
+    let mut updated = serde_json::to_string(&metadata).map_err(std::io::Error::other)?;
+    for line in lines {
+        updated.push('\n');
+        updated.push_str(line);
+    }
+    updated.push('\n');
+    fs::write(path, updated)
+}
+
+#[tokio::test]
+async fn state_db_external_reference_path_is_rejected_without_reconciliation() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let config = test_config(home.path());
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), config.model_provider_id.clone())
+            .await?;
+    let uuid = Uuid::from_u128(920);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let source_id = ThreadId::from_string(&Uuid::from_u128(921).to_string())?;
+    let path = write_session_file(external.path(), "2025-01-05T10-00-00", uuid)?;
+    set_history_base(&path, source_id)?;
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        path.clone(),
+        chrono::Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.history_mode = ThreadHistoryMode::Legacy;
+    builder.cwd = home.path().to_path_buf();
+    builder.model_provider = Some(config.model_provider_id.clone());
+    let mut metadata = builder.build(config.model_provider_id.as_str());
+    metadata.preview = Some("external reference".to_string());
+    runtime.upsert_thread(&metadata).await?;
+
+    let found =
+        find_thread_path_by_id_str(home.path(), &thread_id.to_string(), Some(&runtime)).await?;
+    assert!(found.is_none());
+    assert_eq!(
+        runtime.get_thread(thread_id).await?.unwrap().rollout_path,
+        path
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn state_db_external_legacy_root_path_remains_compatible() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let config = test_config(home.path());
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), config.model_provider_id.clone())
+            .await?;
+    let uuid = Uuid::from_u128(922);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let path = write_session_file(external.path(), "2025-01-05T10-01-00", uuid)?;
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        path.clone(),
+        chrono::Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.history_mode = ThreadHistoryMode::Legacy;
+    builder.cwd = home.path().to_path_buf();
+    builder.model_provider = Some(config.model_provider_id.clone());
+    runtime
+        .upsert_thread(&builder.build(config.model_provider_id.as_str()))
+        .await?;
+
+    let found =
+        find_thread_path_by_id_str(home.path(), &thread_id.to_string(), Some(&runtime)).await?;
+    assert_eq!(found, Some(path));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_search_rejects_external_reference_without_reconciling_state_db() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let config = test_config(home.path());
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), config.model_provider_id.clone())
+            .await?;
+    runtime.mark_backfill_complete(None).await?;
+
+    let uuid = Uuid::from_u128(923);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let source_id = ThreadId::from_string(&Uuid::from_u128(924).to_string())?;
+    let path = write_session_file(external.path(), "2025-01-05T10-02-00", uuid)?;
+    set_history_base(&path, source_id)?;
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        path.clone(),
+        chrono::Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.history_mode = ThreadHistoryMode::Legacy;
+    builder.cwd = home.path().to_path_buf();
+    builder.model_provider = Some(config.model_provider_id.clone());
+    let mut metadata = builder.build(config.model_provider_id.as_str());
+    metadata.preview = Some("external reference".to_string());
+    metadata.first_user_message = Some("external reference first".to_string());
+    runtime.upsert_thread(&metadata).await?;
+    let before = runtime
+        .get_thread(thread_id)
+        .await?
+        .expect("external reference metadata should exist");
+
+    let page = RolloutRecorder::list_threads(
+        Some(runtime.clone()),
+        &config,
+        10,
+        None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        None,
+        None,
+        config.model_provider_id.as_str(),
+        Some("external reference"),
+    )
+    .await?;
+    assert!(page.items.is_empty());
+
+    let after = runtime
+        .get_thread(thread_id)
+        .await?
+        .expect("external reference metadata should remain");
+    assert_eq!(after.rollout_path, before.rollout_path);
+    assert_eq!(after.preview, before.preview);
+    assert_eq!(after.first_user_message, before.first_user_message);
+    Ok(())
+}
+
 #[test]
 fn append_repair_terminates_nonempty_rollout_tail() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -200,6 +350,8 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             memory_mode: None,
             history_mode: Default::default(),
             history_base: None,
+            preview: None,
+            first_user_message: None,
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,

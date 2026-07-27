@@ -98,6 +98,7 @@ pub type ConversationsPage = ThreadsPage;
 #[derive(Default)]
 struct HeadTailSummary {
     saw_session_meta: bool,
+    has_history_base: bool,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
     preview: Option<String>,
@@ -804,7 +805,7 @@ async fn build_thread_item(
         return None;
     }
     // Apply filters: must have session meta and a discoverable preview.
-    if summary.saw_session_meta && summary.preview.is_some() {
+    if summary.saw_session_meta && (summary.preview.is_some() || summary.has_history_base) {
         let HeadTailSummary {
             thread_id,
             first_user_message,
@@ -1148,6 +1149,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 if !summary.saw_session_meta {
                     summary.source = Some(session_meta_line.meta.source.clone());
                     summary.history_mode = session_meta_line.meta.history_mode;
+                    summary.has_history_base = session_meta_line.meta.history_base.is_some();
                     summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
                     summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
                     summary.agent_role = session_meta_line.meta.agent_role.clone();
@@ -1168,7 +1170,24 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                         .and_then(|git| git.repository_url.clone());
                     summary.cli_version = Some(session_meta_line.meta.cli_version);
                     summary.created_at = Some(session_meta_line.meta.timestamp.clone());
+                    summary.preview = session_meta_line
+                        .meta
+                        .preview
+                        .as_deref()
+                        .map(std::string::ToString::to_string);
+                    summary.first_user_message = session_meta_line
+                        .meta
+                        .first_user_message
+                        .as_deref()
+                        .map(std::string::ToString::to_string);
                     summary.saw_session_meta = true;
+                } else {
+                    if let Some(preview) = session_meta_line.meta.preview {
+                        summary.preview = Some(preview.to_string());
+                    }
+                    if let Some(first_user_message) = session_meta_line.meta.first_user_message {
+                        summary.first_user_message = Some(first_user_message.to_string());
+                    }
                 }
             }
             RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
@@ -1358,11 +1377,25 @@ async fn find_thread_path_by_id_str_in_subdir(
             .await
         {
             Ok(Some(db_path)) => {
-                if let Some(existing_db_path) =
+                let db_path_is_managed = rollout_path_is_managed(codex_home, db_path.as_path());
+                let state_db_candidate_visible =
+                    state_db_rollout_path_is_visible(codex_home, thread_id, db_path.as_path())
+                        .await?;
+                if !state_db_candidate_visible {
+                    codex_state::record_fallback(
+                        "find_thread_path",
+                        "external_path_rejected",
+                        /*telemetry_override*/ None,
+                    );
+                } else if let Some(existing_db_path) =
                     compression::existing_rollout_path(db_path.as_path()).await
                 {
                     match read_session_meta_line(&existing_db_path).await {
-                        Ok(meta_line) if meta_line.meta.id == thread_id => {
+                        Ok(meta_line)
+                            if meta_line.meta.id == thread_id
+                                && (db_path_is_managed
+                                    || meta_line.meta.history_base.is_none()) =>
+                        {
                             return Ok(Some(existing_db_path));
                         }
                         Ok(meta_line) => {
@@ -1380,12 +1413,23 @@ async fn find_thread_path_by_id_str_in_subdir(
                                 /*telemetry_override*/ None,
                             );
                         }
-                        Err(err) => {
+                        Err(err) if db_path_is_managed => {
                             tracing::debug!(
                                 "state db returned rollout path for thread {id_str} that could not be verified: {}: {err}",
                                 existing_db_path.display()
                             );
                             unverified_db_path = Some(existing_db_path);
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                "external state db rollout path for thread {id_str} could not be verified: {}: {err}",
+                                existing_db_path.display()
+                            );
+                            codex_state::record_fallback(
+                                "find_thread_path",
+                                "external_path_rejected",
+                                /*telemetry_override*/ None,
+                            );
                         }
                     }
                 } else {
@@ -1398,7 +1442,11 @@ async fn find_thread_path_by_id_str_in_subdir(
                     );
                     codex_state::record_fallback(
                         "find_thread_path",
-                        "stale_path",
+                        if db_path_is_managed {
+                            "stale_path"
+                        } else {
+                            "external_path_rejected"
+                        },
                         /*telemetry_override*/ None,
                     );
                 }
@@ -1491,6 +1539,45 @@ async fn find_thread_path_by_id_str_in_subdir(
     }
 
     Ok(found.or(unverified_db_path))
+}
+
+/// Validate a state-db rollout candidate before callers reconcile or consume it. External legacy
+/// roots remain compatible when their header proves the requested id and has no history base;
+/// external reference children and unverifiable paths are rejected. Managed stale rows retain
+/// the historical metadata-only fallback behavior.
+pub(crate) async fn state_db_rollout_path_is_visible(
+    codex_home: &Path,
+    thread_id: ThreadId,
+    path: &Path,
+) -> io::Result<bool> {
+    let managed = rollout_path_is_managed(codex_home, path);
+    let Some(existing_path) = compression::existing_rollout_path(path).await else {
+        return Ok(managed);
+    };
+    let meta = match read_session_meta_line(existing_path.as_path()).await {
+        Ok(meta) => meta,
+        Err(_) => return Ok(managed),
+    };
+    if meta.meta.id != thread_id {
+        return Ok(managed);
+    }
+    Ok(managed || meta.meta.history_base.is_none())
+}
+
+fn rollout_path_is_managed(codex_home: &Path, path: &Path) -> bool {
+    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    [
+        codex_home.to_path_buf(),
+        codex_home.join(SESSIONS_SUBDIR),
+        codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
+    ]
+    .into_iter()
+    .any(|root| {
+        path.starts_with(root.as_path())
+            || std::fs::canonicalize(root.as_path())
+                .ok()
+                .is_some_and(|canonical_root| candidate.starts_with(canonical_root))
+    })
 }
 
 async fn find_rollout_path_by_id_from_filenames(

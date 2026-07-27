@@ -14,7 +14,6 @@ use super::LocalThreadStore;
 use super::create_thread;
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
-use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -30,11 +29,10 @@ pub(super) async fn create_thread(
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let history_mode = params.history_mode;
     store.ensure_live_recorder_absent(thread_id).await?;
-    let writer_lock = if matches!(history_mode, ThreadHistoryMode::Paginated) {
-        Some(store.writer_lock_coordinator.acquire(thread_id)?)
-    } else {
-        None
-    };
+    // Keep the shared filesystem lock for the entire recorder lifetime.  This applies to legacy
+    // rollouts as well as paginated ones: maintenance must not rename or remove the pathname
+    // while the recorder still owns an open append file descriptor.
+    let writer_lock = Some(store.writer_lock_coordinator.acquire(thread_id)?);
     let recorder = create_thread::create_thread(store, params).await?;
     store
         .insert_live_recorder(thread_id, recorder, history_mode, writer_lock)
@@ -45,41 +43,96 @@ pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<()> {
-    let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    let live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
+    // Acquire before resolving the rollout path or reading history.  A second process may be
+    // archiving/compressing/deleting the same legacy pathname, so no recorder initialization may
+    // observe a path that is moved immediately before it opens its append handle.
+    let writer_lock = Some(store.writer_lock_coordinator.acquire(params.thread_id)?);
+    // Resolve the resume path exactly once under the pre-held filesystem guard. Keep its
+    // canonical header alongside the path so mode and reference detection use one snapshot.
+    let resolved_rollout_path = if let Some(path) = params.rollout_path.as_ref() {
+        Some(super::read_thread::resolve_requested_rollout_path(store, path.clone()).await?)
+    } else {
+        super::read_thread::resolve_rollout_path(store, params.thread_id, params.include_archived)
+            .await?
+            .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                message: format!("no rollout found for thread id {}", params.thread_id),
+            })
+            .map(Some)?
+    };
+    let resolved_source_meta = if let Some(path) = resolved_rollout_path.as_ref() {
+        Some(
+            codex_rollout::read_session_meta_line(path.as_path())
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to read session metadata {}: {err}", path.display()),
+                })?,
+        )
+    } else {
+        None
+    };
+    if let Some(meta) = resolved_source_meta.as_ref()
+        && meta.meta.id != params.thread_id
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout {} belongs to thread {}, not {}",
+                resolved_rollout_path.as_ref().map_or_else(
+                    || "<unknown>".to_string(),
+                    |path| path.display().to_string()
+                ),
+                meta.meta.id,
+                params.thread_id
+            ),
+        });
+    }
     let history_mode = if let Some(history) = params.history.as_deref() {
         canonical_history_mode_from_rollout_items(history)
-    } else if let Some(rollout_path) = params.rollout_path.as_ref() {
-        super::read_thread::read_thread_by_rollout_path(
-            store,
-            rollout_path.clone(),
-            params.include_archived,
-            /*include_history*/ false,
-        )
-        .await?
-        .history_mode
     } else {
-        super::read_thread::read_thread(
-            store,
-            ReadThreadParams {
-                thread_id: params.thread_id,
-                include_archived: params.include_archived,
-                include_history: false,
-            },
-        )
-        .await?
-        .history_mode
+        resolved_source_meta
+            .as_ref()
+            .map(|meta| meta.meta.history_mode)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: format!("missing resolved rollout metadata for {}", params.thread_id),
+            })?
     };
-    let rollout_path = match (params.rollout_path, params.history) {
-        (Some(rollout_path), _history) => rollout_path,
-        (None, history) => {
-            let thread = super::read_thread::read_thread(
+    let rollout_path = {
+        let path = resolved_rollout_path.ok_or_else(|| ThreadStoreError::Internal {
+            message: format!("thread {} does not have a rollout path", params.thread_id),
+        })?;
+        let has_reference_base = resolved_source_meta
+            .as_ref()
+            .is_some_and(|meta| meta.meta.history_base.is_some());
+        if has_reference_base {
+            let thread =
+                super::read_thread::read_thread_by_rollout_path_with_preheld_source_guards(
+                    store,
+                    path.clone(),
+                    params.thread_id,
+                    params.include_archived,
+                    /*include_history*/
+                    params.history.is_none() && history_mode != ThreadHistoryMode::Paginated,
+                    &live_writer_guard,
+                    writer_lock
+                        .clone()
+                        .ok_or_else(|| ThreadStoreError::Internal {
+                            message: format!("missing writer lock for thread {}", params.thread_id),
+                        })?,
+                )
+                .await?;
+            thread
+                .rollout_path
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: format!("thread {} does not have a rollout path", params.thread_id),
+                })?
+        } else {
+            let thread = super::read_thread::read_thread_by_rollout_path(
                 store,
-                ReadThreadParams {
-                    thread_id: params.thread_id,
-                    include_archived: params.include_archived,
-                    include_history: history.is_none(),
-                },
+                path.clone(),
+                params.include_archived,
+                /*include_history*/
+                params.history.is_none() && history_mode != ThreadHistoryMode::Paginated,
             )
             .await?;
             thread
@@ -102,11 +155,6 @@ pub(super) async fn resume_thread(
         cwd,
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
-    };
-    let writer_lock = if matches!(history_mode, ThreadHistoryMode::Paginated) {
-        Some(store.writer_lock_coordinator.acquire(params.thread_id)?)
-    } else {
-        None
     };
     let recorder = RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path))
         .await

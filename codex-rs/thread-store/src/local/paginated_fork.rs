@@ -15,29 +15,47 @@ use crate::ThreadStoreResult;
 pub(super) async fn prepare(
     store: &LocalThreadStore,
     params: PrepareForkParams,
+    source_guards: super::ForkSourceGuards,
 ) -> ThreadStoreResult<PreparedFork> {
     let PrepareForkParams {
         thread_id,
         boundary,
     } = params;
-    let source_reservation = store.live_writer_locks.reserve_lifecycle(thread_id).await;
+    let super::ForkSourceGuards {
+        lifecycle: source_reservation,
+        filesystem: source_filesystem_guard,
+    } = source_guards;
     // Keep the source reserved until persistence and lineage materialization finish, even if the
     // caller cancels fork preparation.
     let lineage_store = store.clone();
-    let (lineage, source_reservation) = tokio::spawn(async move {
-        match live_writer::persist_thread(&lineage_store, thread_id).await {
-            Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
-            Err(err) => return Err(err),
-        }
-        let lineage = lineage_store
-            .resolve_rollout_lineage_for_reference(thread_id)
-            .await?;
-        Ok::<_, ThreadStoreError>((lineage, source_reservation))
-    })
-    .await
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to resolve fork lineage: {err}"),
-    })??;
+    let (lineage, source_reservation, source_filesystem_guard, ancestor_writer_guards) =
+        tokio::spawn(async move {
+            match live_writer::persist_thread(&lineage_store, thread_id).await {
+                Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+            let (lineage, ancestor_writer_guards) = lineage_store
+                .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+                    thread_id,
+                    source_filesystem_guard.clone(),
+                )
+                .await?;
+            Ok::<_, ThreadStoreError>((
+                lineage,
+                source_reservation,
+                source_filesystem_guard,
+                ancestor_writer_guards,
+            ))
+        })
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to resolve fork lineage: {err}"),
+        })??;
+    if lineage.history_mode() != codex_protocol::protocol::ThreadHistoryMode::Paginated {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!("fork source {thread_id} does not use paginated history"),
+        });
+    }
     let source_segment = lineage
         .segments()
         .last()
@@ -59,7 +77,7 @@ pub(super) async fn prepare(
             .await?;
         }
     }
-    let source_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    let source_live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     super::thread_history_materialization::materialize_to_sqlite(
         store,
         thread_id,
@@ -145,14 +163,15 @@ pub(super) async fn prepare(
         } else {
             Some(position)
         };
-    drop(source_writer_guard);
+    drop(source_live_writer_guard);
     let model_context = Arc::new(model_context::load_for_fork(lineage, history_base).await?);
+    drop(ancestor_writer_guards);
 
     Ok(PreparedFork::new(
         thread_id,
         history_base,
         model_context,
-        source_reservation,
+        (source_reservation, source_filesystem_guard),
     ))
 }
 
@@ -165,5 +184,51 @@ fn missing_turn_position(turn_id: &str) -> ThreadStoreError {
 fn invalid_turn_position(turn_id: &str) -> ThreadStoreError {
     ThreadStoreError::Internal {
         message: format!("invalid rollout position for turn {turn_id}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalThreadStore;
+    use super::prepare;
+    use crate::ForkBoundary;
+    use crate::PrepareForkParams;
+    use crate::ThreadStoreError;
+    use crate::local::test_support::test_config;
+    use crate::local::test_support::write_session_file_with_history_mode;
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::ThreadHistoryMode;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn prepare_rejects_legacy_lineage_before_projection() {
+        let home = TempDir::new().expect("temp dir");
+        let source_uuid = Uuid::from_u128(434);
+        let source_id = ThreadId::from_string(&source_uuid.to_string()).expect("source id");
+        write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-04T12-35-00",
+            source_uuid,
+            ThreadHistoryMode::Legacy,
+        )
+        .expect("legacy source rollout");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let source_guards = store
+            .acquire_fork_source_guards(source_id)
+            .await
+            .expect("source guards");
+        let error = prepare(
+            &store,
+            PrepareForkParams {
+                thread_id: source_id,
+                boundary: ForkBoundary::Latest,
+            },
+            source_guards,
+        )
+        .await
+        .expect_err("paginated preparation must reject legacy source");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert!(error.to_string().contains("paginated history"));
     }
 }

@@ -20,6 +20,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
@@ -59,6 +60,7 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_rollout::RolloutRecorder;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
 use codex_rollout::read_session_meta_line;
@@ -146,6 +148,7 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     session_meta.meta.multi_agent_version = Some(MultiAgentVersion::V1);
     append_rollout_item_to_path(&original_path, &RolloutItem::SessionMeta(session_meta)).await?;
     let original_contents = std::fs::read_to_string(&original_path)?;
+    let source_cutoff = original_contents.len() as u64;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -207,6 +210,27 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     assert_eq!(thread.source, SessionSource::VsCode);
     assert_eq!(thread.thread_source, Some(ThreadSource::User));
     assert_eq!(thread.name, None);
+    let child_meta = read_session_meta_line(thread_path.as_path()).await?;
+    let history_base = child_meta
+        .meta
+        .history_base
+        .expect("latest legacy fork should reference its source");
+    assert_eq!(
+        history_base.thread_id,
+        ThreadId::from_string(&conversation_id)?
+    );
+    assert_eq!(history_base.end_ordinal_exclusive, 0);
+    assert_eq!(history_base.end_byte_offset, source_cutoff);
+    assert_eq!(child_meta.meta.preview.as_deref(), Some(preview));
+    assert_eq!(child_meta.meta.first_user_message.as_deref(), Some(preview));
+    let (child_items, _, _) = RolloutRecorder::load_rollout_items(thread_path.as_path()).await?;
+    assert!(!child_items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::UserMessage(message))
+                if message.message == preview
+        )
+    }));
 
     assert_eq!(
         thread.turns.len(),
@@ -275,10 +299,137 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     );
     let started: ThreadStartedNotification =
         serde_json::from_value(notif.params.expect("params must be present"))?;
+    let child_thread_id = thread.id.clone();
     let mut expected_started_thread = thread;
     expected_started_thread.turns.clear();
     assert_eq!(started.thread, expected_started_thread);
 
+    // Appending to the source after the fork must not change the child's frozen logical history.
+    append_rollout_item_to_path(
+        &original_path,
+        &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "source appended after fork".to_string(),
+            ..Default::default()
+        })),
+    )
+    .await?;
+    let turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: child_thread_id,
+            input: vec![UserInput::Text {
+                text: "child turn after fork".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let requests = server.received_requests().await.expect("wiremock requests");
+    let response_request = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/responses"))
+        .expect("child turn response request");
+    let model_input = serde_json::to_string(
+        response_request
+            .body_json::<Value>()?
+            .get("input")
+            .expect("response input"),
+    )?;
+    assert!(model_input.contains(preview));
+    assert!(model_input.contains("child turn after fork"));
+    assert!(!model_input.contains("source appended after fork"));
+
+    let exclude_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse {
+        thread: excluded_thread,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(exclude_id)).await??;
+    assert!(excluded_thread.turns.is_empty());
+    let excluded_meta = read_session_meta_line(
+        excluded_thread
+            .path
+            .as_ref()
+            .expect("excluded child path")
+            .as_path(),
+    )
+    .await?;
+    assert_eq!(
+        excluded_meta
+            .meta
+            .history_base
+            .expect("excluded latest legacy fork history base")
+            .thread_id,
+        ThreadId::from_string(&conversation_id)?
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_active_goal_persists_reference_summary_in_canonical_session_meta() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let config_path = codex_home.path().join("config.toml");
+    std::fs::write(&config_path, "[features]\ngoals = true\n")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread: source, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+    assert!(
+        source.preview.is_empty(),
+        "goal-only source starts without a preview"
+    );
+
+    let objective = "finish the active goal before forking";
+    let goal_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": source.id,
+                "objective": objective,
+                "status": "active",
+            })),
+        )
+        .await?;
+    let _: ThreadGoalSetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(goal_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/goal/updated"),
+    )
+    .await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source.id,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread: child, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    let child_path = child.path.clone().expect("fork child path");
+    let child_meta = read_session_meta_line(child_path.as_path()).await?;
+    assert_eq!(child_meta.meta.preview.as_deref(), Some(objective));
+    assert_eq!(child_meta.meta.first_user_message, None);
+    assert!(child_meta.meta.history_base.is_some());
     Ok(())
 }
 

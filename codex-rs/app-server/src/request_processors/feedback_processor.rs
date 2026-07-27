@@ -9,6 +9,29 @@ use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
 
+async fn resolve_rollout_path_from_state_db(
+    codex_home: &std::path::Path,
+    conversation_id: ThreadId,
+    state_db_ctx: &StateDbHandle,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let active = codex_rollout::find_thread_path_by_id_str(
+        codex_home,
+        &conversation_id.to_string(),
+        Some(state_db_ctx.as_ref()),
+    )
+    .await?;
+    if active.is_some() {
+        return Ok(active);
+    }
+
+    codex_rollout::find_archived_thread_path_by_id_str(
+        codex_home,
+        &conversation_id.to_string(),
+        Some(state_db_ctx.as_ref()),
+    )
+    .await
+}
+
 #[derive(Clone)]
 pub(crate) struct FeedbackRequestProcessor {
     auth_manager: Arc<AuthManager>,
@@ -275,13 +298,16 @@ impl FeedbackRequestProcessor {
         }
 
         let state_db_ctx = state_db_ctx?;
-        state_db_ctx
-            .find_rollout_path_by_id(conversation_id, /*archived_only*/ None)
-            .await
-            .unwrap_or_else(|err| {
-                warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
-                None
-            })
+        resolve_rollout_path_from_state_db(
+            self.config.codex_home.as_path(),
+            conversation_id,
+            state_db_ctx,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
+            None
+        })
     }
 }
 
@@ -349,7 +375,155 @@ fn windows_sandbox_log_attachment(_codex_home: &Path) -> Option<FeedbackAttachme
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::protocol::HistoryPosition;
+    use codex_protocol::protocol::SessionSource;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    async fn write_external_rollout(
+        root: &std::path::Path,
+        id: ThreadId,
+        history_base: Option<ThreadId>,
+    ) -> std::io::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(root)?;
+        let path = root.join(format!("rollout-{id}.jsonl"));
+        let mut metadata = serde_json::json!({
+            "timestamp": "2025-01-05T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "session_id": id,
+                "id": id,
+                "timestamp": "2025-01-05T10:00:00Z",
+                "cwd": root,
+                "originator": "test",
+                "cli_version": "test",
+                "source": "cli",
+                "model_provider": "test-provider",
+                "history_mode": "legacy",
+            },
+        });
+        if let Some(source_id) = history_base {
+            metadata["payload"]["history_base"] = serde_json::to_value(HistoryPosition {
+                thread_id: source_id,
+                end_ordinal_exclusive: 0,
+                end_byte_offset: 1,
+            })?;
+        }
+        let mut contents = serde_json::to_string(&metadata)?;
+        contents.push('\n');
+        std::fs::write(&path, contents)?;
+        Ok(path)
+    }
+
+    #[tokio::test]
+    async fn feedback_cold_path_rejects_external_reference_but_keeps_legacy_root()
+    -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let external = TempDir::new()?;
+        let runtime = codex_state::StateRuntime::init(
+            codex_state::SqliteConfig::new_for_testing(AbsolutePathBuf::try_from(
+                home.path().to_path_buf(),
+            )?),
+            "test-provider".to_string(),
+        )
+        .await?;
+        let root_id = ThreadId::from_string(&uuid::Uuid::from_u128(960).to_string())?;
+        let reference_id = ThreadId::from_string(&uuid::Uuid::from_u128(961).to_string())?;
+        let source_id = ThreadId::from_string(&uuid::Uuid::from_u128(962).to_string())?;
+        let archived_managed_root_id =
+            ThreadId::from_string(&uuid::Uuid::from_u128(963).to_string())?;
+        let archived_external_root_id =
+            ThreadId::from_string(&uuid::Uuid::from_u128(964).to_string())?;
+        let archived_external_reference_id =
+            ThreadId::from_string(&uuid::Uuid::from_u128(965).to_string())?;
+        let root_path = write_external_rollout(external.path(), root_id, None).await?;
+        let reference_path =
+            write_external_rollout(external.path(), reference_id, Some(source_id)).await?;
+        let archived_managed_dir = home.path().join(codex_core::ARCHIVED_SESSIONS_SUBDIR);
+        let archived_managed_root_path =
+            write_external_rollout(&archived_managed_dir, archived_managed_root_id, None).await?;
+        let archived_external_root_path =
+            write_external_rollout(external.path(), archived_external_root_id, None).await?;
+        let archived_external_reference_path = write_external_rollout(
+            external.path(),
+            archived_external_reference_id,
+            Some(source_id),
+        )
+        .await?;
+        for (id, path, archived) in [
+            (root_id, root_path.clone(), false),
+            (reference_id, reference_path, false),
+            (
+                archived_managed_root_id,
+                archived_managed_root_path.clone(),
+                true,
+            ),
+            (
+                archived_external_root_id,
+                archived_external_root_path.clone(),
+                true,
+            ),
+            (
+                archived_external_reference_id,
+                archived_external_reference_path,
+                true,
+            ),
+        ] {
+            let mut builder = codex_state::ThreadMetadataBuilder::new(
+                id,
+                path,
+                chrono::Utc::now(),
+                SessionSource::Cli,
+            );
+            builder.history_mode = codex_protocol::protocol::ThreadHistoryMode::Legacy;
+            builder.model_provider = Some("test-provider".to_string());
+            builder.cwd = home.path().to_path_buf();
+            let mut metadata = builder.build("test-provider");
+            if archived {
+                metadata.archived_at = Some(chrono::Utc::now());
+            }
+            metadata.preview = Some(if id == root_id {
+                "external root".to_string()
+            } else if id == archived_managed_root_id {
+                "managed archived root".to_string()
+            } else if id == archived_external_root_id {
+                "external archived root".to_string()
+            } else {
+                "external reference".to_string()
+            });
+            runtime.upsert_thread(&metadata).await?;
+        }
+
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), root_id, &runtime).await?,
+            Some(root_path)
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), reference_id, &runtime).await?,
+            None
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), archived_managed_root_id, &runtime)
+                .await?,
+            Some(archived_managed_root_path)
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), archived_external_root_id, &runtime)
+                .await?,
+            Some(archived_external_root_path)
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(
+                home.path(),
+                archived_external_reference_id,
+                &runtime,
+            )
+            .await?,
+            None
+        );
+        Ok(())
+    }
 
     #[test]
     fn tool_cache_feedback_attachments_include_existing_active_cache_files() {
