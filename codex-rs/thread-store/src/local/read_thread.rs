@@ -36,7 +36,6 @@ use crate::error::reject_paginated_history_mode;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
-use tokio::sync::OwnedMutexGuard;
 
 pub(super) async fn read_thread(
     store: &LocalThreadStore,
@@ -142,7 +141,6 @@ pub(super) async fn read_thread_by_rollout_path_with_preheld_source_guards(
     expected_thread_id: codex_protocol::ThreadId,
     include_archived: bool,
     include_history: bool,
-    _local_writer_guard: &OwnedMutexGuard<()>,
     source_writer_guard: WriterLockGuard,
 ) -> ThreadStoreResult<StoredThread> {
     let path = resolve_requested_rollout_path(store, rollout_path).await?;

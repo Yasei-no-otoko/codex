@@ -43,7 +43,7 @@ pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<()> {
-    let live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
     // Acquire before resolving the rollout path or reading history.  A second process may be
     // archiving/compressing/deleting the same legacy pathname, so no recorder initialization may
@@ -113,7 +113,6 @@ pub(super) async fn resume_thread(
                     params.include_archived,
                     /*include_history*/
                     params.history.is_none() && history_mode != ThreadHistoryMode::Paginated,
-                    &live_writer_guard,
                     writer_lock
                         .clone()
                         .ok_or_else(|| ThreadStoreError::Internal {
