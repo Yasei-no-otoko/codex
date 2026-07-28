@@ -95,6 +95,51 @@ async fn list_threads_db_rejects_mismatched_sqlite_config_without_cleanup() -> a
     Ok(())
 }
 
+/// A rollout path can be absent briefly while archive, unarchive, or
+/// compression is renaming it. Listing must hide that item without deleting
+/// its SQLite metadata so a later list can recover it.
+#[tokio::test]
+async fn list_threads_db_preserves_metadata_for_temporarily_missing_rollout() -> anyhow::Result<()>
+{
+    let root = TempDir::new().expect("temp dir");
+    let sqlite = codex_state::SqliteConfig::new_for_testing(root.path().abs());
+    let runtime = codex_state::StateRuntime::init(sqlite, "test-provider".to_string()).await?;
+    let thread_id = ThreadId::new();
+    let metadata = ThreadMetadataBuilder::new(
+        thread_id,
+        root.path().join("temporarily-missing-rollout.jsonl"),
+        Utc::now(),
+        SessionSource::Cli,
+    )
+    .build("test-provider");
+    runtime.upsert_thread(&metadata).await?;
+
+    let page = list_threads_db(
+        Some(runtime.as_ref()),
+        runtime.sqlite(),
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        /*relation_filter*/ None,
+        /*archived*/ false,
+        /*section*/ None,
+        /*search_term*/ None,
+    )
+    .await
+    .expect("state db list should be available");
+
+    assert!(
+        page.items.is_empty(),
+        "missing rollout must be hidden from list"
+    );
+    assert_eq!(runtime.get_thread(thread_id).await?, Some(metadata));
+    Ok(())
+}
+
 #[tokio::test]
 async fn list_threads_db_relation_filter_hides_external_reference_children() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
