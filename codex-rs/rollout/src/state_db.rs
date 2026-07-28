@@ -459,8 +459,11 @@ pub async fn list_threads_db(
                     item.id,
                     item.rollout_path.display()
                 );
-                warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
-                let _ = ctx.delete_thread(item.id).await;
+                // A rollout can be temporarily absent while archive, unarchive, or
+                // compression is moving it. Keep the SQLite row so the metadata is
+                // available once the rename completes; this list call already hides
+                // the stale item from its result.
+                warn!("state db discrepancy during list_threads_db: stale_db_path_hidden");
             }
         }
         page.items = valid_items;
@@ -529,8 +532,9 @@ pub async fn list_threads_db(
                     item.id,
                     item.rollout_path.display()
                 );
-                warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
-                let _ = ctx.delete_thread(item.id).await;
+                // Do not delete rows here: path moves can create a short-lived
+                // missing-path window, and the next list can recover the item.
+                warn!("state db discrepancy during list_threads_db: stale_db_path_hidden");
             }
         }
 

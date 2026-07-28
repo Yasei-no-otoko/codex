@@ -3017,11 +3017,16 @@ async fn thread_resume_rejects_cross_store_in_flight_thread() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let ThreadResumeResponse {
-        thread: resumed_thread,
-        ..
-    } = timeout(DEFAULT_READ_TIMEOUT, secondary.read_response(resume_id)).await??;
-    assert_ne!(resumed_thread.status, ThreadStatus::NotLoaded);
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.message,
+        format!("thread {} already has an active writer", thread.id)
+    );
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/completed"),
