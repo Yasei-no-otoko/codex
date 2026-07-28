@@ -4,10 +4,26 @@ use codex_connectors::ConnectorDirectoryCacheKey;
 use codex_connectors::connector_runtime_cache_path;
 use codex_feedback::CODEX_APP_DIRECTORY_CACHE_ATTACHMENT_FILENAME;
 use codex_feedback::CODEX_APPS_TOOLS_CACHE_ATTACHMENT_FILENAME;
+use codex_feedback::FeedbackAttachment;
 #[cfg(target_os = "windows")]
 use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
+use tempfile::NamedTempFile;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
+// Keep generated logical history in line with the feedback log ring's 4 MiB default.
+const MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
+
+enum LogicalRolloutFeedbackAttachment {
+    /// The rollout is not reference-backed, so its physical JSONL remains the attachment.
+    Physical,
+    /// A read-only logical replay was generated for a reference-backed rollout.
+    Generated {
+        temp_file: NamedTempFile,
+        truncated: bool,
+    },
+    /// The rollout is reference-backed but cannot be read safely without mutating storage.
+    Skip,
+}
 
 async fn resolve_rollout_path_from_state_db(
     codex_home: &std::path::Path,
@@ -188,6 +204,8 @@ impl FeedbackRequestProcessor {
             (Vec::new(), None, None)
         };
 
+        let mut logical_attachment_temps = Vec::new();
+        let mut extra_attachments: Vec<FeedbackAttachment> = Vec::new();
         let mut attachment_paths = Vec::new();
         let mut seen_attachment_paths = HashSet::new();
         if include_logs {
@@ -199,10 +217,38 @@ impl FeedbackRequestProcessor {
                     continue;
                 };
                 if seen_attachment_paths.insert(rollout_path.clone()) {
-                    attachment_paths.push(FeedbackAttachmentPath {
-                        path: rollout_path,
-                        attachment_filename_override: None,
-                    });
+                    match self
+                        .logical_rollout_feedback_attachment(*feedback_thread_id, &rollout_path)
+                        .await
+                    {
+                        LogicalRolloutFeedbackAttachment::Generated {
+                            temp_file,
+                            truncated,
+                        } => {
+                            let path = temp_file.path().to_path_buf();
+                            let filename = if truncated {
+                                upload_tags.insert(
+                                    "feedback_rollout_truncated".to_string(),
+                                    "true".to_string(),
+                                );
+                                format!("rollout-history-{feedback_thread_id}-head-tail.jsonl")
+                            } else {
+                                format!("rollout-history-{feedback_thread_id}.jsonl")
+                            };
+                            logical_attachment_temps.push(temp_file);
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path,
+                                attachment_filename_override: Some(filename),
+                            });
+                        }
+                        LogicalRolloutFeedbackAttachment::Physical => {
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path: rollout_path,
+                                attachment_filename_override: None,
+                            });
+                        }
+                        LogicalRolloutFeedbackAttachment::Skip => {}
+                    }
                 }
             }
             if let Some(conversation_id) = conversation_id
@@ -245,7 +291,6 @@ impl FeedbackRequestProcessor {
             }
         }
 
-        let mut extra_attachments = Vec::new();
         if include_logs
             && let Some(doctor_report) =
                 super::feedback_doctor_report::doctor_feedback_report(&self.config).await
@@ -259,6 +304,9 @@ impl FeedbackRequestProcessor {
         let session_source = self.thread_manager.session_source();
 
         let upload_result = tokio::task::spawn_blocking(move || {
+            // Keep generated reference attachments alive until the synchronous upload has read
+            // every path-backed file. NamedTempFile removes them when this closure returns.
+            let _logical_attachment_temps = logical_attachment_temps;
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
             snapshot.upload_feedback(FeedbackUploadOptions {
                 classification: &classification,
@@ -284,6 +332,78 @@ impl FeedbackRequestProcessor {
 
         upload_result.map_err(|err| internal_error(format!("failed to upload feedback: {err}")))?;
         Ok(FeedbackUploadResponse { thread_id })
+    }
+
+    /// Reference-backed rollouts only contain their local delta on disk. Replace that physical
+    /// attachment with a generated JSONL replay when possible so feedback includes the bounded
+    /// inherited history as well as the child's delta.
+    async fn logical_rollout_feedback_attachment(
+        &self,
+        thread_id: ThreadId,
+        rollout_path: &std::path::Path,
+    ) -> LogicalRolloutFeedbackAttachment {
+        let session_meta = match codex_rollout::read_session_meta_line(rollout_path).await {
+            Ok(session_meta) => session_meta,
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    path = %rollout_path.display(),
+                    "failed to inspect rollout before feedback upload: {err}"
+                );
+                return LogicalRolloutFeedbackAttachment::Skip;
+            }
+        };
+        if session_meta.meta.id != thread_id {
+            warn!(
+                requested_thread_id = %thread_id,
+                rollout_thread_id = %session_meta.meta.id,
+                path = %rollout_path.display(),
+                "skipping mismatched rollout during feedback upload"
+            );
+            return LogicalRolloutFeedbackAttachment::Skip;
+        }
+        if session_meta.meta.history_base.is_none() {
+            return LogicalRolloutFeedbackAttachment::Physical;
+        }
+
+        let temp_file = match NamedTempFile::new() {
+            Ok(temp_file) => temp_file,
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    "failed to create temporary logical rollout attachment: {err}"
+                );
+                return LogicalRolloutFeedbackAttachment::Skip;
+            }
+        };
+        let params = WriteReferenceLogicalAttachmentParams {
+            thread_id,
+            include_archived: true,
+            output_path: temp_file.path().to_path_buf(),
+            max_bytes: MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES,
+        };
+        match self
+            .thread_manager
+            .write_reference_logical_attachment(params)
+            .await
+        {
+            Ok(WriteReferenceLogicalAttachmentOutcome::Written { truncated }) => {
+                LogicalRolloutFeedbackAttachment::Generated {
+                    temp_file,
+                    truncated,
+                }
+            }
+            Ok(WriteReferenceLogicalAttachmentOutcome::NotReference) => {
+                LogicalRolloutFeedbackAttachment::Physical
+            }
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    "skipping reference-backed rollout in feedback upload: {err}"
+                );
+                LogicalRolloutFeedbackAttachment::Skip
+            }
+        }
     }
 
     async fn resolve_rollout_path(
