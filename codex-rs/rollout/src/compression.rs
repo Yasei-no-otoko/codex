@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io;
+use std::io::BufRead;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
@@ -199,6 +200,16 @@ pub struct RolloutLineReader {
     inner: RolloutLineReaderInner,
 }
 
+/// Newline-preserving reader for callers that need physical JSONL byte boundaries.
+pub struct RawRolloutLineReader {
+    inner: RawRolloutLineReaderInner,
+}
+
+enum RawRolloutLineReaderInner {
+    Plain(tokio::io::BufReader<tokio::fs::File>),
+    Blocking(Option<BlockingRawLineReader>),
+}
+
 enum RolloutLineReaderInner {
     Plain(tokio::io::Lines<tokio::io::BufReader<tokio::fs::File>>),
     Blocking(Option<BlockingLineReader>),
@@ -224,7 +235,37 @@ impl RolloutLineReader {
     }
 }
 
+impl RawRolloutLineReader {
+    /// Reads the next physical JSONL line, including its trailing newline when present.
+    pub async fn next_raw_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        match &mut self.inner {
+            RawRolloutLineReaderInner::Plain(reader) => {
+                let mut line = Vec::new();
+                let bytes_read =
+                    tokio::io::AsyncBufReadExt::read_until(reader, b'\n', &mut line).await?;
+                Ok((bytes_read != 0).then_some(line))
+            }
+            RawRolloutLineReaderInner::Blocking(slot) => {
+                let Some(mut reader) = slot.take() else {
+                    return Err(io::Error::other("compressed rollout reader is busy"));
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut line = Vec::new();
+                    let bytes_read = reader.read_until(b'\n', &mut line)?;
+                    Ok::<_, io::Error>(((bytes_read != 0).then_some(line), reader))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                let (line, reader) = result;
+                *slot = Some(reader);
+                Ok(line)
+            }
+        }
+    }
+}
+
 type BlockingLineReader = std::io::Lines<std::io::BufReader<Box<dyn Read + Send>>>;
+type BlockingRawLineReader = std::io::BufReader<Box<dyn Read + Send>>;
 
 mod worker {
     use std::ffi::OsStr;
@@ -252,6 +293,9 @@ mod worker {
     use super::RolloutFile;
     use super::metrics;
     use super::path;
+    use crate::ThreadWriterLockCoordinator;
+    use codex_protocol::ThreadId;
+    use std::sync::Arc;
 
     const TEMP_SUFFIX: &str = ".tmp";
     const COMPRESSION_LEVEL: i32 = 3;
@@ -375,6 +419,7 @@ mod worker {
             else {
                 return Ok(CompressionStats::default());
             };
+            let writer_locks = Arc::new(ThreadWriterLockCoordinator::new(codex_home.as_path()));
             let mut stats = CompressionStats::default();
             for root in [
                 codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
@@ -383,8 +428,14 @@ mod worker {
                 if started_at.elapsed() >= WORKER_MAX_RUNTIME {
                     break;
                 }
-                compress_rollouts_in_root(root.as_path(), started_at, &reference_index, &mut stats)
-                    .await?;
+                compress_rollouts_in_root(
+                    root.as_path(),
+                    started_at,
+                    &reference_index,
+                    &writer_locks,
+                    &mut stats,
+                )
+                .await?;
             }
             Ok::<_, io::Error>(stats)
         }
@@ -425,6 +476,7 @@ mod worker {
         root: &Path,
         started_at: Instant,
         reference_index: &RolloutReferenceIndex,
+        writer_locks: &Arc<ThreadWriterLockCoordinator>,
         stats: &mut CompressionStats,
     ) -> io::Result<()> {
         if !tokio::fs::try_exists(root).await.unwrap_or(false) {
@@ -503,9 +555,12 @@ mod worker {
                 while jobs.len() >= MAX_CONCURRENT_COMPRESSION_JOBS {
                     collect_next_compression_job(&mut jobs, stats).await;
                 }
+                let writer_locks = Arc::clone(writer_locks);
+                let thread_id = meta.meta.id;
                 jobs.spawn_blocking(move || {
                     let started_at = Instant::now();
-                    let result = compress_rollout_if_cold_blocking(path.as_path());
+                    let result =
+                        compress_rollout_if_cold_blocking(path.as_path(), thread_id, writer_locks);
                     let duration = started_at.elapsed();
                     (path, duration, result)
                 });
@@ -518,11 +573,12 @@ mod worker {
     type CompressionJobResult = (PathBuf, Duration, io::Result<CompressionMeasurement>);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum CompressionOutcome {
+    pub(super) enum CompressionOutcome {
         Compressed,
         SkippedNotCold,
         SkippedChanged,
         SkippedAlreadyCompressed,
+        SkippedWriterBusy,
     }
 
     impl CompressionOutcome {
@@ -532,12 +588,13 @@ mod worker {
                 CompressionOutcome::SkippedNotCold => "skipped_not_cold",
                 CompressionOutcome::SkippedChanged => "skipped_changed",
                 CompressionOutcome::SkippedAlreadyCompressed => "skipped_already_compressed",
+                CompressionOutcome::SkippedWriterBusy => "skipped_writer_busy",
             }
         }
     }
 
-    struct CompressionMeasurement {
-        outcome: CompressionOutcome,
+    pub(super) struct CompressionMeasurement {
+        pub(super) outcome: CompressionOutcome,
         source_bytes: Option<u64>,
         compressed_bytes: Option<u64>,
     }
@@ -586,7 +643,8 @@ mod worker {
                     }
                     CompressionOutcome::SkippedNotCold
                     | CompressionOutcome::SkippedChanged
-                    | CompressionOutcome::SkippedAlreadyCompressed => {
+                    | CompressionOutcome::SkippedAlreadyCompressed
+                    | CompressionOutcome::SkippedWriterBusy => {
                         stats.skipped = stats.skipped.saturating_add(1);
                     }
                 }
@@ -616,7 +674,22 @@ mod worker {
         }
     }
 
-    fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement> {
+    pub(super) fn compress_rollout_if_cold_blocking(
+        path: &Path,
+        thread_id: ThreadId,
+        writer_locks: Arc<ThreadWriterLockCoordinator>,
+    ) -> io::Result<CompressionMeasurement> {
+        let _writer_lock = match writer_locks.acquire(thread_id) {
+            Ok(lock) => lock,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(CompressionMeasurement::new(
+                    CompressionOutcome::SkippedWriterBusy,
+                    None,
+                    None,
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         let before = match cold_file_state(path)? {
             ColdFileState::Cold(state) => state,
             ColdFileState::NotCold(state) => {
@@ -1008,6 +1081,8 @@ mod reader {
     use std::io::Read;
     use std::path::Path;
 
+    use super::RawRolloutLineReader;
+    use super::RawRolloutLineReaderInner;
     use super::RolloutLineReader;
     use super::RolloutLineReaderInner;
     use super::path;
@@ -1036,6 +1111,42 @@ mod reader {
             inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file).lines()),
         })
     }
+
+    pub(super) async fn open_raw_once(path: &Path) -> io::Result<RawRolloutLineReader> {
+        let path = path::existing_rollout_path(path)
+            .await
+            .unwrap_or_else(|| path.to_path_buf());
+        if path::is_compressed_rollout_path(path.as_path()) {
+            let reader = tokio::task::spawn_blocking(move || {
+                let input = File::open(path.as_path())?;
+                let decoder = zstd::stream::read::Decoder::new(input)?;
+                Ok::<_, io::Error>(io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            return Ok(RawRolloutLineReader {
+                inner: RawRolloutLineReaderInner::Blocking(Some(reader)),
+            });
+        }
+        let file = tokio::fs::File::open(path).await?;
+        Ok(RawRolloutLineReader {
+            inner: RawRolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
+        })
+    }
+}
+
+/// Opens a newline-preserving reader for plain or compressed rollout files.
+pub async fn open_rollout_raw_line_reader(path: &Path) -> io::Result<RawRolloutLineReader> {
+    for _ in 0..MAX_NOT_FOUND_RETRIES {
+        match reader::open_raw_once(path).await {
+            Ok(reader) => return Ok(reader),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                tokio::time::sleep(OPEN_ROLLOUT_LINE_READER_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    reader::open_raw_once(path).await
 }
 
 #[cfg(unix)]

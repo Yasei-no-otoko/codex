@@ -112,15 +112,22 @@ async fn load_agent_model_context(
             .history
             .map(|history| history.items)),
         ThreadHistoryMode::Paginated => Ok(Some(
-            state
-                .load_latest_model_context(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived: true,
-                })
-                .await?
-                .items,
+            load_latest_agent_model_context(state, thread_id).await?,
         )),
     }
+}
+
+async fn load_latest_agent_model_context(
+    state: &ThreadManagerState,
+    thread_id: ThreadId,
+) -> CodexResult<Vec<RolloutItem>> {
+    Ok(state
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        })
+        .await?
+        .items)
 }
 
 impl AgentControl {
@@ -629,14 +636,17 @@ impl AgentControl {
 
         let destination_history_mode = matches!(parent_history_mode, ThreadHistoryMode::Paginated)
             .then_some(ThreadHistoryMode::Paginated);
-        let mut forked_rollout_items =
+        let mut forked_rollout_items = if matches!(fork_mode, SpawnAgentForkMode::FullHistory) {
+            load_latest_agent_model_context(state, parent_thread_id).await?
+        } else {
             load_agent_model_context(state, parent_thread_id, parent_history_mode)
                 .await?
                 .ok_or_else(|| {
                     CodexErr::Fatal(format!(
                         "parent thread history unavailable for fork: {parent_thread_id}"
                     ))
-                })?;
+                })?
+        };
 
         let selected_capability_roots = forked_rollout_items
             .iter()

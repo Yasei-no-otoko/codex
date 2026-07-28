@@ -72,6 +72,15 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     if let Some(provider) = meta_line.meta.model_provider.as_deref() {
         metadata.model_provider = provider.to_string();
     }
+    // Reference-backed legacy children persist inherited summaries in their
+    // own SessionMeta update. Treat those fields as authoritative durable
+    // metadata so SQLite rebuilds do not need to walk ancestor rollouts.
+    if let Some(preview) = meta_line.meta.preview.as_ref() {
+        metadata.preview = Some(preview.to_string());
+    }
+    if let Some(first_user_message) = meta_line.meta.first_user_message.as_ref() {
+        metadata.first_user_message = Some(first_user_message.to_string());
+    }
     if !meta_line.meta.cli_version.is_empty() {
         metadata.cli_version = meta_line.meta.cli_version.clone();
     }
@@ -404,6 +413,8 @@ mod tests {
                     memory_mode: None,
                     history_mode: Default::default(),
                     history_base: None,
+                    preview: None,
+                    first_user_message: None,
                     subagent_history_start_ordinal: None,
                     multi_agent_version: None,
                     context_window: None,
@@ -653,6 +664,8 @@ mod tests {
                     memory_mode: None,
                     history_mode: ThreadHistoryMode::Legacy,
                     history_base: None,
+                    preview: None,
+                    first_user_message: None,
                     subagent_history_start_ordinal: None,
                     multi_agent_version: None,
                     context_window: None,
@@ -665,6 +678,31 @@ mod tests {
         assert_eq!(metadata.model, None);
         assert_eq!(metadata.reasoning_effort, None);
         assert_eq!(metadata.history_mode, ThreadHistoryMode::Paginated);
+    }
+
+    #[test]
+    fn later_session_meta_update_restores_reference_summary() {
+        let mut metadata = metadata_for_test();
+        let thread_id = metadata.id;
+        let meta = SessionMeta {
+            id: thread_id,
+            session_id: thread_id.into(),
+            preview: Some("inherited goal".to_string()),
+            first_user_message: Some("inherited request".to_string()),
+            ..Default::default()
+        };
+
+        apply_rollout_item(
+            &mut metadata,
+            &RolloutItem::SessionMeta(SessionMetaLine { meta, git: None }),
+            "test-provider",
+        );
+
+        assert_eq!(metadata.preview.as_deref(), Some("inherited goal"));
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("inherited request")
+        );
     }
 
     fn metadata_for_test() -> ThreadMetadata {

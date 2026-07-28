@@ -6,7 +6,9 @@ use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -90,6 +92,132 @@ async fn list_threads_db_rejects_mismatched_sqlite_config_without_cleanup() -> a
 
     assert!(page.is_none());
     assert_eq!(runtime.get_thread(thread_id).await?, Some(metadata));
+    Ok(())
+}
+
+/// A rollout path can be absent briefly while archive, unarchive, or
+/// compression is renaming it. Listing must hide that item without deleting
+/// its SQLite metadata so a later list can recover it.
+#[tokio::test]
+async fn list_threads_db_preserves_metadata_for_temporarily_missing_rollout() -> anyhow::Result<()>
+{
+    let root = TempDir::new().expect("temp dir");
+    let sqlite = codex_state::SqliteConfig::new_for_testing(root.path().abs());
+    let runtime = codex_state::StateRuntime::init(sqlite, "test-provider".to_string()).await?;
+    let thread_id = ThreadId::new();
+    let metadata = ThreadMetadataBuilder::new(
+        thread_id,
+        root.path().join("temporarily-missing-rollout.jsonl"),
+        Utc::now(),
+        SessionSource::Cli,
+    )
+    .build("test-provider");
+    runtime.upsert_thread(&metadata).await?;
+
+    let page = list_threads_db(
+        Some(runtime.as_ref()),
+        runtime.sqlite(),
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        /*relation_filter*/ None,
+        /*archived*/ false,
+        /*section*/ None,
+        /*search_term*/ None,
+    )
+    .await
+    .expect("state db list should be available");
+
+    assert!(
+        page.items.is_empty(),
+        "missing rollout must be hidden from list"
+    );
+    assert_eq!(runtime.get_thread(thread_id).await?, Some(metadata));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_db_relation_filter_hides_external_reference_children() -> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let runtime = codex_state::StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+
+    let parent_id = ThreadId::new();
+    let child_id = ThreadId::new();
+    let parent_path = write_rollout_with_user_message(
+        home.path(),
+        parent_id,
+        "parent",
+        ThreadHistoryMode::Legacy,
+    )?;
+    let parent_metadata =
+        ThreadMetadataBuilder::new(parent_id, parent_path, Utc::now(), SessionSource::Cli)
+            .build("test-provider");
+    runtime.upsert_thread(&parent_metadata).await?;
+    let parent_path_end_byte_offset = std::fs::metadata(parent_metadata.rollout_path.as_path())
+        .expect("parent file exists")
+        .len();
+
+    let external_root = home.path().join("external");
+    std::fs::create_dir_all(external_root.as_path())?;
+    let child_path = write_rollout_with_user_message_with_history_base(
+        external_root.as_path(),
+        child_id,
+        "external reference child",
+        ThreadHistoryMode::Legacy,
+        Some(HistoryPosition {
+            thread_id: parent_id,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: parent_path_end_byte_offset,
+        }),
+    )?;
+    let child_metadata =
+        ThreadMetadataBuilder::new(child_id, child_path, Utc::now(), SessionSource::Cli)
+            .build("test-provider");
+    runtime.upsert_thread(&child_metadata).await?;
+    runtime
+        .upsert_thread_spawn_edge(
+            parent_id,
+            child_id,
+            codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await?;
+
+    let page = list_threads_db(
+        Some(runtime.as_ref()),
+        &codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        Some(codex_state::ThreadRelationFilter::DirectChildrenOf(
+            parent_id,
+        )),
+        /*archived*/ false,
+        /*is_pinned*/ None,
+        /*search_term*/ None,
+    )
+    .await
+    .expect("state db list should be available");
+
+    assert!(
+        page.items.is_empty(),
+        "external reference child with managed history_base must not be shown"
+    );
     Ok(())
 }
 
@@ -284,6 +412,8 @@ fn write_rollout_with_user_message(
                     memory_mode: None,
                     history_mode,
                     history_base: None,
+                    preview: None,
+                    first_user_message: None,
                     subagent_history_start_ordinal: None,
                     multi_agent_version: None,
                     context_window: None,
@@ -306,5 +436,27 @@ fn write_rollout_with_user_message(
         .collect::<Result<Vec<_>, _>>()?
         .join("\n");
     std::fs::write(path.as_path(), format!("{jsonl}\n"))?;
+    Ok(path)
+}
+
+fn write_rollout_with_user_message_with_history_base(
+    home: &Path,
+    thread_id: ThreadId,
+    message: &str,
+    history_mode: ThreadHistoryMode,
+    history_base: Option<HistoryPosition>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let path = write_rollout_with_user_message(home, thread_id, message, history_mode)?;
+    let mut lines = std::fs::read_to_string(path.as_path())?
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut meta_line: RolloutLine =
+        serde_json::from_str(lines.first().expect("has rollout metadata"))?;
+    if let RolloutItem::SessionMeta(SessionMetaLine { ref mut meta, .. }) = meta_line.item {
+        meta.history_base = history_base;
+    }
+    lines[0] = serde_json::to_string(&meta_line)?;
+    std::fs::write(path.as_path(), format!("{}\n", lines.join("\n")))?;
     Ok(path)
 }

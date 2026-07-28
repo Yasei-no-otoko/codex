@@ -20,9 +20,13 @@ pub enum ScanOutcome<T> {
 pub struct ReverseJsonlScanner<R> {
     reader: R,
     next_chunk_end: u64,
+    record_end_offset: u64,
+    record_terminated_by_newline: bool,
     chunk_position: usize,
     chunk: Vec<u8>,
     record_reversed: Vec<u8>,
+    last_record_end_offset: Option<u64>,
+    last_record_terminated_by_newline: Option<bool>,
 }
 
 impl<R> ReverseJsonlScanner<R>
@@ -46,13 +50,35 @@ where
                 "reverse JSONL scan end is past the file",
             ));
         }
+        let record_terminated_by_newline = if end_byte_offset == 0 {
+            false
+        } else {
+            reader.seek(SeekFrom::Start(end_byte_offset - 1))?;
+            let mut byte = [0; 1];
+            reader.read_exact(&mut byte)?;
+            byte[0] == b'\n'
+        };
         Ok(Self {
             reader,
             next_chunk_end: end_byte_offset,
+            record_end_offset: end_byte_offset,
+            record_terminated_by_newline,
             chunk_position: 0,
             chunk: vec![0; READ_CHUNK_SIZE],
             record_reversed: Vec::new(),
+            last_record_end_offset: None,
+            last_record_terminated_by_newline: None,
         })
+    }
+
+    /// Returns the byte offset immediately after the most recently returned record.
+    pub fn last_record_end_offset(&self) -> Option<u64> {
+        self.last_record_end_offset
+    }
+
+    /// Reports whether the most recently returned record ended at a JSONL newline.
+    pub fn last_record_terminated_by_newline(&self) -> Option<bool> {
+        self.last_record_terminated_by_newline
     }
 
     /// Scans the next nonblank record.
@@ -65,7 +91,13 @@ where
     {
         loop {
             let Some(byte) = self.read_previous_byte()? else {
-                return Ok(self.finish_record());
+                let outcome = self.finish_record();
+                if outcome.is_some() {
+                    self.last_record_end_offset = Some(self.record_end_offset);
+                    self.last_record_terminated_by_newline =
+                        Some(self.record_terminated_by_newline);
+                }
+                return Ok(outcome);
             };
 
             if byte != b'\n' {
@@ -73,7 +105,19 @@ where
                 continue;
             }
 
+            let record_end_offset = self.record_end_offset;
+            let record_terminated_by_newline = self.record_terminated_by_newline;
+            let newline_offset = self
+                .next_chunk_end
+                .checked_add(self.chunk_position as u64)
+                .ok_or_else(|| io::Error::other("JSONL record offset overflow"))?;
+            self.record_end_offset = newline_offset
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("JSONL record offset overflow"))?;
+            self.record_terminated_by_newline = true;
             if let Some(outcome) = self.finish_record() {
+                self.last_record_end_offset = Some(record_end_offset);
+                self.last_record_terminated_by_newline = Some(record_terminated_by_newline);
                 return Ok(Some(outcome));
             }
         }

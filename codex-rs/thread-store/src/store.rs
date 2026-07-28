@@ -32,6 +32,8 @@ use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
+use crate::WriteReferenceLogicalAttachmentOutcome;
+use crate::WriteReferenceLogicalAttachmentParams;
 
 /// Future returned by [`ThreadStore`] operations.
 pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResult<T>> + Send + 'a>>;
@@ -82,6 +84,17 @@ pub trait ThreadStore: Any + Send + Sync {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory>;
+
+    /// Writes a read-only logical reference attachment for feedback upload.
+    ///
+    /// Implementations must not materialize or otherwise mutate referenced rollouts. Stores
+    /// without reference-aware support return [`WriteReferenceLogicalAttachmentOutcome::NotReference`].
+    fn write_reference_logical_attachment(
+        &self,
+        _params: WriteReferenceLogicalAttachmentParams,
+    ) -> ThreadStoreFuture<'_, WriteReferenceLogicalAttachmentOutcome> {
+        Box::pin(async { Ok(WriteReferenceLogicalAttachmentOutcome::NotReference) })
+    }
 
     /// Loads the persisted rollout items needed to reconstruct the latest model-visible context.
     ///

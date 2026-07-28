@@ -3038,11 +3038,18 @@ impl SessionContextWindow {
     }
 }
 
-/// Exclusive position in another thread's paginated rollout history.
+/// Exclusive position in another thread's inherited rollout history.
+///
+/// Paginated history uses both fields: `end_ordinal_exclusive` identifies the
+/// logical record boundary and `end_byte_offset` bounds the physical JSONL
+/// prefix. Legacy history has no rollout ordinals, so it stores
+/// `end_ordinal_exclusive = 0` as a sentinel and treats the byte offset as the
+/// authoritative immutable boundary.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, TS)]
 pub struct HistoryPosition {
     pub thread_id: ThreadId,
-    /// First rollout ordinal not included from the prefix file.
+    /// First rollout ordinal not included from the prefix file. This is `0`
+    /// for legacy byte-bounded history, where no ordinal stream exists.
     pub end_ordinal_exclusive: u64,
     /// Byte offset immediately after the last included JSONL record from the prefix file.
     pub end_byte_offset: u64,
@@ -3097,9 +3104,22 @@ pub struct SessionMeta {
     pub memory_mode: Option<String>,
     #[serde(default)]
     pub history_mode: ThreadHistoryMode,
-    /// Exclusive prefix of another paginated rollout inherited by this thread.
+    /// Exclusive prefix of another rollout inherited by this thread. Legacy
+    /// references use a zero ordinal sentinel and rely on the byte offset as
+    /// the authoritative cutoff; paginated references use both fields. Legacy
+    /// Reference children require a binary that understands `history_base`. This is a
+    /// persistence-format boundary: rolling back to a binary predating this field while
+    /// retaining the same CODEX_HOME is unsupported because that binary can resume only the
+    /// child's local suffix and silently omit its inherited history. Upgrade to a compatible
+    /// binary (or use a separate CODEX_HOME) before resuming reference-backed children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_base: Option<HistoryPosition>,
+    /// Optional durable summary for reference-backed legacy children. Unlike inherited rollout
+    /// items, this metadata is local to the child and survives SQLite rebuilds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_user_message: Option<String>,
     /// First rollout ordinal that belongs to this subagent's own projected history.
     ///
     /// Earlier rollout records are inherited model context and stay out of child
@@ -3137,6 +3157,8 @@ impl Default for SessionMeta {
             memory_mode: None,
             history_mode: ThreadHistoryMode::default(),
             history_base: None,
+            preview: None,
+            first_user_message: None,
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,

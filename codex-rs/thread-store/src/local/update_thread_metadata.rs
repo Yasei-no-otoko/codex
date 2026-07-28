@@ -8,7 +8,6 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
-use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
 use codex_rollout::find_archived_thread_path_by_id_str;
@@ -54,20 +53,11 @@ pub(super) async fn update_thread_metadata(
     }
 
     let requires_rollout_compat = requires_rollout_compatibility_update(&patch);
+    let live_rollout_path = live_writer::rollout_path(store, thread_id).await.ok();
     let has_explicit_metadata = patch.name.is_some() || requires_rollout_compat;
     let history_mode = if has_explicit_metadata {
-        Some(
-            read_thread::read_thread(
-                store,
-                ReadThreadParams {
-                    thread_id,
-                    include_archived: params.include_archived,
-                    include_history: false,
-                },
-            )
-            .await?
-            .history_mode,
-        )
+        let resolved = resolve_rollout_path(store, thread_id, params.include_archived).await?;
+        Some(canonical_history_mode(store, thread_id, resolved.path.as_path()).await?)
     } else {
         None
     };
@@ -124,95 +114,126 @@ pub(super) async fn update_thread_metadata(
         return Ok(updated);
     }
 
-    if live_writer::rollout_path(store, thread_id).await.is_ok() {
+    if live_rollout_path.is_some() {
         live_writer::persist_thread(store, thread_id).await?;
     }
-    let mut resolved_rollout_path =
-        resolve_rollout_path(store, thread_id, params.include_archived).await?;
     let name = patch.name;
     let git_info = patch.git_info;
-    if let Some(memory_mode) = patch.memory_mode {
-        apply_thread_memory_mode(resolved_rollout_path.path.as_path(), thread_id, memory_mode)
-            .await?;
-        refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
-    }
+    // Persist first, then serialize the direct JSONL compatibility append with the same local
+    // writer mutex and filesystem lock used by recorder/maintenance operations. Resolve the path
+    // only after the lock is held because compression can replace the plain pathname meanwhile.
+    let (resolved_rollout_path_for_read, resolved_git_info) = {
+        let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+        let _writer_guard = if let Some(existing) = store.existing_writer_lock(thread_id).await {
+            existing
+        } else {
+            store.writer_lock_coordinator.acquire(thread_id)?
+        };
+        let mut resolved_rollout_path =
+            resolve_rollout_path(store, thread_id, params.include_archived).await?;
+        if live_rollout_path.is_none() {
+            resolved_rollout_path.path = super::helpers::scoped_rollout_path(
+                store.config.codex_home.clone(),
+                resolved_rollout_path.path.as_path(),
+                "Codex home",
+            )?;
+        }
+        if patch.memory_mode.is_some() || git_info.is_some() {
+            resolved_rollout_path.path = codex_rollout::materialize_rollout_for_reference(
+                resolved_rollout_path.path.as_path(),
+            )
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to materialize rollout for metadata update: {err}"),
+            })?;
+        }
+        if let Some(memory_mode) = patch.memory_mode {
+            apply_thread_memory_mode(resolved_rollout_path.path.as_path(), thread_id, memory_mode)
+                .await?;
+            refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
+        }
 
-    let state_db_ctx = store.state_db().await;
-    codex_rollout::state_db::reconcile_rollout(
-        state_db_ctx.as_deref(),
-        resolved_rollout_path.path.as_path(),
-        store.config.default_model_provider_id.as_str(),
-        /*builder*/ None,
-        &[],
-        /*archived_only*/ resolved_rollout_path.archived.then_some(true),
-        /*new_thread_memory_mode*/ None,
-    )
-    .await;
-
-    if let Some(name) = name {
-        append_thread_name(
-            store.config.codex_home.as_path(),
-            thread_id,
-            &name.unwrap_or_default(),
+        let state_db_ctx = store.state_db().await;
+        codex_rollout::state_db::reconcile_rollout(
+            state_db_ctx.as_deref(),
+            resolved_rollout_path.path.as_path(),
+            store.config.default_model_provider_id.as_str(),
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ resolved_rollout_path.archived.then_some(true),
+            /*new_thread_memory_mode*/ None,
         )
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to index thread name: {err}"),
-        })?;
-    }
+        .await;
 
-    let resolved_git_info = match git_info {
-        Some(git_info) => {
-            let Some(state_db) = store.state_db().await else {
-                return Err(ThreadStoreError::Internal {
-                    message: format!("sqlite state db unavailable for thread {thread_id}"),
-                });
-            };
-            let metadata =
-                state_db
-                    .get_thread(thread_id)
-                    .await
-                    .map_err(|err| ThreadStoreError::Internal {
+        if let Some(name) = name {
+            append_thread_name(
+                store.config.codex_home.as_path(),
+                thread_id,
+                &name.unwrap_or_default(),
+            )
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to index thread name: {err}"),
+            })?;
+        }
+
+        let resolved_git_info = match git_info {
+            Some(git_info) => {
+                let Some(state_db) = store.state_db().await else {
+                    return Err(ThreadStoreError::Internal {
+                        message: format!("sqlite state db unavailable for thread {thread_id}"),
+                    });
+                };
+                let metadata = state_db.get_thread(thread_id).await.map_err(|err| {
+                    ThreadStoreError::Internal {
                         message: format!(
                             "failed to read git metadata for thread {thread_id}: {err}"
                         ),
-                    })?;
-            let Some(metadata) = metadata else {
-                return Err(ThreadStoreError::Internal {
-                    message: format!("thread metadata unavailable before git update: {thread_id}"),
-                });
-            };
-            let memory_mode = state_db
-                .get_thread_memory_mode(thread_id)
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to read memory mode for thread {thread_id}: {err}"),
+                    }
                 })?;
-            let existing_git_info = git_info_from_parts(
-                metadata.git_sha,
-                metadata.git_branch,
-                metadata.git_origin_url,
-            );
-            Some((
-                resolve_git_info_patch(existing_git_info, git_info),
-                memory_mode,
-            ))
+                let Some(metadata) = metadata else {
+                    return Err(ThreadStoreError::Internal {
+                        message: format!(
+                            "thread metadata unavailable before git update: {thread_id}"
+                        ),
+                    });
+                };
+                let memory_mode =
+                    state_db
+                        .get_thread_memory_mode(thread_id)
+                        .await
+                        .map_err(|err| ThreadStoreError::Internal {
+                            message: format!(
+                                "failed to read memory mode for thread {thread_id}: {err}"
+                            ),
+                        })?;
+                let existing_git_info = git_info_from_parts(
+                    metadata.git_sha,
+                    metadata.git_branch,
+                    metadata.git_origin_url,
+                );
+                Some((
+                    resolve_git_info_patch(existing_git_info, git_info),
+                    memory_mode,
+                ))
+            }
+            None => None,
+        };
+        if let Some(((sha, branch, origin_url), memory_mode)) = resolved_git_info.as_ref() {
+            apply_thread_git_info_to_rollout(
+                resolved_rollout_path.path.as_path(),
+                thread_id,
+                sha,
+                branch,
+                origin_url,
+                memory_mode.as_deref(),
+            )
+            .await?;
+            refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
+            apply_thread_git_info(store, thread_id, sha, branch, origin_url).await?;
         }
-        None => None,
+        (resolved_rollout_path.path, resolved_git_info)
     };
-    if let Some(((sha, branch, origin_url), memory_mode)) = resolved_git_info.as_ref() {
-        apply_thread_git_info_to_rollout(
-            resolved_rollout_path.path.as_path(),
-            thread_id,
-            sha,
-            branch,
-            origin_url,
-            memory_mode.as_deref(),
-        )
-        .await?;
-        refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
-        apply_thread_git_info(store, thread_id, sha, branch, origin_url).await?;
-    }
 
     let mut thread = match read_thread::read_thread(
         store,
@@ -228,7 +249,7 @@ pub(super) async fn update_thread_metadata(
         Err(_) => {
             read_thread::read_thread_by_rollout_path(
                 store,
-                resolved_rollout_path.path,
+                resolved_rollout_path_for_read,
                 params.include_archived,
                 /*include_history*/ false,
             )
@@ -847,7 +868,7 @@ async fn resolve_rollout_path(
 }
 
 fn rollout_path_is_archived(store: &LocalThreadStore, path: &Path) -> bool {
-    path.starts_with(store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR))
+    super::helpers::rollout_path_is_archived(store.config.codex_home.as_path(), path)
 }
 
 #[cfg(test)]
@@ -872,6 +893,7 @@ mod tests {
     use crate::ThreadSortKey;
     use crate::ThreadStore;
     use crate::local::LocalThreadStore;
+    use crate::local::test_support::compress_session_file;
     use crate::local::test_support::test_config;
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
@@ -902,6 +924,95 @@ mod tests {
             .await
             .expect("find thread name");
         assert_eq!(latest_name.as_deref(), Some("A sharper name"));
+    }
+
+    #[tokio::test]
+    async fn name_update_keeps_cold_compressed_rollout_compressed() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::from_u128(321);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T14-05-00", uuid).expect("session file");
+        let compressed_path = path.with_file_name(format!(
+            "{}.zst",
+            path.file_name()
+                .expect("rollout file name")
+                .to_string_lossy()
+        ));
+        let contents = std::fs::read(&path).expect("read rollout");
+        std::fs::write(
+            &compressed_path,
+            zstd::stream::encode_all(contents.as_slice(), 3).expect("compress rollout"),
+        )
+        .expect("write compressed rollout");
+        std::fs::remove_file(&path).expect("remove plain rollout");
+
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("Compressed name".to_string())),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("set name without materializing rollout");
+
+        assert!(!path.exists());
+        assert!(compressed_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cold_external_memory_update_rejects_without_materializing_rollout() {
+        let home = TempDir::new().expect("home temp dir");
+        let external = TempDir::new().expect("external temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let uuid = Uuid::from_u128(322);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let plain_path = write_session_file(external.path(), "2025-01-03T14-06-00", uuid)
+            .expect("external session file");
+        let compressed_path = compress_session_file(&plain_path).expect("compress session file");
+        let compressed_before = std::fs::read(&compressed_path).expect("read compressed rollout");
+        let mut builder = ThreadMetadataBuilder::new(
+            thread_id,
+            plain_path.clone(),
+            Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.history_mode = ThreadHistoryMode::Legacy;
+        builder.model_provider = Some(config.default_model_provider_id.clone());
+        builder.cwd = home.path().to_path_buf();
+        runtime
+            .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should succeed");
+
+        let store = LocalThreadStore::new(config, Some(runtime));
+        let error = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    memory_mode: Some(ThreadMemoryMode::Enabled),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect_err("cold external rollout must be rejected before materialization");
+        assert!(error.to_string().contains("Codex home"));
+        assert_eq!(
+            std::fs::read(&compressed_path).expect("read compressed rollout"),
+            compressed_before
+        );
+        assert!(!plain_path.exists());
     }
 
     #[tokio::test]

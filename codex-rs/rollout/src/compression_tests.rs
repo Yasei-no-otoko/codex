@@ -3,6 +3,7 @@ use std::fs;
 use std::fs::FileTimes;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -24,9 +25,38 @@ use super::*;
 use crate::RolloutConfig;
 use crate::RolloutRecorder;
 use crate::RolloutRecorderParams;
+use crate::ThreadWriterLockCoordinator;
 use crate::append_rollout_item_to_path;
 use crate::read_session_meta_line;
 use crate::search_rollout_matches;
+
+#[test]
+fn compression_and_reference_writer_use_the_same_thread_lock() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(42);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&path, thread_id, "lock race")?;
+    set_old_mtime(&path)?;
+
+    let coordinator = Arc::new(ThreadWriterLockCoordinator::new(home.path()));
+    let held = coordinator.acquire(thread_id)?;
+    // A separate coordinator must observe the OS lock as busy. Same-process readers reuse an
+    // explicitly held recorder/source guard; other acquisitions must conflict.
+    let compression_coordinator = Arc::new(ThreadWriterLockCoordinator::new(home.path()));
+    let measurement = super::worker::compress_rollout_if_cold_blocking(
+        path.as_path(),
+        thread_id,
+        compression_coordinator,
+    )?;
+    assert_eq!(
+        measurement.outcome,
+        super::worker::CompressionOutcome::SkippedWriterBusy
+    );
+    assert!(path.exists());
+    drop(held);
+    Ok(())
+}
 
 #[tokio::test]
 async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
@@ -45,6 +75,43 @@ async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
     assert_eq!(items.len(), 2);
     assert!(!rollout_path.exists());
     assert!(compressed_rollout_path(&rollout_path).exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_rollout_reader_preserves_newlines_and_rejects_no_newline_tail() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout-raw.jsonl");
+    fs::write(&path, b"{\"line\":1}\r\npartial")?;
+
+    let mut reader = open_rollout_raw_line_reader(&path).await?;
+    assert_eq!(
+        reader.next_raw_line().await?,
+        Some(b"{\"line\":1}\r\n".to_vec())
+    );
+    assert_eq!(reader.next_raw_line().await?, Some(b"partial".to_vec()));
+    assert_eq!(reader.next_raw_line().await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_rollout_reader_preserves_newlines_for_compressed_rollouts() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout-raw-compressed.jsonl");
+    fs::write(&path, b"{\"line\":1}\r\n{\"line\":2}\n")?;
+    compress_now(&path)?;
+    let compressed_path = compressed_rollout_path(&path);
+
+    let mut reader = open_rollout_raw_line_reader(&compressed_path).await?;
+    assert_eq!(
+        reader.next_raw_line().await?,
+        Some(b"{\"line\":1}\r\n".to_vec())
+    );
+    assert_eq!(
+        reader.next_raw_line().await?,
+        Some(b"{\"line\":2}\n".to_vec())
+    );
+    assert_eq!(reader.next_raw_line().await?, None);
     Ok(())
 }
 
@@ -692,6 +759,8 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             memory_mode: None,
             history_mode: Default::default(),
             history_base: None,
+            preview: None,
+            first_user_message: None,
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,

@@ -66,3 +66,7 @@ pub use types::ThreadSearchPage;
 pub use types::ThreadSortKey;
 pub use types::TurnPage;
 pub use types::UpdateThreadMetadataParams;
+pub use types::WriteReferenceLogicalAttachmentOutcome;
+pub use types::WriteReferenceLogicalAttachmentParams;
+
+pub use local::write_reference_logical_attachment_from_items;

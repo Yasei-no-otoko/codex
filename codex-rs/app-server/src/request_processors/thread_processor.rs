@@ -4055,7 +4055,12 @@ impl ThreadRequestProcessor {
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
-        let prepared_fork = if paginated_source {
+        let legacy_latest_reference_candidate = !paginated_source
+            && !ephemeral
+            && path.is_none()
+            && last_turn_id.is_none()
+            && before_turn_id.is_none();
+        let prepared_fork = if paginated_source || legacy_latest_reference_candidate {
             let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
                 (Some(turn_id), None) => {
                     codex_thread_store::ForkBoundary::ThroughTurn(turn_id.to_string())
@@ -4066,27 +4071,58 @@ impl ThreadRequestProcessor {
                 (None, None) => codex_thread_store::ForkBoundary::Latest,
                 (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
             };
-            Some(
-                self.thread_store
-                    .prepare_fork(codex_thread_store::PrepareForkParams {
-                        thread_id: source_thread_id,
-                        boundary,
-                    })
-                    .await
-                    .map_err(|err| match err {
-                        ThreadStoreError::InvalidRequest { message } => invalid_request(message),
-                        ThreadStoreError::ThreadNotFound { thread_id } => {
-                            invalid_request(format!("no rollout found for thread id {thread_id}"))
-                        }
-                        ThreadStoreError::Unsupported { .. } => {
-                            method_not_found("paginated_threads is not supported yet")
-                        }
-                        err => internal_error(format!("failed to prepare paginated fork: {err}")),
-                    })?,
-            )
+            match self
+                .thread_store
+                .prepare_fork(codex_thread_store::PrepareForkParams {
+                    thread_id: source_thread_id,
+                    boundary,
+                })
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(ThreadStoreError::Unsupported { .. }) if legacy_latest_reference_candidate => {
+                    None
+                }
+                Err(ThreadStoreError::Conflict { message }) => {
+                    return Err(invalid_request(message));
+                }
+                Err(ThreadStoreError::InvalidRequest { message }) => {
+                    return Err(invalid_request(message));
+                }
+                Err(ThreadStoreError::ThreadNotFound { thread_id }) => {
+                    return Err(invalid_request(format!(
+                        "no rollout found for thread id {thread_id}"
+                    )));
+                }
+                Err(ThreadStoreError::Unsupported { .. }) => {
+                    return Err(method_not_found("paginated_threads is not supported yet"));
+                }
+                Err(err) => {
+                    return Err(internal_error(format!("failed to prepare fork: {err}")));
+                }
+            }
         } else {
             None
         };
+        let reference_fork = prepared_fork.is_some() && legacy_latest_reference_candidate;
+        let (mut inherited_preview, mut inherited_first_user_message) = if reference_fork {
+            (
+                (!source_thread.preview.is_empty()).then(|| source_thread.preview.clone()),
+                source_thread.first_user_message.clone(),
+            )
+        } else {
+            (None, None)
+        };
+        if reference_fork && let Some(prepared_fork) = prepared_fork.as_ref() {
+            let (context_preview, context_first_user_message) =
+                legacy_summary_from_rollout_items(prepared_fork.model_context.as_ref());
+            if inherited_preview.is_none() {
+                inherited_preview = context_preview;
+            }
+            if inherited_first_user_message.is_none() {
+                inherited_first_user_message = context_first_user_message;
+            }
+        }
         let source_history_items = if let Some(prepared_fork) = prepared_fork.as_ref() {
             Arc::clone(&prepared_fork.model_context)
         } else {
@@ -4202,6 +4238,10 @@ impl ThreadRequestProcessor {
                 .fork_prepared_thread(
                     config,
                     prepared_fork,
+                    ForkInheritedMetadata {
+                        preview: inherited_preview,
+                        first_user_message: inherited_first_user_message,
+                    },
                     thread_source,
                     parent_trace,
                     supports_openai_form_elicitation,
@@ -4257,20 +4297,23 @@ impl ThreadRequestProcessor {
             app_server_client_version,
         )
         .await?;
-        if session_configured.rollout_path.is_some()
-            && let Some(name) = source_thread_name.clone()
-        {
-            self.thread_manager
-                .update_thread_metadata(
-                    thread_id,
-                    StoreThreadMetadataPatch {
-                        name: Some(Some(name)),
-                        ..Default::default()
-                    },
-                    /*include_archived*/ true,
-                )
-                .await
-                .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
+        if session_configured.rollout_path.is_some() {
+            let inherited_metadata = StoreThreadMetadataPatch {
+                name: source_thread_name.clone().map(Some),
+                ..Default::default()
+            };
+            if !inherited_metadata.is_empty() {
+                self.thread_manager
+                    .update_thread_metadata(
+                        thread_id,
+                        inherited_metadata,
+                        /*include_archived*/ true,
+                    )
+                    .await
+                    .map_err(|err| {
+                        core_thread_write_error("inherit source thread metadata", err)
+                    })?;
+            }
         }
         let inherited_goal = if defer_goal_continuation
             && session_configured.rollout_path.is_some()
@@ -4323,11 +4366,15 @@ impl ThreadRequestProcessor {
             let stored_thread = self
                 .read_stored_thread_for_new_fork(thread_id, include_turns && !paginated_source)
                 .await?;
-            self.stored_thread_to_api_thread(
+            let mut thread = self.stored_thread_to_api_thread(
                 stored_thread,
                 fallback_model_provider.as_str(),
                 include_turns && !paginated_source,
-            )
+            );
+            if reference_fork && !source_thread.preview.is_empty() {
+                thread.preview = source_thread.preview.clone();
+            }
+            thread
         } else {
             let mut thread = build_thread_from_snapshot(
                 thread_id,
@@ -5274,6 +5321,74 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
         })
         .map(|preview| strip_user_message_prefix(preview.as_str()).to_string())
         .unwrap_or_default()
+}
+
+/// Recover the source summary from a prepared legacy reference snapshot after its recorder has
+/// been flushed. This avoids a second thread read (and a fresh filesystem lock) for active
+/// goal-only or unflushed-user sources whose preflight summary was still empty.
+fn legacy_summary_from_rollout_items(items: &[RolloutItem]) -> (Option<String>, Option<String>) {
+    let mut preview = None;
+    let mut first_user_message = None;
+    for item in items {
+        let (candidate, is_user_message) = match item {
+            RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(event)) => {
+                let objective = event.goal.objective.trim();
+                (
+                    (!objective.is_empty()).then(|| objective.to_string()),
+                    false,
+                )
+            }
+            RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
+                (codex_protocol::protocol::user_message_preview(event), true)
+            }
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
+                if let codex_protocol::items::TurnItem::UserMessage(user) = &event.item {
+                    (
+                        codex_protocol::protocol::user_message_preview(
+                            &user.as_legacy_user_message_event(),
+                        ),
+                        true,
+                    )
+                } else {
+                    (None, false)
+                }
+            }
+            RolloutItem::ResponseItem(item) => {
+                let parsed_item = codex_core::parse_turn_item(item);
+                let is_user_message = matches!(
+                    parsed_item.as_ref(),
+                    Some(codex_protocol::items::TurnItem::UserMessage(_))
+                );
+                let candidate = if is_user_message {
+                    parsed_item.and_then(|item| match item {
+                        codex_protocol::items::TurnItem::UserMessage(user) => {
+                            Some(strip_user_message_prefix(user.message().as_str()).to_string())
+                        }
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                (
+                    candidate.filter(|candidate| !candidate.is_empty()),
+                    is_user_message,
+                )
+            }
+            _ => (None, false),
+        };
+        if let Some(candidate) = candidate {
+            if preview.is_none() {
+                preview = Some(candidate.clone());
+            }
+            if is_user_message && first_user_message.is_none() {
+                first_user_message = Some(candidate);
+            }
+        }
+        if preview.is_some() && first_user_message.is_some() {
+            break;
+        }
+    }
+    (preview, first_user_message)
 }
 
 fn requested_permissions_trust_project(overrides: &ConfigOverrides, cwd: &Path) -> bool {

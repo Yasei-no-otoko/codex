@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use codex_protocol::ThreadId;
@@ -169,48 +170,235 @@ async fn rejects_missing_cycles_and_out_of_bounds_offsets() {
 
     let cycle_a = ThreadId::default();
     let cycle_b = ThreadId::default();
-    write_rollout(
+    let cycle_a_path = write_rollout(
         home.path(),
         cycle_a,
-        Some(unchecked_history_position(
-            cycle_b, /*end_ordinal_exclusive*/ 1,
-        )),
+        /*history_base*/ None,
         /*next_ordinal*/ 2,
     );
-    write_rollout(
+    let cycle_b_path = write_rollout(
         home.path(),
         cycle_b,
-        Some(unchecked_history_position(
-            cycle_a, /*end_ordinal_exclusive*/ 1,
-        )),
+        /*history_base*/ None,
         /*next_ordinal*/ 2,
     );
+    for _ in 0..3 {
+        let cycle_a_len = fs::metadata(cycle_a_path.as_path())
+            .expect("cycle A metadata")
+            .len();
+        let cycle_b_len = fs::metadata(cycle_b_path.as_path())
+            .expect("cycle B metadata")
+            .len();
+        write_rollout(
+            home.path(),
+            cycle_a,
+            Some(HistoryPosition {
+                thread_id: cycle_b,
+                end_ordinal_exclusive: 1,
+                end_byte_offset: cycle_b_len,
+            }),
+            /*next_ordinal*/ 2,
+        );
+        write_rollout(
+            home.path(),
+            cycle_b,
+            Some(HistoryPosition {
+                thread_id: cycle_a,
+                end_ordinal_exclusive: 1,
+                end_byte_offset: cycle_a_len,
+            }),
+            /*next_ordinal*/ 2,
+        );
+    }
     assert_invalid_lineage(&store, cycle_a, "cycle detected").await;
 
     let root = ThreadId::default();
-    let invalid_child = ThreadId::default();
     let root_path = write_rollout(
         home.path(),
         root,
         /*history_base*/ None,
         /*next_ordinal*/ 2,
     );
-    write_rollout(
-        home.path(),
-        invalid_child,
-        Some(HistoryPosition {
+    let err = super::validate_cutoff_bounds(
+        root,
+        root_path.as_path(),
+        &HistoryPosition {
             thread_id: root,
             end_ordinal_exclusive: 2,
-            end_byte_offset: fs::metadata(root_path).expect("root metadata").len() + 1,
-        }),
+            end_byte_offset: fs::metadata(root_path.as_path())
+                .expect("root metadata")
+                .len()
+                + 1,
+        },
+        ThreadHistoryMode::Paginated,
+        false,
+    )
+    .await
+    .expect_err("cutoff past the source rollout should be rejected");
+    assert!(
+        err.to_string()
+            .contains("cutoff byte offset is past the source rollout"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn paginated_cutoff_accepts_rejected_and_blank_newline_tail() {
+    let home = TempDir::new().expect("temp dir");
+    let root = ThreadId::default();
+    let root_path = write_rollout(
+        home.path(),
+        root,
+        /*history_base*/ None,
+        /*next_ordinal*/ 3,
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("open root rollout")
+        .write_all(b"{\"rejected\":true}\n\n")
+        .expect("append rejected tail");
+    let cutoff = fs::metadata(root_path.as_path())
+        .expect("root metadata")
+        .len();
+
+    super::validate_cutoff_bounds(
+        root,
+        root_path.as_path(),
+        &HistoryPosition {
+            thread_id: root,
+            end_ordinal_exclusive: 3,
+            end_byte_offset: cutoff,
+        },
+        ThreadHistoryMode::Paginated,
+        false,
+    )
+    .await
+    .expect("paginated physical cutoff should accept rejected tail");
+}
+
+#[tokio::test]
+async fn legacy_cutoff_rejects_newline_terminated_malformed_tail() {
+    let home = TempDir::new().expect("temp dir");
+    let root = ThreadId::default();
+    let root_path = write_rollout(
+        home.path(),
+        root,
+        /*history_base*/ None,
         /*next_ordinal*/ 2,
     );
-    assert_invalid_lineage(
-        &store,
-        invalid_child,
-        "cutoff byte offset is past the source rollout",
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("open root rollout")
+        .write_all(b"{\"malformed\":true}\n")
+        .expect("append malformed tail");
+    let cutoff = fs::metadata(root_path.as_path())
+        .expect("root metadata")
+        .len();
+
+    let err = super::validate_cutoff_bounds(
+        root,
+        root_path.as_path(),
+        &HistoryPosition {
+            thread_id: root,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: cutoff,
+        },
+        ThreadHistoryMode::Legacy,
+        false,
     )
-    .await;
+    .await
+    .expect_err("legacy cutoff must reject malformed tail");
+    assert!(
+        err.to_string().contains("complete rollout envelope"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_cutoff_accepts_unknown_nested_payload_schema() {
+    let home = TempDir::new().expect("temp dir");
+    let root = ThreadId::default();
+    let root_path = write_rollout(
+        home.path(),
+        root,
+        /*history_base*/ None,
+        /*next_ordinal*/ 2,
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("open root rollout")
+        .write_all(
+            br#"{"timestamp":"2026-07-16T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":{"future_shape":[1,2,3]}}}}}"#,
+        )
+        .expect("append schema-evolved envelope");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("reopen root rollout")
+        .write_all(b"\n")
+        .expect("terminate schema-evolved envelope");
+    let cutoff = fs::metadata(root_path.as_path())
+        .expect("root metadata")
+        .len();
+
+    super::validate_cutoff_bounds(
+        root,
+        root_path.as_path(),
+        &HistoryPosition {
+            thread_id: root,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: cutoff,
+        },
+        ThreadHistoryMode::Legacy,
+        false,
+    )
+    .await
+    .expect("legacy cutoff should accept a complete envelope with an unknown payload schema");
+}
+
+#[tokio::test]
+async fn compressed_legacy_cutoff_accepts_complete_envelope_without_materializing() {
+    let home = TempDir::new().expect("temp dir");
+    let root = ThreadId::default();
+    let plain_path = home
+        .path()
+        .join("sessions/2026/07/16")
+        .join(format!("rollout-2026-07-16T00-00-00-{root}.jsonl"));
+    fs::create_dir_all(plain_path.parent().expect("rollout parent")).expect("create rollout dir");
+    let bytes = br#"{"timestamp":"2026-07-16T00:00:00.000Z","type":"session_meta","payload":{}}
+{"timestamp":"2026-07-16T00:00:01.000Z","type":"future_event","payload":{"new_shape":[1,2,3]}}
+"#;
+    fs::write(&plain_path, bytes).expect("write legacy rollout");
+    let compressed_path = plain_path.with_extension("jsonl.zst");
+    let mut output = fs::File::create(&compressed_path).expect("create compressed rollout");
+    let mut input = fs::File::open(&plain_path).expect("open legacy rollout");
+    zstd::stream::copy_encode(&mut input, &mut output, 3).expect("compress legacy rollout");
+    fs::remove_file(&plain_path).expect("remove plain rollout");
+
+    super::validate_cutoff_bounds(
+        root,
+        compressed_path.as_path(),
+        &HistoryPosition {
+            thread_id: root,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: bytes.len() as u64,
+        },
+        ThreadHistoryMode::Legacy,
+        false,
+    )
+    .await
+    .expect("compressed legacy envelope boundary should validate");
+    assert!(
+        compressed_path.exists(),
+        "validation must not materialize zstd"
+    );
+    assert!(
+        !plain_path.exists(),
+        "validation must not create a plain sibling"
+    );
 }
 
 async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, detail: &str) {

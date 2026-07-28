@@ -2,11 +2,13 @@ mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
+mod legacy_fork;
 mod list_threads;
 mod live_writer;
 mod model_context;
 mod paginated_fork;
 mod read_thread;
+mod reference_attachment;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
 mod rollout_lineage;
@@ -17,6 +19,11 @@ mod unarchive_thread;
 mod update_thread_metadata;
 mod writer_lock;
 
+pub use reference_attachment::write_reference_logical_attachment_from_items;
+
+#[cfg(test)]
+#[path = "reference_attachment_tests.rs"]
+mod reference_attachment_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -66,6 +73,8 @@ use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
 use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
+use crate::WriteReferenceLogicalAttachmentOutcome;
+use crate::WriteReferenceLogicalAttachmentParams;
 use crate::local::writer_lock::WriterLockCoordinator;
 use crate::local::writer_lock::WriterLockGuard;
 
@@ -117,6 +126,17 @@ struct ThreadCoordination {
     // accept writes during child initialization, including MCP startup that can take 30 seconds.
     // Operations that need both locks must acquire `lifecycle` before `writer`.
     lifecycle: Arc<RwLock<()>>,
+}
+
+/// Locks reserved before inspecting a fork source's rollout metadata.
+///
+/// Mode detection and header reads must happen under the same lifecycle/filesystem barrier that
+/// the selected preparation path keeps until the child metadata is durable. Otherwise a concurrent
+/// archive/compression rename can make the initial read fail and accidentally select a different
+/// fork implementation.
+pub(super) struct ForkSourceGuards {
+    pub(super) lifecycle: OwnedRwLockReadGuard<()>,
+    pub(super) filesystem: WriterLockGuard,
 }
 
 impl LiveWriterLocks {
@@ -250,7 +270,31 @@ impl LocalThreadStore {
         Ok(())
     }
 
-    async fn acquire_paginated_writer_locks(
+    async fn existing_writer_lock(&self, thread_id: ThreadId) -> Option<WriterLockGuard> {
+        self.live_recorders
+            .lock()
+            .await
+            .get(&thread_id)
+            .and_then(|entry| entry.writer_lock.clone())
+    }
+
+    async fn acquire_fork_source_guards(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<ForkSourceGuards> {
+        let lifecycle = self.live_writer_locks.reserve_lifecycle(thread_id).await;
+        let filesystem = if let Some(guard) = self.existing_writer_lock(thread_id).await {
+            guard
+        } else {
+            self.writer_lock_coordinator.acquire(thread_id)?
+        };
+        Ok(ForkSourceGuards {
+            lifecycle,
+            filesystem,
+        })
+    }
+
+    async fn acquire_writer_locks(
         &self,
         thread_ids: &[ThreadId],
     ) -> ThreadStoreResult<Vec<WriterLockGuard>> {
@@ -266,22 +310,10 @@ impl LocalThreadStore {
                 continue;
             }
 
-            // Only a readable legacy header proves no paginated writer can own this id. Missing
-            // lazy rollouts and damaged headers must conservatively try the lock.
-            let history_mode = match read_thread::resolve_rollout_path(
-                self, thread_id, /*include_archived*/ true,
-            )
-            .await?
-            {
-                Some(rollout_path) => codex_rollout::read_session_meta_line(rollout_path.as_path())
-                    .await
-                    .ok()
-                    .map(|meta_line| meta_line.meta.history_mode),
-                None => None,
-            };
-            if !matches!(history_mode, Some(ThreadHistoryMode::Legacy)) {
-                writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
-            }
+            // The filesystem lock protects all cross-process destructive operations, including
+            // legacy reference preparation. Missing rollouts and damaged headers must
+            // conservatively try the lock as well.
+            writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
         }
         Ok(writer_locks)
     }
@@ -423,6 +455,15 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(LocalThreadStore::load_history(self, params))
     }
 
+    fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> ThreadStoreFuture<'_, WriteReferenceLogicalAttachmentOutcome> {
+        Box::pin(async move {
+            reference_attachment::write_reference_logical_attachment(self, params).await
+        })
+    }
+
     fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
@@ -431,7 +472,58 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
-        Box::pin(async move { paginated_fork::prepare(self, params).await })
+        Box::pin(async move {
+            let source_guards = self.acquire_fork_source_guards(params.thread_id).await?;
+            match live_writer::persist_thread(self, params.thread_id).await {
+                Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+            let Some(source_path) =
+                read_thread::resolve_rollout_path(self, params.thread_id, true).await?
+            else {
+                return Err(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                });
+            };
+            let source_meta = codex_rollout::read_session_meta_line(source_path.as_path())
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to read fork source metadata {}: {err}",
+                        source_path.display()
+                    ),
+                })?;
+            if matches!(&params.boundary, crate::ForkBoundary::Latest)
+                && source_meta.meta.history_mode == ThreadHistoryMode::Legacy
+            {
+                // Pathless latest forks of supported external legacy roots must retain the
+                // historical copied-history fallback in app-server. Reference preparation
+                // requires a managed source so that lineage cannot splice arbitrary files.
+                if !read_thread::rollout_path_is_managed(self, source_path.as_path()).await {
+                    if source_meta.meta.history_base.is_some() {
+                        return Err(ThreadStoreError::InvalidRequest {
+                            message: format!(
+                                "reference rollout for thread {} must resolve to its managed Codex home path",
+                                params.thread_id
+                            ),
+                        });
+                    }
+                    return Err(ThreadStoreError::Unsupported {
+                        operation: "external legacy latest fork",
+                    });
+                }
+                return legacy_fork::prepare(self, params, source_guards).await;
+            }
+            if source_meta.meta.history_mode != ThreadHistoryMode::Paginated {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "fork source {} does not use paginated history",
+                        params.thread_id
+                    ),
+                });
+            }
+            paginated_fork::prepare(self, params, source_guards).await
+        })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
@@ -533,6 +625,7 @@ mod tests {
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::HistoryPosition;
     use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SandboxPolicy;
@@ -544,13 +637,19 @@ mod tests {
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::ForkBoundary;
     use crate::LiveThread;
+    use crate::ThreadMetadataPatch;
     use crate::ThreadPersistenceMetadata;
+    use crate::local::test_support::compress_session_file;
+    use crate::local::test_support::set_history_base_in_session_file;
     use crate::local::test_support::test_config;
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
+    use crate::local::test_support::write_session_file_with_fork;
     use crate::local::test_support::write_session_file_with_history_mode;
 
     #[tokio::test]
@@ -600,6 +699,297 @@ mod tests {
         assert!(
             matches!(err, ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id)
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_live_writer_blocks_cross_store_maintenance_until_reopened() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let thread_id = ThreadId::default();
+        let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        store
+            .create_thread(create_thread_params(thread_id))
+            .await
+            .expect("create legacy live thread");
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![user_message_item("before maintenance")],
+            })
+            .await
+            .expect("append before maintenance");
+        store
+            .flush_thread(thread_id)
+            .await
+            .expect("flush before maintenance");
+
+        let maintenance_store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        let rollout_path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("load active rollout path");
+        let resume_error = maintenance_store
+            .resume_thread(ResumeThreadParams {
+                thread_id,
+                rollout_path: Some(rollout_path),
+                history: None,
+                include_archived: true,
+                metadata: thread_metadata(),
+            })
+            .await
+            .expect_err("resume must not race an active legacy writer");
+        assert!(matches!(resume_error, ThreadStoreError::Conflict { .. }));
+        let archive_error = maintenance_store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("archive must not move an active legacy rollout");
+        assert!(matches!(archive_error, ThreadStoreError::Conflict { .. }));
+        let delete_error = maintenance_store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("delete must not remove an active legacy rollout");
+        assert!(matches!(delete_error, ThreadStoreError::Conflict { .. }));
+
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![user_message_item("after maintenance conflict")],
+            })
+            .await
+            .expect("append after maintenance conflict");
+        store
+            .flush_thread(thread_id)
+            .await
+            .expect("flush after maintenance conflict");
+        store
+            .shutdown_thread(thread_id)
+            .await
+            .expect("close active legacy writer");
+
+        let reopened_store = LocalThreadStore::new(config, /*state_db*/ None);
+        let history = reopened_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: true,
+            })
+            .await
+            .expect("reopen legacy rollout");
+        let items = history.history.expect("reopened history").items;
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::UserMessage(event))
+                    if event.message == "before maintenance"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::UserMessage(event))
+                    if event.message == "after maintenance conflict"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn cold_lineage_scan_blocks_same_store_maintenance() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let thread_id =
+            ThreadId::from_string(&Uuid::from_u128(902).to_string()).expect("thread id");
+        let rollout_path = write_session_file(
+            home.path(),
+            "2025-01-03T00-00-00.000Z",
+            Uuid::from_u128(902),
+        )
+        .expect("write cold source");
+        let store = LocalThreadStore::new(config, /*state_db*/ None);
+
+        let (_lineage, writer_guards) = store
+            .resolve_rollout_lineage_for_reference_locked(thread_id)
+            .await
+            .expect("resolve cold lineage while holding filesystem guard");
+
+        let archive_error = store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("archive must conflict with a same-store lineage scan");
+        assert!(matches!(archive_error, ThreadStoreError::Conflict { .. }));
+        let delete_error = store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("delete must conflict with a same-store lineage scan");
+        assert!(matches!(delete_error, ThreadStoreError::Conflict { .. }));
+        let unarchive_error = store
+            .unarchive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("unarchive must conflict before path mutation");
+        assert!(matches!(unarchive_error, ThreadStoreError::Conflict { .. }));
+        assert!(
+            rollout_path.exists(),
+            "maintenance must not mutate the source"
+        );
+
+        drop(writer_guards);
+        store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect("archive succeeds after lineage guards are released");
+    }
+
+    #[tokio::test]
+    async fn unmaterialized_root_preview_patch_does_not_require_rollout_metadata() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create lazy root");
+        let rollout_path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("load lazy rollout path");
+        assert!(!rollout_path.exists());
+
+        let updated = live_thread
+            .update_metadata(
+                ThreadMetadataPatch {
+                    preview: Some("inherited preview".to_string()),
+                    first_user_message: Some("inherited first message".to_string()),
+                    ..Default::default()
+                },
+                /*include_archived*/ true,
+            )
+            .await
+            .expect("preview-only patch should work before rollout materialization");
+        assert_eq!(updated.preview, "inherited preview");
+        assert_eq!(
+            updated.first_user_message.as_deref(),
+            Some("inherited first message")
+        );
+
+        live_thread
+            .append_items(&[user_message_item("first child message")])
+            .await
+            .expect("append first child message");
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read metadata")
+            .expect("metadata row");
+        assert_eq!(metadata.preview.as_deref(), Some("inherited preview"));
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("inherited first message")
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_fork_dispatches_lazy_sources_by_persisted_history_mode() {
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            let home = TempDir::new().expect("temp dir");
+            let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+            let thread_id = ThreadId::default();
+            let mut params = create_thread_params(thread_id);
+            params.history_mode = history_mode;
+            store
+                .create_thread(params)
+                .await
+                .expect("create lazy source");
+            let prepared = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.prepare_fork(PrepareForkParams {
+                    thread_id,
+                    boundary: ForkBoundary::Latest,
+                }),
+            )
+            .await
+            .expect("latest fork should not deadlock")
+            .expect("latest fork should dispatch after persistence");
+
+            match history_mode {
+                ThreadHistoryMode::Legacy => {
+                    let history_base = prepared.history_base.expect("legacy reference cutoff");
+                    assert_eq!(history_base.thread_id, thread_id);
+                    assert_eq!(history_base.end_ordinal_exclusive, 0);
+                    assert!(history_base.end_byte_offset > 0);
+                }
+                ThreadHistoryMode::Paginated => {
+                    assert_eq!(prepared.history_base, None);
+                }
+            }
+            drop(prepared);
+            store
+                .shutdown_thread(thread_id)
+                .await
+                .expect("shutdown lazy source");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_legacy_fork_survives_concurrent_archive_during_mode_detection() {
+        let home = TempDir::new().expect("home temp dir");
+        let source_uuid = uuid::Uuid::from_u128(903);
+        let source_id = ThreadId::from_string(&source_uuid.to_string()).expect("source id");
+        write_session_file(home.path(), "2025-01-03T00-01-00.000Z", source_uuid)
+            .expect("write legacy source");
+        let config = test_config(home.path());
+        let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
+        let maintenance_race_store = maintenance_store.clone();
+
+        let prepare = tokio::spawn(async move {
+            store
+                .prepare_fork(PrepareForkParams {
+                    thread_id: source_id,
+                    boundary: ForkBoundary::Latest,
+                })
+                .await
+        });
+        let archive = tokio::spawn(async move {
+            maintenance_race_store
+                .archive_thread(ArchiveThreadParams {
+                    thread_id: source_id,
+                })
+                .await
+        });
+
+        let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), prepare)
+            .await
+            .expect("fork/archive race must not deadlock")
+            .expect("fork task should not panic")
+            .expect("legacy source must not be dispatched as paginated");
+        let history_base = prepared
+            .history_base
+            .expect("legacy latest fork should retain a byte cutoff");
+        assert_eq!(history_base.thread_id, source_id);
+        assert_eq!(history_base.end_ordinal_exclusive, 0);
+        drop(prepared);
+
+        let archive_result = tokio::time::timeout(std::time::Duration::from_secs(5), archive)
+            .await
+            .expect("archive must finish after fork releases its source guard")
+            .expect("archive task should not panic");
+        match archive_result {
+            Ok(()) => {}
+            Err(ThreadStoreError::Conflict { .. }) => {
+                maintenance_store
+                    .archive_thread(ArchiveThreadParams {
+                        thread_id: source_id,
+                    })
+                    .await
+                    .expect("archive retry should succeed after fork preparation");
+            }
+            Err(error) => panic!("unexpected archive result: {error:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1196,10 +1586,7 @@ mod tests {
                 .path()
                 .join("thread-writer-locks")
                 .join(format!("{thread_id}.lock"));
-            assert_eq!(
-                lock_path.exists(),
-                matches!(history_mode, ThreadHistoryMode::Paginated)
-            );
+            assert!(lock_path.exists());
             store
                 .discard_thread(thread_id)
                 .await
@@ -1280,6 +1667,402 @@ mod tests {
 
         assert_rollout_contains_message(rollout_path.as_path(), "before resume").await;
         assert_rollout_contains_message(rollout_path.as_path(), "after resume").await;
+    }
+
+    #[tokio::test]
+    async fn pathless_resume_with_supplied_history_resolves_rollout_path() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let thread_id =
+            ThreadId::from_string(&Uuid::from_u128(413).to_string()).expect("thread id");
+        let first_store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        first_store
+            .create_thread(create_thread_params(thread_id))
+            .await
+            .expect("create thread");
+        first_store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![user_message_item("resume history")],
+            })
+            .await
+            .expect("append thread");
+        first_store
+            .flush_thread(thread_id)
+            .await
+            .expect("flush thread");
+        first_store
+            .shutdown_thread(thread_id)
+            .await
+            .expect("shutdown thread");
+
+        let resumed_store = LocalThreadStore::new(config, /*state_db*/ None);
+        resumed_store
+            .resume_thread(ResumeThreadParams {
+                thread_id,
+                rollout_path: None,
+                history: Some(Arc::new(Vec::new())),
+                include_archived: false,
+                metadata: thread_metadata(),
+            })
+            .await
+            .expect("pathless resume with supplied history");
+        resumed_store
+            .shutdown_thread(thread_id)
+            .await
+            .expect("shutdown resumed thread");
+    }
+
+    #[tokio::test]
+    async fn pathless_cold_reference_resume_materializes_compressed_lineage_and_preserves_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let home = TempDir::new()?;
+        let config = test_config(home.path());
+        let parent_uuid = Uuid::from_u128(414);
+        let child_uuid = Uuid::from_u128(415);
+        let parent_id = ThreadId::from_string(&parent_uuid.to_string())?;
+        let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+        let parent_path = write_session_file_with_fork(
+            home.path(),
+            home.path().join("sessions/2025/01/03"),
+            "2025-01-04T12-00-00",
+            parent_uuid,
+            "compressed parent message",
+            Some("test-provider"),
+            None,
+            ThreadHistoryMode::Legacy,
+        )?;
+        let parent_cutoff = std::fs::metadata(&parent_path)?.len();
+        let child_path = write_session_file_with_fork(
+            home.path(),
+            home.path().join("sessions/2025/01/03"),
+            "2025-01-04T12-01-00",
+            child_uuid,
+            "compressed child message",
+            Some("test-provider"),
+            Some(parent_uuid),
+            ThreadHistoryMode::Legacy,
+        )?;
+        set_history_base_in_session_file(
+            &child_path,
+            &HistoryPosition {
+                thread_id: parent_id,
+                end_ordinal_exclusive: 0,
+                end_byte_offset: parent_cutoff,
+            },
+        )?;
+        let parent_compressed = compress_session_file(&parent_path)?;
+        let child_compressed = compress_session_file(&child_path)?;
+        let store = LocalThreadStore::new(config, /*state_db*/ None);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.resume_thread(ResumeThreadParams {
+                thread_id: child_id,
+                rollout_path: None,
+                history: None,
+                include_archived: false,
+                metadata: thread_metadata(),
+            }),
+        )
+        .await
+        .expect("cold reference resume must not deadlock")?;
+
+        let parent_plain = codex_rollout::plain_rollout_path(parent_compressed.as_path());
+        let child_plain = codex_rollout::plain_rollout_path(child_compressed.as_path());
+        assert!(parent_plain.exists());
+        assert!(child_plain.exists());
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id: child_id,
+                include_archived: false,
+            })
+            .await?;
+        let messages = history
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::UserMessage(event)) => Some(event.message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec!["compressed parent message", "compressed child message"]
+        );
+        store.shutdown_thread(child_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_resume_guard_matrix_handles_path_and_history_variants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (explicit_path, supplied_history) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let home = TempDir::new()?;
+            let config = test_config(home.path());
+            let parent_uuid = Uuid::from_u128(416 + u128::from(explicit_path) * 4);
+            let child_uuid = Uuid::from_u128(417 + u128::from(explicit_path) * 4);
+            let parent_id = ThreadId::from_string(&parent_uuid.to_string())?;
+            let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+            let parent_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-10-00",
+                parent_uuid,
+                "matrix parent",
+                Some("test-provider"),
+                None,
+                ThreadHistoryMode::Legacy,
+            )?;
+            let parent_cutoff = std::fs::metadata(&parent_path)?.len();
+            let child_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-11-00",
+                child_uuid,
+                "matrix child",
+                Some("test-provider"),
+                Some(parent_uuid),
+                ThreadHistoryMode::Legacy,
+            )?;
+            set_history_base_in_session_file(
+                &child_path,
+                &HistoryPosition {
+                    thread_id: parent_id,
+                    end_ordinal_exclusive: 0,
+                    end_byte_offset: parent_cutoff,
+                },
+            )?;
+            let child_compressed = compress_session_file(&child_path)?;
+            compress_session_file(&parent_path)?;
+
+            let store = LocalThreadStore::new(config, /*state_db*/ None);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.resume_thread(ResumeThreadParams {
+                    thread_id: child_id,
+                    rollout_path: explicit_path.then_some(child_compressed),
+                    history: supplied_history.then(|| Arc::new(Vec::new())),
+                    include_archived: false,
+                    metadata: thread_metadata(),
+                }),
+            )
+            .await
+            .expect("reference resume matrix must not deadlock")?;
+            let history = store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id: child_id,
+                    include_archived: false,
+                })
+                .await?;
+            let messages = history
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
+                        Some(event.message.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(messages, vec!["matrix parent", "matrix child"]);
+            store.shutdown_thread(child_id).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_reference_resume_avoids_summary_lineage_reentry_plain_and_zstd()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (compressed, offset) in [(false, 0_u128), (true, 2_u128)] {
+            let home = TempDir::new()?;
+            let config = test_config(home.path());
+            let parent_uuid = Uuid::from_u128(430 + offset);
+            let child_uuid = Uuid::from_u128(431 + offset);
+            let parent_id = ThreadId::from_string(&parent_uuid.to_string())?;
+            let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+            let parent_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-30-00",
+                parent_uuid,
+                "empty fixture parent",
+                Some("test-provider"),
+                None,
+                ThreadHistoryMode::Legacy,
+            )?;
+            let parent_cutoff = std::fs::metadata(&parent_path)?.len();
+            let child_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-31-00",
+                child_uuid,
+                "",
+                Some("test-provider"),
+                Some(parent_uuid),
+                ThreadHistoryMode::Legacy,
+            )?;
+            set_history_base_in_session_file(
+                &child_path,
+                &HistoryPosition {
+                    thread_id: parent_id,
+                    end_ordinal_exclusive: 0,
+                    end_byte_offset: parent_cutoff,
+                },
+            )?;
+
+            let explicit_path = if compressed {
+                let child_compressed = compress_session_file(&child_path)?;
+                compress_session_file(&parent_path)?;
+                child_compressed
+            } else {
+                child_path
+            };
+            let store = LocalThreadStore::new(config, /*state_db*/ None);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.resume_thread(ResumeThreadParams {
+                    thread_id: child_id,
+                    rollout_path: Some(explicit_path),
+                    history: None,
+                    include_archived: false,
+                    metadata: thread_metadata(),
+                }),
+            )
+            .await
+            .expect("empty explicit reference resume must not reenter summary lineage")?;
+
+            let history = store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id: child_id,
+                    include_archived: false,
+                })
+                .await?;
+            assert!(history.items.iter().any(|item| {
+                matches!(
+                    item,
+                    RolloutItem::EventMsg(EventMsg::UserMessage(event))
+                        if event.message == "empty fixture parent"
+                )
+            }));
+            store.shutdown_thread(child_id).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_reference_resume_historyless_avoids_summary_lineage_reentry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for compressed in [false, true] {
+            let home = TempDir::new()?;
+            let config = test_config(home.path());
+            let parent_uuid = Uuid::from_u128(432);
+            let child_uuid = Uuid::from_u128(433);
+            let parent_id = ThreadId::from_string(&parent_uuid.to_string())?;
+            let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+            let parent_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-32-00",
+                parent_uuid,
+                "",
+                Some("test-provider"),
+                None,
+                ThreadHistoryMode::Legacy,
+            )?;
+            let parent_cutoff = std::fs::metadata(&parent_path)?.len();
+            let child_path = write_session_file_with_fork(
+                home.path(),
+                home.path().join("sessions/2025/01/03"),
+                "2025-01-04T12-33-00",
+                child_uuid,
+                "",
+                Some("test-provider"),
+                Some(parent_uuid),
+                ThreadHistoryMode::Legacy,
+            )?;
+            set_history_base_in_session_file(
+                &child_path,
+                &HistoryPosition {
+                    thread_id: parent_id,
+                    end_ordinal_exclusive: 0,
+                    end_byte_offset: parent_cutoff,
+                },
+            )?;
+
+            let explicit_path = if compressed {
+                let child_compressed = compress_session_file(&child_path)?;
+                compress_session_file(&parent_path)?;
+                child_compressed
+            } else {
+                child_path
+            };
+            let store = LocalThreadStore::new(config, /*state_db*/ None);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.resume_thread(ResumeThreadParams {
+                    thread_id: child_id,
+                    rollout_path: Some(explicit_path),
+                    history: Some(Arc::new(Vec::new())),
+                    include_archived: false,
+                    metadata: thread_metadata(),
+                }),
+            )
+            .await
+            .expect(
+                "empty explicit reference historyless resume must not reenter summary lineage",
+            )?;
+
+            let history = store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id: child_id,
+                    include_archived: false,
+                })
+                .await?;
+            let messages = history
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
+                        Some(event.message.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(messages, vec!["", ""]);
+            store.shutdown_thread(child_id).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_rejects_mismatched_rollout_id_before_preheld_lineage() {
+        for supplied_history in [false, true] {
+            let home = TempDir::new().expect("temp dir");
+            let expected_id =
+                ThreadId::from_string(&Uuid::from_u128(421).to_string()).expect("expected id");
+            let other_uuid = Uuid::from_u128(422);
+            let other_path = write_session_file(home.path(), "2025-01-04T12-20-00", other_uuid)
+                .expect("other rollout");
+            let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.resume_thread(ResumeThreadParams {
+                    thread_id: expected_id,
+                    rollout_path: Some(other_path),
+                    history: supplied_history.then(|| Arc::new(Vec::new())),
+                    include_archived: false,
+                    metadata: thread_metadata(),
+                }),
+            )
+            .await
+            .expect("mismatched explicit resume must not deadlock");
+            assert!(matches!(
+                result,
+                Err(ThreadStoreError::InvalidRequest { .. })
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1449,8 +2232,8 @@ mod tests {
                 boundary: crate::ForkBoundary::Latest,
             })
             .await
-            .expect_err("external rollouts cannot be referenced by thread id");
-        assert!(error.to_string().contains("must be in Codex home"));
+            .expect_err("external latest forks should use the copied-history fallback");
+        assert!(matches!(error, ThreadStoreError::Unsupported { .. }));
     }
 
     #[tokio::test]
@@ -1715,6 +2498,8 @@ mod tests {
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
+            preview: None,
+            first_user_message: None,
             subagent_history_start_ordinal: None,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
             metadata: thread_metadata(),

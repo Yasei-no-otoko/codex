@@ -3,11 +3,15 @@ use std::collections::HashMap;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::parse_cursor;
+use codex_rollout::read_session_meta_line;
 
 use super::LocalThreadStore;
 use super::helpers::resolve_thread_names;
 use super::helpers::set_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
+use super::read_thread::enrich_legacy_reference_summary;
+use super::read_thread::reference_rollout_path_is_managed;
+use super::read_thread::rollout_path_is_managed;
 use crate::ListThreadsParams;
 use crate::SortDirection;
 use crate::ThreadPage;
@@ -62,7 +66,7 @@ pub(super) async fn list_threads(
         .as_ref()
         .and_then(|cursor| serde_json::to_value(cursor).ok())
         .and_then(|value| value.as_str().map(str::to_owned));
-    let mut items = page
+    let items = page
         .items
         .into_iter()
         .filter_map(|item| {
@@ -73,6 +77,46 @@ pub(super) async fn list_threads(
             )
         })
         .collect::<Vec<_>>();
+    let mut visible_items = Vec::with_capacity(items.len());
+    for thread in items {
+        let visible = if let Some(path) = thread.rollout_path.as_deref() {
+            let managed_path = rollout_path_is_managed(store, path).await;
+            if managed_path {
+                true
+            } else {
+                match codex_rollout::existing_rollout_path(path).await {
+                    Some(existing_path) => {
+                        match read_session_meta_line(existing_path.as_path()).await {
+                            // A root copied outside CODEX_HOME remains compatible only when the header
+                            // proves both its identity and its lack of a lineage reference.
+                            Ok(meta) if meta.meta.id != thread.thread_id => managed_path,
+                            Ok(meta) if meta.meta.history_base.is_none() => true,
+                            Ok(_) => reference_rollout_path_is_managed(
+                                store,
+                                thread.thread_id,
+                                existing_path.as_path(),
+                            )
+                            .await
+                            .unwrap_or(false),
+                            // Managed stale rows retain metadata-only compatibility. External rows have
+                            // no safe fallback when their header cannot be verified.
+                            Err(_) => managed_path,
+                        }
+                    }
+                    None => managed_path,
+                }
+            }
+        } else {
+            true
+        };
+        if visible {
+            visible_items.push(thread);
+        }
+    }
+    let mut items = visible_items;
+    for thread in &mut items {
+        enrich_legacy_reference_summary(store, thread).await?;
+    }
 
     let thread_history_modes = items
         .iter()
@@ -84,7 +128,6 @@ pub(super) async fn list_threads(
             set_thread_name(thread, name);
         }
     }
-
     Ok(ThreadPage { items, next_cursor })
 }
 
@@ -211,10 +254,13 @@ mod tests {
     use super::*;
     use crate::ThreadStore;
     use crate::local::LocalThreadStore;
+    use crate::local::test_support::set_history_base_in_session_file;
     use crate::local::test_support::test_config;
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with;
+    use codex_state::DirectionalThreadSpawnEdgeStatus;
+    use codex_state::ThreadMetadataBuilder;
 
     #[tokio::test]
     async fn list_threads_uses_default_provider_when_rollout_omits_provider() {
@@ -259,7 +305,12 @@ mod tests {
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(103);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path = home.path().join("rollout-title-search.jsonl");
+        let rollout_path = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("2025/01/03/rollout-title-search.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+            .expect("rollout directory");
         fs::write(&rollout_path, "").expect("placeholder rollout file");
 
         let runtime = codex_state::StateRuntime::init(
@@ -323,12 +374,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_hides_external_reference_children_but_keeps_external_legacy_roots() {
+        let home = TempDir::new().expect("home temp dir");
+        let external = TempDir::new().expect("external temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        runtime
+            .mark_backfill_complete(None)
+            .await
+            .expect("backfill should be complete");
+
+        let parent_uuid = Uuid::from_u128(115);
+        let child_uuid = Uuid::from_u128(116);
+        let parent_id = ThreadId::from_string(&parent_uuid.to_string()).expect("parent id");
+        let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+        let parent_path = write_session_file(external.path(), "2025-01-03T13-00-00", parent_uuid)
+            .expect("external root rollout");
+        let child_path = write_session_file_with(
+            external.path(),
+            external.path().join("sessions/2025/01/03"),
+            "2025-01-03T13-01-00",
+            child_uuid,
+            "external reference child",
+            Some("test-provider"),
+            ThreadHistoryMode::Legacy,
+        )
+        .expect("external child rollout");
+        set_history_base_in_session_file(
+            &child_path,
+            &codex_protocol::protocol::HistoryPosition {
+                thread_id: parent_id,
+                end_ordinal_exclusive: 0,
+                end_byte_offset: std::fs::metadata(&parent_path)
+                    .expect("parent metadata")
+                    .len(),
+            },
+        )
+        .expect("set child history base");
+
+        for (thread_id, path, preview) in [
+            (parent_id, parent_path.clone(), "external legacy root"),
+            (child_id, child_path.clone(), "external reference child"),
+        ] {
+            let mut builder =
+                ThreadMetadataBuilder::new(thread_id, path, Utc::now(), SessionSource::Cli);
+            builder.history_mode = ThreadHistoryMode::Legacy;
+            builder.model_provider = Some(config.default_model_provider_id.clone());
+            builder.cwd = home.path().to_path_buf();
+            let mut metadata = builder.build(config.default_model_provider_id.as_str());
+            metadata.preview = Some(preview.to_string());
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("state db upsert should succeed");
+        }
+        runtime
+            .upsert_thread_spawn_edge(parent_id, child_id, DirectionalThreadSpawnEdgeStatus::Open)
+            .await
+            .expect("spawn edge should persist");
+
+        let store = LocalThreadStore::new(config, Some(runtime));
+        let relation_page = store
+            .list_threads(ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                section: None,
+                archived: false,
+                search_term: None,
+                relation_filter: Some(ThreadRelationFilter::DirectChildrenOf(parent_id)),
+                use_state_db_only: true,
+            })
+            .await
+            .expect("relation listing should succeed");
+        assert!(relation_page.items.is_empty());
+
+        let all_page = store
+            .list_threads(ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                section: None,
+                archived: false,
+                search_term: None,
+                relation_filter: None,
+                use_state_db_only: true,
+            })
+            .await
+            .expect("state-db listing should succeed");
+        let ids = all_page
+            .items
+            .iter()
+            .map(|thread| thread.thread_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![parent_id]);
+        assert_eq!(all_page.items[0].preview, "external legacy root");
+    }
+
+    #[tokio::test]
     async fn list_paginated_threads_uses_sqlite_name_over_legacy_compatibility() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(104);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path = home.path().join("rollout-paginated-name-search.jsonl");
+        let rollout_path = home
+            .path()
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join("2025/01/03/rollout-paginated-name-search.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+            .expect("rollout directory");
         fs::write(&rollout_path, "").expect("placeholder rollout file");
 
         let runtime = codex_state::StateRuntime::init(

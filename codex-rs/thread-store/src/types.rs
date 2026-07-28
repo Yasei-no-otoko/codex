@@ -96,8 +96,18 @@ pub struct CreateThreadParams {
     pub multi_agent_version: Option<MultiAgentVersion>,
     /// Persisted thread history contract selected when the thread was created.
     pub history_mode: ThreadHistoryMode,
-    /// Exclusive prefix of another paginated rollout inherited by this thread.
+    /// Exclusive prefix of another rollout inherited by this thread.
+    ///
+    /// Legacy references set `end_ordinal_exclusive` to the documented `0`
+    /// sentinel; their byte offset is authoritative. Paginated references keep
+    /// the ordinal and byte boundary pair.
     pub history_base: Option<HistoryPosition>,
+    /// Summary inherited from a reference-backed legacy parent.
+    ///
+    /// These values are written into the child's canonical SessionMeta at the same
+    /// durability boundary as `history_base`; they are not replayed ancestor items.
+    pub preview: Option<String>,
+    pub first_user_message: Option<String>,
     /// First rollout ordinal that belongs to this subagent's projected history.
     pub subagent_history_start_ordinal: Option<u64>,
     /// Initial context-window identity captured when the thread was created.
@@ -154,6 +164,31 @@ pub struct LoadThreadHistoryParams {
     pub thread_id: ThreadId,
     /// Whether archived threads are eligible.
     pub include_archived: bool,
+}
+
+/// Parameters for writing a bounded, read-only logical history attachment for feedback upload.
+#[derive(Clone, Debug)]
+pub struct WriteReferenceLogicalAttachmentParams {
+    /// Reference-backed child whose logical history should be written.
+    pub thread_id: ThreadId,
+    /// Whether archived source segments may be followed.
+    pub include_archived: bool,
+    /// Caller-owned temporary path to overwrite with newline-delimited JSON.
+    pub output_path: PathBuf,
+    /// Maximum output size in bytes. Complete JSONL lines are retained only.
+    pub max_bytes: usize,
+}
+
+/// Result of attempting to write a logical reference attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteReferenceLogicalAttachmentOutcome {
+    /// The requested rollout is a legacy root or this store does not support references.
+    NotReference,
+    /// The logical attachment was written to the requested output path.
+    Written {
+        /// Whether complete-line head/tail capping omitted any records.
+        truncated: bool,
+    },
 }
 
 /// Persisted rollout history for a thread, without any filesystem path requirement.

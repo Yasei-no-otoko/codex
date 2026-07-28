@@ -1,7 +1,6 @@
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
 use super::helpers::scoped_rollout_path;
-use crate::ArchiveThreadParams;
 use crate::ArchiveThreadsParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -41,14 +40,13 @@ pub(super) async fn archive_threads(
             });
         }
     }
-    let _writer_guards = store
-        .acquire_paginated_writer_locks(&lock_thread_ids)
-        .await?;
+    let _writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
+    let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
 
     let parent_thread_id = thread_ids[0];
     let mut archived_thread_ids = Vec::new();
     for thread_id in thread_ids {
-        match archive_thread(store, ArchiveThreadParams { thread_id }).await {
+        match archive_thread(store, thread_id).await {
             Ok(()) => archived_thread_ids.push(thread_id),
             Err(err) if archived_thread_ids.is_empty() => return Err(err),
             Err(err) => warn!(
@@ -59,11 +57,10 @@ pub(super) async fn archive_threads(
     Ok(archived_thread_ids)
 }
 
-pub(super) async fn archive_thread(
+async fn archive_thread(
     store: &LocalThreadStore,
-    params: ArchiveThreadParams,
+    thread_id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<()> {
-    let thread_id = params.thread_id;
     let state_db_ctx = store.state_db().await;
     let rollout_path = find_thread_path_by_id_str(
         store.config.codex_home.as_path(),
@@ -126,6 +123,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::ArchiveThreadParams;
     use crate::ListThreadsParams;
     use crate::ThreadSortKey;
     use crate::ThreadStore;

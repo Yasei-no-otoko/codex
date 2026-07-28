@@ -75,13 +75,15 @@ impl ThreadMetadataSync {
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             git_info: git_info.map(git_info_patch_from_observation),
             memory_mode: Some(params.metadata.memory_mode),
+            preview: params.preview.clone(),
+            first_user_message: params.first_user_message.clone(),
             ..Default::default()
         };
         Self {
             thread_id: params.thread_id,
             cwd_seen: !cwd.as_os_str().is_empty(),
-            preview_seen: false,
-            first_user_message_seen: false,
+            preview_seen: params.preview.is_some(),
+            first_user_message_seen: params.first_user_message.is_some(),
             title_seen: false,
             pending_update: Some(update),
             pending_update_generation: 1,
@@ -153,6 +155,23 @@ impl ThreadMetadataSync {
         }
         if update.patch.updated_at.is_some() {
             self.last_touch_persisted_at = Some(Instant::now());
+        }
+    }
+
+    /// Mark fields supplied by an explicit metadata patch as authoritative.
+    ///
+    /// Reference-backed forks inherit metadata without replaying the ancestor's user item into
+    /// the child JSONL. Without these markers, the first child user message would look like the
+    /// first observed message and overwrite the inherited preview/title values.
+    pub(crate) fn mark_explicit_metadata_patch(&mut self, patch: &ThreadMetadataPatch) {
+        if patch.preview.is_some() {
+            self.preview_seen = true;
+        }
+        if patch.first_user_message.is_some() {
+            self.first_user_message_seen = true;
+        }
+        if patch.title.is_some() {
+            self.title_seen = true;
         }
     }
 
@@ -251,6 +270,14 @@ impl ThreadMetadataSync {
                         && let Some(memory_mode) = parse_memory_mode(memory_mode)
                     {
                         update.memory_mode = Some(memory_mode);
+                    }
+                    if let Some(preview) = meta_line.meta.preview.as_ref() {
+                        self.preview_seen = true;
+                        update.preview = Some(preview.clone());
+                    }
+                    if let Some(first_user_message) = meta_line.meta.first_user_message.as_ref() {
+                        self.first_user_message_seen = true;
+                        update.first_user_message = Some(first_user_message.clone());
                     }
                 }
                 RolloutItem::TurnContext(turn_ctx) => {

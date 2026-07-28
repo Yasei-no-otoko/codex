@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -8,8 +9,11 @@ use codex_protocol::protocol::ThreadHistoryMode;
 
 use super::LocalThreadStore;
 use super::read_thread;
+use super::writer_lock::WriterLockGuard;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 
 /// One physical rollout range contributing to a logical paginated history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +31,7 @@ pub(super) struct RolloutLineageSegment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RolloutLineage {
     pub(super) segments: Vec<RolloutLineageSegment>,
+    pub(super) history_mode: ThreadHistoryMode,
 }
 
 impl LocalThreadStore {
@@ -41,13 +46,69 @@ impl LocalThreadStore {
         .await
     }
 
-    pub(super) async fn resolve_rollout_lineage_for_reference(
+    /// Resolve a reference lineage while holding every cross-process writer lock until the
+    /// caller finishes consuming the physical segments. Compression and delete/archive use the
+    /// same locks, so a compressed ancestor cannot disappear after it is materialized but before
+    /// a reverse/history scan opens it.
+    pub(super) async fn resolve_rollout_lineage_for_reference_locked(
         &self,
         requested_thread_id: ThreadId,
-    ) -> ThreadStoreResult<RolloutLineage> {
-        self.resolve_rollout_lineage_with_representation(
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_locks(
             requested_thread_id,
             LineageRepresentation::PlainForReference,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Variant for callers that already hold the immediate source's filesystem lock. The guard
+    /// is cloned only for the resolver; the original remains owned by the caller and can be kept
+    /// through child durability (legacy latest forks do this).
+    pub(super) async fn resolve_rollout_lineage_for_reference_locked_with_source_guard(
+        &self,
+        requested_thread_id: ThreadId,
+        source_guard: WriterLockGuard,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_locks(
+            requested_thread_id,
+            LineageRepresentation::PlainForReference,
+            Some((requested_thread_id, source_guard)),
+            false,
+        )
+        .await
+    }
+
+    /// Resolve a reference lineage while the caller owns the immediate source's local writer
+    /// mutex. The source filesystem guard is explicitly cloned for the resolver; the caller keeps
+    /// both tokens through recorder initialization. Ancestors still acquire their own local and
+    /// filesystem guards normally.
+    pub(super) async fn resolve_rollout_lineage_for_reference_locked_with_source_tokens(
+        &self,
+        requested_thread_id: ThreadId,
+        source_guard: WriterLockGuard,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_locks(
+            requested_thread_id,
+            LineageRepresentation::PlainForReference,
+            Some((requested_thread_id, source_guard)),
+            true,
+        )
+        .await
+    }
+
+    /// Resolve a reference lineage for a read-only feedback attachment. This acquires the same
+    /// local/filesystem guards as fork preparation but never materializes a compressed rollout.
+    pub(super) async fn resolve_rollout_lineage_for_reference_attachment(
+        &self,
+        requested_thread_id: ThreadId,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_locks(
+            requested_thread_id,
+            LineageRepresentation::ReadOnlyForAttachment,
+            None,
+            false,
         )
         .await
     }
@@ -57,19 +118,73 @@ impl LocalThreadStore {
         requested_thread_id: ThreadId,
         representation: LineageRepresentation,
     ) -> ThreadStoreResult<RolloutLineage> {
+        let (lineage, _writer_guards) = self
+            .resolve_rollout_lineage_with_representation_and_locks(
+                requested_thread_id,
+                representation,
+                None,
+                false,
+            )
+            .await?;
+        Ok(lineage)
+    }
+
+    async fn resolve_rollout_lineage_with_representation_and_locks(
+        &self,
+        requested_thread_id: ThreadId,
+        representation: LineageRepresentation,
+        prelocked_source: Option<(ThreadId, WriterLockGuard)>,
+        prelocked_source_local: bool,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
         let mut segments = Vec::new();
         let mut seen = HashSet::new();
         let mut thread_id = requested_thread_id;
         let mut end = None;
+        let mut history_mode = None;
+        let mut writer_guards = Vec::new();
 
         loop {
             if !seen.insert(thread_id) {
                 return Err(malformed_lineage(requested_thread_id, "cycle detected"));
             }
+            let source_local_is_prelocked =
+                prelocked_source_local && thread_id == requested_thread_id;
+            let _local_writer_guard = match representation {
+                LineageRepresentation::Existing => None,
+                // The process-local lock serializes this store's live recorder while its path and
+                // metadata are resolved. The filesystem guard below closes the cross-process
+                // compression/delete/archive window.
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment
+                    if source_local_is_prelocked =>
+                {
+                    None
+                }
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => {
+                    Some(self.live_writer_locks.lock(thread_id).await)
+                }
+            };
             let _writer_guard = match representation {
                 LineageRepresentation::Existing => None,
-                LineageRepresentation::PlainForReference => {
-                    Some(self.live_writer_locks.lock(thread_id).await)
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => {
+                    let prelocked = prelocked_source
+                        .as_ref()
+                        .filter(|(prelocked_thread_id, _)| *prelocked_thread_id == thread_id)
+                        .map(|(_, guard)| guard.clone());
+                    if let Some(prelocked) = prelocked {
+                        Some(prelocked)
+                    } else if let Some(existing) = self.existing_writer_lock(thread_id).await {
+                        // Live recorders explicitly share their guard with readers. Maintenance
+                        // still acquires a fresh lock and conflicts while this scan owns the path.
+                        writer_guards.push(existing.clone());
+                        Some(existing)
+                    } else {
+                        let guard = self.writer_lock_coordinator.acquire(thread_id)?;
+                        writer_guards.push(guard.clone());
+                        Some(guard)
+                    }
                 }
             };
             let rollout_path =
@@ -93,6 +208,16 @@ impl LocalThreadStore {
                             ),
                         })?
                 }
+                LineageRepresentation::ReadOnlyForAttachment => {
+                    super::helpers::scoped_rollout_path(
+                        self.config.codex_home.clone(),
+                        codex_rollout::existing_rollout_path(rollout_path.as_path())
+                            .await
+                            .unwrap_or(rollout_path)
+                            .as_path(),
+                        "Codex home",
+                    )?
+                }
             };
             let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
                 .await
@@ -108,20 +233,34 @@ impl LocalThreadStore {
                     "source rollout belongs to another thread",
                 ));
             }
-            if meta.meta.history_mode != ThreadHistoryMode::Paginated {
-                return Err(malformed_lineage(
-                    requested_thread_id,
-                    "source rollout is not paginated",
-                ));
+            if let Some(expected_mode) = history_mode {
+                if meta.meta.history_mode != expected_mode {
+                    return Err(malformed_lineage(
+                        requested_thread_id,
+                        "source rollout mixes legacy and paginated history",
+                    ));
+                }
+            } else {
+                history_mode = Some(meta.meta.history_mode);
             }
             if let Some(end) = end {
-                validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
+                validate_cutoff_bounds(
+                    requested_thread_id,
+                    rollout_path.as_path(),
+                    &end,
+                    meta.meta.history_mode,
+                    matches!(representation, LineageRepresentation::ReadOnlyForAttachment),
+                )
+                .await?;
             }
-            let start_ordinal = match meta.meta.history_base {
-                Some(base) => base.end_ordinal_exclusive.checked_add(1).ok_or_else(|| {
-                    malformed_lineage(requested_thread_id, "source ordinal overflow")
-                })?,
-                None => 1,
+            let start_ordinal = match meta.meta.history_mode {
+                ThreadHistoryMode::Legacy => 0,
+                ThreadHistoryMode::Paginated => match meta.meta.history_base {
+                    Some(base) => base.end_ordinal_exclusive.checked_add(1).ok_or_else(|| {
+                        malformed_lineage(requested_thread_id, "source ordinal overflow")
+                    })?,
+                    None => 1,
+                },
             };
             segments.push(RolloutLineageSegment {
                 thread_id,
@@ -138,7 +277,13 @@ impl LocalThreadStore {
         }
 
         segments.reverse();
-        Ok(RolloutLineage { segments })
+        Ok((
+            RolloutLineage {
+                segments,
+                history_mode: history_mode.unwrap_or(ThreadHistoryMode::Legacy),
+            },
+            writer_guards,
+        ))
     }
 }
 
@@ -146,11 +291,16 @@ impl LocalThreadStore {
 enum LineageRepresentation {
     Existing,
     PlainForReference,
+    ReadOnlyForAttachment,
 }
 
 impl RolloutLineage {
     pub(super) fn segments(&self) -> &[RolloutLineageSegment] {
         self.segments.as_slice()
+    }
+
+    pub(super) fn history_mode(&self) -> ThreadHistoryMode {
+        self.history_mode
     }
 
     pub(super) fn segment_index_for_ordinal(&self, ordinal: u64) -> Option<usize> {
@@ -180,7 +330,14 @@ impl RolloutLineage {
             .ok_or_else(|| ThreadStoreError::Internal {
                 message: "rollout lineage has no segments".to_string(),
             })?;
-        validate_cutoff_bounds(end.thread_id, segment.rollout_path.as_path(), &end).await?;
+        validate_cutoff_bounds(
+            end.thread_id,
+            segment.rollout_path.as_path(),
+            &end,
+            self.history_mode,
+            false,
+        )
+        .await?;
         segment.end = Some(end);
         Ok(self)
     }
@@ -204,26 +361,244 @@ async fn validate_cutoff_bounds(
     requested_thread_id: ThreadId,
     rollout_path: &Path,
     end: &HistoryPosition,
+    history_mode: ThreadHistoryMode,
+    read_only_attachment: bool,
 ) -> ThreadStoreResult<()> {
-    if end.end_ordinal_exclusive == 0 {
+    if matches!(history_mode, ThreadHistoryMode::Paginated) && end.end_ordinal_exclusive == 0 {
         return Err(malformed_lineage(
             requested_thread_id,
             "cutoff cannot include source session metadata",
         ));
     }
-    let file_len = tokio::fs::metadata(rollout_path)
+    if matches!(history_mode, ThreadHistoryMode::Legacy) && end.end_ordinal_exclusive != 0 {
+        return Err(malformed_lineage(
+            requested_thread_id,
+            "legacy cutoff must use the zero ordinal sentinel",
+        ));
+    }
+    let compressed = rollout_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"));
+    // Compressed bytes cannot be passed to the legacy reverse scanner. The raw reader exposes
+    // uncompressed, newline-inclusive offsets and validates the stable envelope at the same
+    // boundary, so compressed Legacy and read-only attachment paths share one validator.
+    if read_only_attachment || (compressed && matches!(history_mode, ThreadHistoryMode::Legacy)) {
+        return validate_raw_rollout_cutoff(
+            requested_thread_id,
+            rollout_path,
+            end.end_byte_offset,
+            history_mode,
+        )
+        .await;
+    }
+    if compressed {
+        validate_uncompressed_newline_boundary(
+            requested_thread_id,
+            rollout_path,
+            end.end_byte_offset,
+        )
+        .await?;
+        if matches!(history_mode, ThreadHistoryMode::Paginated) {
+            return Ok(());
+        }
+    } else {
+        let file_len = tokio::fs::metadata(rollout_path)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to read lineage metadata {}: {err}",
+                    rollout_path.display()
+                ),
+            })?
+            .len();
+        if end.end_byte_offset > file_len {
+            return Err(malformed_lineage(
+                requested_thread_id,
+                "cutoff byte offset is past the source rollout",
+            ));
+        }
+    }
+    match history_mode {
+        ThreadHistoryMode::Legacy => {
+            let last_complete_offset =
+                super::legacy_fork::last_complete_rollout_envelope_offset_at_or_before(
+                    rollout_path,
+                    end.end_byte_offset,
+                )
+                .await?;
+            if last_complete_offset != end.end_byte_offset {
+                return Err(malformed_lineage(
+                    requested_thread_id,
+                    "cutoff byte offset is not at a complete rollout envelope",
+                ));
+            }
+        }
+        ThreadHistoryMode::Paginated => {
+            validate_newline_boundary(requested_thread_id, rollout_path, end.end_byte_offset)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn validate_uncompressed_newline_boundary(
+    requested_thread_id: ThreadId,
+    rollout_path: &Path,
+    end_byte_offset: u64,
+) -> ThreadStoreResult<()> {
+    let mut reader = codex_rollout::open_rollout_raw_line_reader(rollout_path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!(
-                "failed to read lineage metadata {}: {err}",
+                "failed to read compressed lineage {}: {err}",
                 rollout_path.display()
             ),
-        })?
-        .len();
-    if end.end_byte_offset > file_len {
+        })?;
+    let mut offset = 0u64;
+    while let Some(line) =
+        reader
+            .next_raw_line()
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to scan compressed lineage {}: {err}",
+                    rollout_path.display()
+                ),
+            })?
+    {
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        offset = offset.saturating_add(line.len() as u64);
+        if offset == end_byte_offset {
+            return Ok(());
+        }
+        if offset > end_byte_offset {
+            break;
+        }
+    }
+    Err(malformed_lineage(
+        requested_thread_id,
+        "cutoff byte offset is not at a complete JSONL record",
+    ))
+}
+
+async fn validate_raw_rollout_cutoff(
+    requested_thread_id: ThreadId,
+    rollout_path: &Path,
+    end_byte_offset: u64,
+    history_mode: ThreadHistoryMode,
+) -> ThreadStoreResult<()> {
+    let mut reader = codex_rollout::open_rollout_raw_line_reader(rollout_path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to read reference lineage {}: {err}",
+                rollout_path.display()
+            ),
+        })?;
+    let mut offset = 0u64;
+    let mut last_complete_envelope = 0u64;
+    while let Some(line) =
+        reader
+            .next_raw_line()
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to scan reference lineage {}: {err}",
+                    rollout_path.display()
+                ),
+            })?
+    {
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let next_offset = offset.saturating_add(line.len() as u64);
+        if next_offset > end_byte_offset {
+            break;
+        }
+        offset = next_offset;
+        if matches!(history_mode, ThreadHistoryMode::Paginated) {
+            last_complete_envelope = offset;
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let envelope = object
+            .get("timestamp")
+            .is_some_and(serde_json::Value::is_string)
+            && object.get("type").is_some_and(serde_json::Value::is_string)
+            && object
+                .get("payload")
+                .is_some_and(serde_json::Value::is_object);
+        if envelope {
+            last_complete_envelope = offset;
+        }
+    }
+    let boundary = if matches!(history_mode, ThreadHistoryMode::Paginated) {
+        offset
+    } else {
+        last_complete_envelope
+    };
+    if boundary != end_byte_offset {
         return Err(malformed_lineage(
             requested_thread_id,
-            "cutoff byte offset is past the source rollout",
+            if matches!(history_mode, ThreadHistoryMode::Legacy) {
+                "cutoff byte offset is not at a complete rollout envelope"
+            } else {
+                "cutoff byte offset is not at a complete JSONL record"
+            },
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_newline_boundary(
+    requested_thread_id: ThreadId,
+    rollout_path: &Path,
+    end_byte_offset: u64,
+) -> ThreadStoreResult<()> {
+    if end_byte_offset == 0 {
+        return Err(malformed_lineage(
+            requested_thread_id,
+            "paginated cutoff must end after a JSONL newline",
+        ));
+    }
+    let mut file =
+        tokio::fs::File::open(rollout_path)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to open lineage rollout {}: {err}",
+                    rollout_path.display()
+                ),
+            })?;
+    file.seek(SeekFrom::Start(end_byte_offset - 1))
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to seek lineage rollout {}: {err}",
+                rollout_path.display()
+            ),
+        })?;
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to read lineage cutoff {}: {err}",
+                rollout_path.display()
+            ),
+        })?;
+    if byte[0] != b'\n' {
+        return Err(malformed_lineage(
+            requested_thread_id,
+            "paginated cutoff must end after a JSONL newline",
         ));
     }
     Ok(())
@@ -231,7 +606,7 @@ async fn validate_cutoff_bounds(
 
 fn malformed_lineage(thread_id: ThreadId, detail: &str) -> ThreadStoreError {
     ThreadStoreError::InvalidRequest {
-        message: format!("invalid paginated history lineage for {thread_id}: {detail}"),
+        message: format!("invalid rollout history lineage for {thread_id}: {detail}"),
     }
 }
 

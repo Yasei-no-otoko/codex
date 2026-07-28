@@ -399,7 +399,6 @@ pub async fn list_threads_db(
         SortDirection::Asc => codex_state::SortDirection::Asc,
         SortDirection::Desc => codex_state::SortDirection::Desc,
     };
-
     if let Some(relation_filter) = relation_filter {
         let filters = codex_state::ThreadFilterOptions {
             archived_only: archived,
@@ -412,16 +411,63 @@ pub async fn list_threads_db(
             sort_direction: state_sort_direction,
             search_term,
         };
-        return match ctx
+        let mut page = match ctx
             .list_threads_by_relation(page_size, relation_filter, filters)
             .await
         {
-            Ok(page) => Some(page),
+            Ok(page) => page,
             Err(err) => {
                 warn!("state db list_threads failed: {err}");
-                None
+                return None;
             }
         };
+        let mut valid_items = Vec::with_capacity(page.items.len());
+        for item in page.items {
+            if let Some(existing_path) =
+                crate::compression::existing_rollout_path(item.rollout_path.as_path()).await
+            {
+                let visible = match crate::list::state_db_rollout_path_is_visible(
+                    sqlite.home(),
+                    item.id,
+                    item.rollout_path.as_path(),
+                )
+                .await
+                {
+                    Ok(visible) => visible,
+                    Err(err) => {
+                        warn!(
+                            "state db path visibility check failed for thread {}: {}",
+                            item.id, err
+                        );
+                        false
+                    }
+                };
+                if visible {
+                    let mut item = item;
+                    item.rollout_path = existing_path;
+                    valid_items.push(item);
+                } else {
+                    warn!(
+                        "state db list_threads dropped hidden thread {}: {}",
+                        item.id,
+                        item.rollout_path.display()
+                    );
+                }
+            } else {
+                warn!(
+                    "state db list_threads returned stale rollout path for thread {}: {}",
+                    item.id,
+                    item.rollout_path.display()
+                );
+                // A rollout can be temporarily absent while archive, unarchive, or
+                // compression is moving it. Keep the SQLite row so the metadata is
+                // available once the rename completes; this list call already hides
+                // the stale item from its result.
+                warn!("state db discrepancy during list_threads_db: stale_db_path_hidden");
+            }
+        }
+        page.items = valid_items;
+        return Some(page);
     }
 
     let mut items = Vec::with_capacity(page_size);
@@ -453,16 +499,42 @@ pub async fn list_threads_db(
             if let Some(existing_path) =
                 crate::compression::existing_rollout_path(item.rollout_path.as_path()).await
             {
-                let mut item = item;
-                item.rollout_path = existing_path;
-                items.push(item);
+                let visible = match crate::list::state_db_rollout_path_is_visible(
+                    sqlite.home(),
+                    item.id,
+                    item.rollout_path.as_path(),
+                )
+                .await
+                {
+                    Ok(visible) => visible,
+                    Err(err) => {
+                        warn!(
+                            "state db path visibility check failed for thread {}: {}",
+                            item.id, err
+                        );
+                        false
+                    }
+                };
+                if visible {
+                    let mut item = item;
+                    item.rollout_path = existing_path;
+                    items.push(item);
+                } else {
+                    warn!(
+                        "state db list_threads dropped hidden thread {}: {}",
+                        item.id,
+                        item.rollout_path.display()
+                    );
+                }
             } else {
                 warn!(
                     "state db list_threads returned stale rollout path for thread {}: {}",
                     item.id,
                     item.rollout_path.display()
                 );
-                warn!("state db discrepancy during list_threads_db: stale_db_path_retained");
+                // Do not delete rows here: path moves can create a short-lived
+                // missing-path window, and the next list can recover the item.
+                warn!("state db discrepancy during list_threads_db: stale_db_path_hidden");
             }
         }
 

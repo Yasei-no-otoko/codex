@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_utils_absolute_path::test_support::PathExt;
@@ -128,4 +129,44 @@ pub(super) fn write_session_file_with_fork(
         writeln!(file, "{user_event}")?;
     }
     Ok(path)
+}
+
+pub(super) fn set_history_base_in_session_file(
+    path: &Path,
+    history_base: &HistoryPosition,
+) -> std::io::Result<()> {
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines();
+    let first_line = lines
+        .next()
+        .ok_or_else(|| std::io::Error::other("session file is missing metadata"))?;
+    let mut metadata: serde_json::Value = serde_json::from_str(first_line)
+        .map_err(|err| std::io::Error::other(format!("invalid session metadata: {err}")))?;
+    metadata["payload"]["history_base"] = serde_json::to_value(history_base)
+        .map_err(|err| std::io::Error::other(format!("invalid history base: {err}")))?;
+    let mut updated = serde_json::to_string(&metadata)
+        .map_err(|err| std::io::Error::other(format!("serialize session metadata: {err}")))?;
+    for line in lines {
+        updated.push('\n');
+        updated.push_str(line);
+    }
+    updated.push('\n');
+    fs::write(path, updated)
+}
+
+pub(super) fn compress_session_file(path: &Path) -> std::io::Result<PathBuf> {
+    let compressed_path = path.with_file_name(format!(
+        "{}.zst",
+        path.file_name()
+            .ok_or_else(|| std::io::Error::other("session file has no filename"))?
+            .to_string_lossy()
+    ));
+    let contents = fs::read(path)?;
+    fs::write(
+        &compressed_path,
+        zstd::stream::encode_all(contents.as_slice(), 3)
+            .map_err(|err| std::io::Error::other(format!("compress session file: {err}")))?,
+    )?;
+    fs::remove_file(path)?;
+    Ok(compressed_path)
 }

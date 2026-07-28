@@ -81,6 +81,8 @@ use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
+use codex_thread_store::WriteReferenceLogicalAttachmentOutcome;
+use codex_thread_store::WriteReferenceLogicalAttachmentParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -120,6 +122,13 @@ static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
 
 type CapturedOps = Vec<(ThreadId, Op)>;
 type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
+
+/// Metadata inherited by a reference-backed fork's canonical `SessionMeta`.
+#[derive(Clone, Debug, Default)]
+pub struct ForkInheritedMetadata {
+    pub preview: Option<String>,
+    pub first_user_message: Option<String>,
+}
 
 pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
     FORCE_TEST_THREAD_MANAGER_BEHAVIOR.store(enabled, Ordering::Relaxed);
@@ -692,6 +701,25 @@ impl ThreadManager {
         self.state.get_thread(thread_id).await
     }
 
+    /// Writes a bounded, read-only logical history attachment for feedback upload.
+    pub async fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> CodexResult<WriteReferenceLogicalAttachmentOutcome> {
+        self.state.write_reference_logical_attachment(params).await
+    }
+
+    /// Load the complete logical replay history for a persisted thread.
+    pub async fn read_stored_thread_history(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> CodexResult<Vec<RolloutItem>> {
+        self.state
+            .read_stored_thread_history(thread_id, include_archived)
+            .await
+    }
+
     /// Updates metadata for loaded and cold threads through one entrypoint.
     ///
     /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered
@@ -1133,6 +1161,7 @@ impl ThreadManager {
         &self,
         config: Config,
         prepared: PreparedFork,
+        inherited_metadata: ForkInheritedMetadata,
         thread_source: Option<ThreadSource>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
@@ -1145,6 +1174,8 @@ impl ThreadManager {
         let fork_persistence = ForkPersistence::Referenced {
             history_base: prepared.history_base,
             inherited_item_count: prepared.model_context.len(),
+            inherited_preview: inherited_metadata.preview,
+            inherited_first_user_message: inherited_metadata.first_user_message,
         };
         let result = self
             .fork_thread_with_initial_history(
@@ -1286,6 +1317,8 @@ impl ThreadManagerState {
         }
     }
 
+    /// Read a persisted thread through the configured store, including any logical inherited
+    /// history represented by a reference-backed rollout.
     pub(crate) async fn read_stored_thread(
         &self,
         params: ReadThreadParams,
@@ -1308,6 +1341,147 @@ impl ThreadManagerState {
                     }
                 }
                 err => CodexErr::Fatal(format!("failed to read stored thread {thread_id}: {err}")),
+            })
+    }
+
+    /// Load the complete logical replay history for a persisted thread.
+    pub(crate) async fn read_stored_thread_history(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> CodexResult<Vec<RolloutItem>> {
+        // `read_thread(include_history = true)` intentionally rejects Paginated history. Ask the
+        // store's model-context loader only for that representation: LocalThreadStore resolves
+        // the complete frozen lineage (including a reference child's inherited prefix) instead
+        // of reading the child's physical suffix in isolation. Legacy stores retain their
+        // complete-history path below.
+        match self
+            .thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived,
+                include_history: true,
+            })
+            .await
+        {
+            Ok(stored_thread) => stored_thread
+                .history
+                .map(|history| history.items)
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "stored thread {thread_id} did not include persisted history"
+                    ))
+                }),
+            Err(ThreadStoreError::Unsupported {
+                operation: "paginated_threads",
+            }) => self
+                .thread_store
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived,
+                })
+                .await
+                .map(|context| Self::expand_paginated_model_context(context.items))
+                .map_err(|err| match err {
+                    ThreadStoreError::ThreadNotFound { thread_id } => {
+                        CodexErr::ThreadNotFound(thread_id)
+                    }
+                    ThreadStoreError::InvalidRequest { message } => {
+                        CodexErr::InvalidRequest(message)
+                    }
+                    err => CodexErr::Fatal(format!(
+                        "failed to load paginated model context for {thread_id}: {err}"
+                    )),
+                }),
+            Err(ThreadStoreError::ThreadNotFound { thread_id }) => {
+                Err(CodexErr::ThreadNotFound(thread_id))
+            }
+            Err(ThreadStoreError::InvalidRequest { message }) => Err(CodexErr::Fatal(format!(
+                "failed to read stored thread {thread_id}: invalid thread-store request: {message}"
+            ))),
+            Err(err) => Err(CodexErr::Fatal(format!(
+                "failed to read stored thread {thread_id}: {err}"
+            ))),
+        }
+    }
+
+    /// Replace the latest Paginated compaction checkpoint with its model-visible replacement
+    /// history before memory sampling serializes the replay. Legacy history is read through the
+    /// complete-history path above and must keep its checkpoint representation to avoid
+    /// duplication.
+    fn expand_paginated_model_context(items: Vec<RolloutItem>) -> Vec<RolloutItem> {
+        let latest_compacted_index = items
+            .iter()
+            .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
+        let mut expanded = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            if Some(index) != latest_compacted_index {
+                expanded.push(item);
+                continue;
+            }
+            match item {
+                RolloutItem::Compacted(mut compacted) => {
+                    if let Some(replacement_history) = compacted.replacement_history.take() {
+                        expanded.extend(
+                            replacement_history
+                                .into_iter()
+                                .map(RolloutItem::ResponseItem),
+                        );
+                    } else {
+                        expanded.push(RolloutItem::Compacted(compacted));
+                    }
+                }
+                item => expanded.push(item),
+            }
+        }
+        expanded
+    }
+
+    /// Prefer a loaded conversation's pre-held history path. Cold reads use the thread-store's
+    /// read-only reference attachment implementation and never fall back to a physical suffix.
+    pub(crate) async fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> CodexResult<WriteReferenceLogicalAttachmentOutcome> {
+        let thread_id = params.thread_id;
+        if let Ok(conversation) = self.get_thread(thread_id).await {
+            let history = conversation
+                .load_history(params.include_archived)
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to load logical feedback history for {thread_id}: {err}"
+                    ))
+                })?;
+            let output_path = params.output_path.clone();
+            let max_bytes = params.max_bytes;
+            return tokio::task::spawn_blocking(move || {
+                codex_thread_store::write_reference_logical_attachment_from_items(
+                    output_path,
+                    history.items,
+                    max_bytes,
+                )
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to write logical feedback history for {thread_id}: {err}"
+                    ))
+                })
+            })
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "logical feedback history writer task failed for {thread_id}: {err}"
+                ))
+            })?;
+        }
+
+        self.thread_store
+            .write_reference_logical_attachment(params)
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "failed to write logical feedback history for {thread_id}: {err}"
+                ))
             })
     }
 

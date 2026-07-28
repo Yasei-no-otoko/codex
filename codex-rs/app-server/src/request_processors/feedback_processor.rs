@@ -4,10 +4,49 @@ use codex_connectors::ConnectorDirectoryCacheKey;
 use codex_connectors::connector_runtime_cache_path;
 use codex_feedback::CODEX_APP_DIRECTORY_CACHE_ATTACHMENT_FILENAME;
 use codex_feedback::CODEX_APPS_TOOLS_CACHE_ATTACHMENT_FILENAME;
+use codex_feedback::FeedbackAttachment;
 #[cfg(target_os = "windows")]
 use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
+use tempfile::NamedTempFile;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
+// Keep generated logical history in line with the feedback log ring's 4 MiB default.
+const MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
+
+enum LogicalRolloutFeedbackAttachment {
+    /// The rollout is not reference-backed, so its physical JSONL remains the attachment.
+    Physical,
+    /// A read-only logical replay was generated for a reference-backed rollout.
+    Generated {
+        temp_file: NamedTempFile,
+        truncated: bool,
+    },
+    /// The rollout is reference-backed but cannot be read safely without mutating storage.
+    Skip,
+}
+
+async fn resolve_rollout_path_from_state_db(
+    codex_home: &std::path::Path,
+    conversation_id: ThreadId,
+    state_db_ctx: &StateDbHandle,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let active = codex_rollout::find_thread_path_by_id_str(
+        codex_home,
+        &conversation_id.to_string(),
+        Some(state_db_ctx.as_ref()),
+    )
+    .await?;
+    if active.is_some() {
+        return Ok(active);
+    }
+
+    codex_rollout::find_archived_thread_path_by_id_str(
+        codex_home,
+        &conversation_id.to_string(),
+        Some(state_db_ctx.as_ref()),
+    )
+    .await
+}
 
 #[derive(Clone)]
 pub(crate) struct FeedbackRequestProcessor {
@@ -165,6 +204,8 @@ impl FeedbackRequestProcessor {
             (Vec::new(), None, None)
         };
 
+        let mut logical_attachment_temps = Vec::new();
+        let mut extra_attachments: Vec<FeedbackAttachment> = Vec::new();
         let mut attachment_paths = Vec::new();
         let mut seen_attachment_paths = HashSet::new();
         if include_logs {
@@ -176,10 +217,38 @@ impl FeedbackRequestProcessor {
                     continue;
                 };
                 if seen_attachment_paths.insert(rollout_path.clone()) {
-                    attachment_paths.push(FeedbackAttachmentPath {
-                        path: rollout_path,
-                        attachment_filename_override: None,
-                    });
+                    match self
+                        .logical_rollout_feedback_attachment(*feedback_thread_id, &rollout_path)
+                        .await
+                    {
+                        LogicalRolloutFeedbackAttachment::Generated {
+                            temp_file,
+                            truncated,
+                        } => {
+                            let path = temp_file.path().to_path_buf();
+                            let filename = if truncated {
+                                upload_tags.insert(
+                                    "feedback_rollout_truncated".to_string(),
+                                    "true".to_string(),
+                                );
+                                format!("rollout-history-{feedback_thread_id}-head-tail.jsonl")
+                            } else {
+                                format!("rollout-history-{feedback_thread_id}.jsonl")
+                            };
+                            logical_attachment_temps.push(temp_file);
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path,
+                                attachment_filename_override: Some(filename),
+                            });
+                        }
+                        LogicalRolloutFeedbackAttachment::Physical => {
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path: rollout_path,
+                                attachment_filename_override: None,
+                            });
+                        }
+                        LogicalRolloutFeedbackAttachment::Skip => {}
+                    }
                 }
             }
             if let Some(conversation_id) = conversation_id
@@ -222,7 +291,6 @@ impl FeedbackRequestProcessor {
             }
         }
 
-        let mut extra_attachments = Vec::new();
         if include_logs
             && let Some(doctor_report) =
                 super::feedback_doctor_report::doctor_feedback_report(&self.config).await
@@ -236,6 +304,9 @@ impl FeedbackRequestProcessor {
         let session_source = self.thread_manager.session_source();
 
         let upload_result = tokio::task::spawn_blocking(move || {
+            // Keep generated reference attachments alive until the synchronous upload has read
+            // every path-backed file. NamedTempFile removes them when this closure returns.
+            let _logical_attachment_temps = logical_attachment_temps;
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
             snapshot.upload_feedback(FeedbackUploadOptions {
                 classification: &classification,
@@ -263,6 +334,78 @@ impl FeedbackRequestProcessor {
         Ok(FeedbackUploadResponse { thread_id })
     }
 
+    /// Reference-backed rollouts only contain their local delta on disk. Replace that physical
+    /// attachment with a generated JSONL replay when possible so feedback includes the bounded
+    /// inherited history as well as the child's delta.
+    async fn logical_rollout_feedback_attachment(
+        &self,
+        thread_id: ThreadId,
+        rollout_path: &std::path::Path,
+    ) -> LogicalRolloutFeedbackAttachment {
+        let session_meta = match codex_rollout::read_session_meta_line(rollout_path).await {
+            Ok(session_meta) => session_meta,
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    path = %rollout_path.display(),
+                    "failed to inspect rollout before feedback upload: {err}"
+                );
+                return LogicalRolloutFeedbackAttachment::Skip;
+            }
+        };
+        if session_meta.meta.id != thread_id {
+            warn!(
+                requested_thread_id = %thread_id,
+                rollout_thread_id = %session_meta.meta.id,
+                path = %rollout_path.display(),
+                "skipping mismatched rollout during feedback upload"
+            );
+            return LogicalRolloutFeedbackAttachment::Skip;
+        }
+        if session_meta.meta.history_base.is_none() {
+            return LogicalRolloutFeedbackAttachment::Physical;
+        }
+
+        let temp_file = match NamedTempFile::new() {
+            Ok(temp_file) => temp_file,
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    "failed to create temporary logical rollout attachment: {err}"
+                );
+                return LogicalRolloutFeedbackAttachment::Skip;
+            }
+        };
+        let params = WriteReferenceLogicalAttachmentParams {
+            thread_id,
+            include_archived: true,
+            output_path: temp_file.path().to_path_buf(),
+            max_bytes: MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES,
+        };
+        match self
+            .thread_manager
+            .write_reference_logical_attachment(params)
+            .await
+        {
+            Ok(WriteReferenceLogicalAttachmentOutcome::Written { truncated }) => {
+                LogicalRolloutFeedbackAttachment::Generated {
+                    temp_file,
+                    truncated,
+                }
+            }
+            Ok(WriteReferenceLogicalAttachmentOutcome::NotReference) => {
+                LogicalRolloutFeedbackAttachment::Physical
+            }
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    "skipping reference-backed rollout in feedback upload: {err}"
+                );
+                LogicalRolloutFeedbackAttachment::Skip
+            }
+        }
+    }
+
     async fn resolve_rollout_path(
         &self,
         conversation_id: ThreadId,
@@ -275,13 +418,16 @@ impl FeedbackRequestProcessor {
         }
 
         let state_db_ctx = state_db_ctx?;
-        state_db_ctx
-            .find_rollout_path_by_id(conversation_id, /*archived_only*/ None)
-            .await
-            .unwrap_or_else(|err| {
-                warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
-                None
-            })
+        resolve_rollout_path_from_state_db(
+            self.config.codex_home.as_path(),
+            conversation_id,
+            state_db_ctx,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
+            None
+        })
     }
 }
 
@@ -349,7 +495,168 @@ fn windows_sandbox_log_attachment(_codex_home: &Path) -> Option<FeedbackAttachme
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::protocol::HistoryPosition;
+    use codex_protocol::protocol::SessionSource;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    async fn write_external_rollout(
+        root: &std::path::Path,
+        id: ThreadId,
+        history_base: Option<ThreadId>,
+    ) -> std::io::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(root)?;
+        let path = root.join(format!("rollout-{id}.jsonl"));
+        let mut metadata = serde_json::json!({
+            "timestamp": "2025-01-05T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "session_id": id,
+                "id": id,
+                "timestamp": "2025-01-05T10:00:00Z",
+                "cwd": root,
+                "originator": "test",
+                "cli_version": "test",
+                "source": "cli",
+                "model_provider": "test-provider",
+                "history_mode": "legacy",
+            },
+        });
+        if let Some(source_id) = history_base {
+            metadata["payload"]["history_base"] = serde_json::to_value(HistoryPosition {
+                thread_id: source_id,
+                end_ordinal_exclusive: 0,
+                end_byte_offset: 1,
+            })?;
+        }
+        let mut contents = serde_json::to_string(&metadata)?;
+        contents.push('\n');
+        std::fs::write(&path, contents)?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn feedback_cold_path_rejects_external_reference_but_keeps_legacy_root()
+    -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let external = TempDir::new()?;
+        let runtime = codex_state::StateRuntime::init(
+            codex_state::SqliteConfig::new_for_testing(AbsolutePathBuf::try_from(
+                home.path().to_path_buf(),
+            )?),
+            "test-provider".to_string(),
+        )
+        .await?;
+        let root_id = ThreadId::from_string(&uuid::Uuid::from_u128(960).to_string())?;
+        let reference_id = ThreadId::from_string(&uuid::Uuid::from_u128(961).to_string())?;
+        let source_id = ThreadId::from_string(&uuid::Uuid::from_u128(962).to_string())?;
+        let archived_managed_root_id =
+            ThreadId::from_string(&uuid::Uuid::from_u128(963).to_string())?;
+        let archived_external_root_id =
+            ThreadId::from_string(&uuid::Uuid::from_u128(964).to_string())?;
+        let archived_external_reference_id =
+            ThreadId::from_string(&uuid::Uuid::from_u128(965).to_string())?;
+        let root_path = write_external_rollout(external.path(), root_id, None).await?;
+        let reference_path =
+            write_external_rollout(external.path(), reference_id, Some(source_id)).await?;
+        let archived_managed_dir = home.path().join(codex_core::ARCHIVED_SESSIONS_SUBDIR);
+        let archived_managed_root_path =
+            write_external_rollout(&archived_managed_dir, archived_managed_root_id, None).await?;
+        let archived_external_root_path =
+            write_external_rollout(external.path(), archived_external_root_id, None).await?;
+        let archived_external_reference_path = write_external_rollout(
+            external.path(),
+            archived_external_reference_id,
+            Some(source_id),
+        )
+        .await?;
+        let archived_external_reference_path = {
+            use std::os::unix::fs::symlink;
+
+            let managed_dir = home
+                .path()
+                .join(codex_core::ARCHIVED_SESSIONS_SUBDIR)
+                .join("2025/01/05");
+            std::fs::create_dir_all(&managed_dir)?;
+            let managed_path = managed_dir.join("rollout-external-reference-link.jsonl");
+            symlink(&archived_external_reference_path, &managed_path)?;
+            managed_path
+        };
+        for (id, path, archived) in [
+            (root_id, root_path.clone(), false),
+            (reference_id, reference_path, false),
+            (
+                archived_managed_root_id,
+                archived_managed_root_path.clone(),
+                true,
+            ),
+            (
+                archived_external_root_id,
+                archived_external_root_path.clone(),
+                true,
+            ),
+            (
+                archived_external_reference_id,
+                archived_external_reference_path,
+                true,
+            ),
+        ] {
+            let mut builder = codex_state::ThreadMetadataBuilder::new(
+                id,
+                path,
+                chrono::Utc::now(),
+                SessionSource::Cli,
+            );
+            builder.history_mode = codex_protocol::protocol::ThreadHistoryMode::Legacy;
+            builder.model_provider = Some("test-provider".to_string());
+            builder.cwd = home.path().to_path_buf();
+            let mut metadata = builder.build("test-provider");
+            if archived {
+                metadata.archived_at = Some(chrono::Utc::now());
+            }
+            metadata.preview = Some(if id == root_id {
+                "external root".to_string()
+            } else if id == archived_managed_root_id {
+                "managed archived root".to_string()
+            } else if id == archived_external_root_id {
+                "external archived root".to_string()
+            } else {
+                "external reference".to_string()
+            });
+            runtime.upsert_thread(&metadata).await?;
+        }
+
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), root_id, &runtime).await?,
+            Some(root_path)
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), reference_id, &runtime).await?,
+            None
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), archived_managed_root_id, &runtime)
+                .await?,
+            Some(archived_managed_root_path)
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(home.path(), archived_external_root_id, &runtime)
+                .await?,
+            Some(archived_external_root_path)
+        );
+        assert_eq!(
+            resolve_rollout_path_from_state_db(
+                home.path(),
+                archived_external_reference_id,
+                &runtime,
+            )
+            .await?,
+            None
+        );
+        Ok(())
+    }
 
     #[test]
     fn tool_cache_feedback_attachments_include_existing_active_cache_files() {

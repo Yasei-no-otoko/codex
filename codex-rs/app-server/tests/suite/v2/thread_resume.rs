@@ -2636,6 +2636,8 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         memory_mode: None,
         history_mode: Default::default(),
         history_base: None,
+        preview: None,
+        first_user_message: None,
         subagent_history_start_ordinal: None,
         multi_agent_version: None,
         context_window: None,
@@ -2940,7 +2942,7 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
+async fn thread_resume_rejects_cross_store_in_flight_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -3011,15 +3013,20 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
 
     let resume_id = secondary
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             ..Default::default()
         })
         .await?;
-    let ThreadResumeResponse {
-        thread: resumed_thread,
-        ..
-    } = timeout(DEFAULT_READ_TIMEOUT, secondary.read_response(resume_id)).await??;
-    assert_ne!(resumed_thread.status, ThreadStatus::NotLoaded);
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.message,
+        format!("thread {} already has an active writer", thread.id)
+    );
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/completed"),
@@ -3461,7 +3468,7 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
 }
 
 #[tokio::test]
-async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
+async fn thread_resume_rejects_cross_store_running_thread_with_excluded_turns() -> Result<()> {
     let server = responses::start_mock_server().await;
     let _response_mock = responses::mount_sse_once(
         &server,
@@ -3523,13 +3530,16 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let ThreadResumeResponse {
-        thread: resumed, ..
-    } = timeout(DEFAULT_READ_TIMEOUT, secondary.read_response(resume_id)).await??;
-
-    assert_eq!(resumed.id, thread.id);
-    assert_eq!(resumed.status, ThreadStatus::Idle);
-    assert!(resumed.turns.is_empty());
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.message,
+        format!("thread {} already has an active writer", thread.id)
+    );
 
     Ok(())
 }
@@ -4283,6 +4293,8 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    timeout(DEFAULT_READ_TIMEOUT, primary.shutdown_gracefully()).await??;
 
     let mut secondary = TestAppServer::builder()
         .with_codex_home(codex_home.path())
