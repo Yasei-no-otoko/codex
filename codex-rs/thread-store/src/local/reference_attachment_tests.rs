@@ -9,6 +9,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::UserMessageEvent;
+use pretty_assertions::assert_eq;
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use uuid::Uuid;

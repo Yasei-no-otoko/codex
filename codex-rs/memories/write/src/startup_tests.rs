@@ -19,20 +19,28 @@ use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnContextItem;
+use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_state::Phase2JobClaimOutcome;
 use codex_utils_absolute_path::test_support::PathExt;
 use codex_utils_output_truncation::approx_token_count;
@@ -527,13 +535,33 @@ async fn memories_phase1_reads_paginated_rollout_history_for_sampling() -> anyho
     if let RolloutItem::SessionMeta(session_meta) = &mut metadata_line.item {
         session_meta.meta.history_mode = ThreadHistoryMode::Paginated;
     }
-    let user_line = memory_response_line(&timestamp, "paginated memory input marker");
+    let pre_compaction_line =
+        memory_response_line(&timestamp, "paginated pre-compaction original marker");
+    let turn_started_line = memory_turn_started_line(&timestamp, "paginated-root-turn");
+    let user_event_line = memory_user_event_line(&timestamp, "paginated current user turn");
+    let turn_context_line =
+        memory_turn_context_line(home.path(), &timestamp, "paginated-root-turn");
+    let compaction_line = memory_compacted_line(
+        &timestamp,
+        "paginated root compaction summary",
+        "paginated root replacement history marker",
+        None,
+    );
+    let post_compaction_line =
+        memory_response_line(&timestamp, "paginated root post-compaction suffix marker");
+    let turn_complete_line = memory_turn_complete_line(&timestamp, "paginated-root-turn");
     tokio::fs::write(
         &rollout_path,
         format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             serde_json::to_string(&metadata_line)?,
-            serde_json::to_string(&user_line)?
+            serde_json::to_string(&pre_compaction_line)?,
+            serde_json::to_string(&turn_started_line)?,
+            serde_json::to_string(&user_event_line)?,
+            serde_json::to_string(&turn_context_line)?,
+            serde_json::to_string(&compaction_line)?,
+            serde_json::to_string(&post_compaction_line)?,
+            serde_json::to_string(&turn_complete_line)?,
         ),
     )
     .await?;
@@ -551,7 +579,7 @@ async fn memories_phase1_reads_paginated_rollout_history_for_sampling() -> anyho
     metadata_builder.history_mode = ThreadHistoryMode::Paginated;
     let mut metadata = metadata_builder.build("test-provider");
     metadata.history_mode = ThreadHistoryMode::Paginated;
-    metadata.preview = Some("paginated memory input marker".to_string());
+    metadata.preview = Some("paginated memory source".to_string());
     db.upsert_thread(&metadata).await?;
     db.set_thread_memory_mode(thread_id, "enabled").await?;
 
@@ -577,8 +605,20 @@ async fn memories_phase1_reads_paginated_rollout_history_for_sampling() -> anyho
     let request = wait_for_single_request(&response).await;
     let prompt = &request.message_input_texts("user")[0];
     assert!(
-        prompt.contains("paginated memory input marker"),
-        "phase-1 prompt should preserve paginated rollout input: {prompt}"
+        prompt.contains("paginated root post-compaction suffix marker"),
+        "phase-1 prompt should preserve the paginated post-compaction suffix: {prompt}"
+    );
+    assert!(
+        prompt.contains("paginated root replacement history marker"),
+        "phase-1 prompt should expand the paginated root replacement history: {prompt}"
+    );
+    assert!(
+        !prompt.contains("paginated root compaction summary"),
+        "phase-1 prompt should not serialize the paginated checkpoint summary: {prompt}"
+    );
+    assert!(
+        !prompt.contains("paginated pre-compaction original marker"),
+        "phase-1 prompt should not duplicate pre-compaction original history: {prompt}"
     );
 
     shutdown_test_codex(&test).await?;
@@ -669,6 +709,107 @@ async fn memories_phase1_samples_paginated_reference_child_prefix_and_delta_only
     assert!(
         !prompt.contains("paginated parent append after fork"),
         "phase-1 prompt must exclude paginated parent writes after the fork boundary: {prompt}"
+    );
+
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn memories_phase1_samples_paginated_compacted_reference_replacement_and_suffix()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex(&server, Arc::clone(&home)).await?;
+    let db = test
+        .codex
+        .state_db()
+        .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory sampling test"))?;
+    let parent_id = ThreadId::new();
+    let child_id = ThreadId::new();
+    let updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    let (parent_path, child_path) = write_paginated_compacted_reference_memory_rollouts(
+        home.path(),
+        parent_id,
+        child_id,
+        updated_at,
+    )
+    .await?;
+
+    for (thread_id, rollout_path) in [(parent_id, parent_path), (child_id, child_path)] {
+        let mut metadata_builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            updated_at,
+            SessionSource::Cli,
+        );
+        metadata_builder.updated_at = Some(updated_at);
+        metadata_builder.recency_at = Some(updated_at);
+        metadata_builder.cwd = home.path().to_path_buf();
+        metadata_builder.model_provider = Some("test-provider".to_string());
+        let mut metadata = metadata_builder.build("test-provider");
+        metadata.history_mode = ThreadHistoryMode::Paginated;
+        db.upsert_thread(&metadata).await?;
+    }
+    for (thread_id, preview) in [
+        (parent_id, "paginated compacted parent source"),
+        (child_id, "paginated compacted child source"),
+    ] {
+        db.set_thread_preview_if_empty(thread_id, preview).await?;
+    }
+    db.set_thread_memory_mode(parent_id, "disabled").await?;
+    db.set_thread_memory_mode(child_id, "enabled").await?;
+
+    let response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-paginated-compacted-reference-memory"),
+            ev_assistant_message(
+                "msg-paginated-compacted-reference-memory",
+                r#"{"raw_memory":"raw memory","rollout_summary":"paginated compacted reference summary","rollout_slug":"paginated-compacted-reference-child"}"#,
+            ),
+            ev_completed("resp-paginated-compacted-reference-memory"),
+        ]),
+    )
+    .await;
+    let provider = Arc::new(MockMemoryModelProvider::new(
+        test.config.model_provider.clone(),
+        Some(test.thread_manager.auth_manager()),
+    ));
+    let (context, config) = memory_startup_context_with_provider(&test, provider).await;
+    phase1::run(context, config).await;
+
+    let request = wait_for_single_request(&response).await;
+    let user_texts = request.message_input_texts("user");
+    assert_eq!(
+        user_texts.len(),
+        1,
+        "phase-1 should send one user InputText"
+    );
+    let prompt = &user_texts[0];
+    assert!(
+        prompt.contains("paginated inherited replacement marker"),
+        "phase-1 prompt should include the inherited replacement history: {prompt}"
+    );
+    assert!(
+        prompt.contains("paginated child replacement history marker"),
+        "phase-1 prompt should include the child replacement history: {prompt}"
+    );
+    assert!(
+        prompt.contains("paginated child post-compaction suffix marker"),
+        "phase-1 prompt should include the post-compaction child suffix: {prompt}"
+    );
+    assert!(
+        !prompt.contains("paginated child compaction summary"),
+        "phase-1 prompt should not serialize the child checkpoint summary: {prompt}"
+    );
+    assert!(
+        !prompt.contains("paginated child pre-compaction original marker"),
+        "phase-1 prompt should not duplicate the child pre-compaction original: {prompt}"
+    );
+    assert!(
+        !prompt.contains("paginated compacted parent append after fork"),
+        "phase-1 prompt must exclude parent writes after the fork boundary: {prompt}"
     );
 
     shutdown_test_codex(&test).await?;
@@ -1192,6 +1333,109 @@ async fn write_paginated_reference_memory_rollouts(
     Ok((parent_path, child_path))
 }
 
+async fn write_paginated_compacted_reference_memory_rollouts(
+    codex_home: &Path,
+    parent_id: ThreadId,
+    child_id: ThreadId,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let day_dir = codex_home.join("sessions/2025/01/05");
+    tokio::fs::create_dir_all(&day_dir).await?;
+    let timestamp = updated_at.to_rfc3339();
+    let filename_timestamp = "2025-01-05T12-00-00";
+    let parent_path = day_dir.join(format!("rollout-{filename_timestamp}-{parent_id}.jsonl"));
+    let child_path = day_dir.join(format!("rollout-{filename_timestamp}-{child_id}.jsonl"));
+
+    let mut parent_meta = memory_session_meta_line(
+        codex_home, parent_id, &timestamp, /*forked_from_id*/ None, /*history_base*/ None,
+    );
+    if let RolloutItem::SessionMeta(session_meta) = &mut parent_meta.item {
+        session_meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    }
+    let parent_prefix = memory_response_line_with_ordinal(
+        &timestamp,
+        "paginated compacted parent prefix original marker",
+        1,
+    );
+    let parent_head = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&parent_meta)?,
+        serde_json::to_string(&parent_prefix)?
+    );
+    let source_cutoff = parent_head.as_bytes().len() as u64;
+    let parent_append = memory_response_line_with_ordinal(
+        &timestamp,
+        "paginated compacted parent append after fork",
+        2,
+    );
+    tokio::fs::write(
+        &parent_path,
+        format!(
+            "{}{}\n",
+            parent_head,
+            serde_json::to_string(&parent_append)?
+        ),
+    )
+    .await?;
+
+    let history_base = HistoryPosition {
+        thread_id: parent_id,
+        end_ordinal_exclusive: 2,
+        end_byte_offset: source_cutoff,
+    };
+    let mut child_meta = memory_session_meta_line(
+        codex_home,
+        child_id,
+        &timestamp,
+        Some(parent_id),
+        Some(history_base),
+    );
+    if let RolloutItem::SessionMeta(session_meta) = &mut child_meta.item {
+        session_meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    }
+    let child_pre_compaction = memory_response_line_with_ordinal(
+        &timestamp,
+        "paginated child pre-compaction original marker",
+        3,
+    );
+    let turn_started = memory_turn_started_line(&timestamp, "paginated-compacted-child-turn");
+    let user_event = memory_user_event_line(&timestamp, "paginated compacted child current turn");
+    let turn_context =
+        memory_turn_context_line(codex_home, &timestamp, "paginated-compacted-child-turn");
+    let child_compaction = memory_compacted_line_with_replacements(
+        &timestamp,
+        "paginated child compaction summary",
+        &[
+            "paginated inherited replacement marker",
+            "paginated child replacement history marker",
+        ],
+        Some(4),
+    );
+    let child_post_compaction = memory_response_line_with_ordinal(
+        &timestamp,
+        "paginated child post-compaction suffix marker",
+        5,
+    );
+    let turn_complete = memory_turn_complete_line(&timestamp, "paginated-compacted-child-turn");
+    tokio::fs::write(
+        &child_path,
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            serde_json::to_string(&child_meta)?,
+            serde_json::to_string(&child_pre_compaction)?,
+            serde_json::to_string(&turn_started)?,
+            serde_json::to_string(&user_event)?,
+            serde_json::to_string(&turn_context)?,
+            serde_json::to_string(&child_compaction)?,
+            serde_json::to_string(&child_post_compaction)?,
+            serde_json::to_string(&turn_complete)?,
+        ),
+    )
+    .await?;
+
+    Ok((parent_path, child_path))
+}
+
 fn memory_session_meta_line(
     codex_home: &Path,
     thread_id: ThreadId,
@@ -1232,6 +1476,118 @@ fn memory_response_line(timestamp: &str, text: &str) -> RolloutLine {
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
+        }),
+    }
+}
+
+fn memory_compacted_line(
+    timestamp: &str,
+    summary: &str,
+    replacement_text: &str,
+    ordinal: Option<u64>,
+) -> RolloutLine {
+    memory_compacted_line_with_replacements(timestamp, summary, &[replacement_text], ordinal)
+}
+
+fn memory_compacted_line_with_replacements(
+    timestamp: &str,
+    summary: &str,
+    replacement_texts: &[&str],
+    ordinal: Option<u64>,
+) -> RolloutLine {
+    RolloutLine {
+        timestamp: timestamp.to_string(),
+        ordinal,
+        item: RolloutItem::Compacted(CompactedItem {
+            message: summary.to_string(),
+            replacement_history: Some(
+                replacement_texts
+                    .iter()
+                    .map(|text| ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: (*text).to_string(),
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    })
+                    .collect(),
+            ),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+    }
+}
+
+fn memory_turn_started_line(timestamp: &str, turn_id: &str) -> RolloutLine {
+    RolloutLine {
+        timestamp: timestamp.to_string(),
+        ordinal: None,
+        item: RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: Default::default(),
+        })),
+    }
+}
+
+fn memory_turn_complete_line(timestamp: &str, turn_id: &str) -> RolloutLine {
+    RolloutLine {
+        timestamp: timestamp.to_string(),
+        ordinal: None,
+        item: RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: turn_id.to_string(),
+            last_agent_message: None,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        })),
+    }
+}
+
+fn memory_user_event_line(timestamp: &str, message: &str) -> RolloutLine {
+    RolloutLine {
+        timestamp: timestamp.to_string(),
+        ordinal: None,
+        item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: message.to_string(),
+            ..Default::default()
+        })),
+    }
+}
+
+fn memory_turn_context_line(root: &Path, timestamp: &str, turn_id: &str) -> RolloutLine {
+    RolloutLine {
+        timestamp: timestamp.to_string(),
+        ordinal: None,
+        item: RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some(turn_id.to_string()),
+            cwd: serde_json::from_value(serde_json::json!(root)).expect("absolute cwd"),
+            workspace_roots: None,
+            current_date: None,
+            timezone: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            network: None,
+            file_system_sandbox_policy: None,
+            model: "test-model".to_string(),
+            comp_hash: None,
+            personality: None,
+            collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
+            realtime_active: None,
+            effort: None,
+            summary: ReasoningSummary::Auto,
         }),
     }
 }

@@ -1,5 +1,6 @@
 use super::ThreadWriterLockCoordinator;
 use codex_protocol::ThreadId;
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use uuid::Uuid;
 

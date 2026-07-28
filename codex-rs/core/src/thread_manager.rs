@@ -1381,7 +1381,7 @@ impl ThreadManagerState {
                     include_archived,
                 })
                 .await
-                .map(|context| context.items)
+                .map(|context| Self::expand_paginated_model_context(context.items))
                 .map_err(|err| match err {
                     ThreadStoreError::ThreadNotFound { thread_id } => {
                         CodexErr::ThreadNotFound(thread_id)
@@ -1403,6 +1403,38 @@ impl ThreadManagerState {
                 "failed to read stored thread {thread_id}: {err}"
             ))),
         }
+    }
+
+    /// Replace the latest Paginated compaction checkpoint with its model-visible replacement
+    /// history before memory sampling serializes the replay. Legacy history is read through the
+    /// complete-history path above and must keep its checkpoint representation to avoid
+    /// duplication.
+    fn expand_paginated_model_context(items: Vec<RolloutItem>) -> Vec<RolloutItem> {
+        let latest_compacted_index = items
+            .iter()
+            .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
+        let mut expanded = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            if Some(index) != latest_compacted_index {
+                expanded.push(item);
+                continue;
+            }
+            match item {
+                RolloutItem::Compacted(mut compacted) => {
+                    if let Some(replacement_history) = compacted.replacement_history.take() {
+                        expanded.extend(
+                            replacement_history
+                                .into_iter()
+                                .map(RolloutItem::ResponseItem),
+                        );
+                    } else {
+                        expanded.push(RolloutItem::Compacted(compacted));
+                    }
+                }
+                item => expanded.push(item),
+            }
+        }
+        expanded
     }
 
     /// Prefer a loaded conversation's pre-held history path. Cold reads use the thread-store's

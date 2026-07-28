@@ -79,6 +79,43 @@ async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn raw_rollout_reader_preserves_newlines_and_rejects_no_newline_tail() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout-raw.jsonl");
+    fs::write(&path, b"{\"line\":1}\r\npartial")?;
+
+    let mut reader = open_rollout_raw_line_reader(&path).await?;
+    assert_eq!(
+        reader.next_raw_line().await?,
+        Some(b"{\"line\":1}\r\n".to_vec())
+    );
+    assert_eq!(reader.next_raw_line().await?, Some(b"partial".to_vec()));
+    assert_eq!(reader.next_raw_line().await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_rollout_reader_preserves_newlines_for_compressed_rollouts() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout-raw-compressed.jsonl");
+    fs::write(&path, b"{\"line\":1}\r\n{\"line\":2}\n")?;
+    compress_now(&path)?;
+    let compressed_path = compressed_rollout_path(&path);
+
+    let mut reader = open_rollout_raw_line_reader(&compressed_path).await?;
+    assert_eq!(
+        reader.next_raw_line().await?,
+        Some(b"{\"line\":1}\r\n".to_vec())
+    );
+    assert_eq!(
+        reader.next_raw_line().await?,
+        Some(b"{\"line\":2}\n".to_vec())
+    );
+    assert_eq!(reader.next_raw_line().await?, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_session_meta_line_stops_before_invalid_utf8_tail() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(16);
