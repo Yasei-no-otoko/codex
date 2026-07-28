@@ -166,6 +166,31 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+/// Parameters for writing a bounded, read-only logical history attachment for feedback upload.
+#[derive(Clone, Debug)]
+pub struct WriteReferenceLogicalAttachmentParams {
+    /// Reference-backed child whose logical history should be written.
+    pub thread_id: ThreadId,
+    /// Whether archived source segments may be followed.
+    pub include_archived: bool,
+    /// Caller-owned temporary path to overwrite with newline-delimited JSON.
+    pub output_path: PathBuf,
+    /// Maximum output size in bytes. Complete JSONL lines are retained only.
+    pub max_bytes: usize,
+}
+
+/// Result of attempting to write a logical reference attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteReferenceLogicalAttachmentOutcome {
+    /// The requested rollout is a legacy root or this store does not support references.
+    NotReference,
+    /// The logical attachment was written to the requested output path.
+    Written {
+        /// Whether complete-line head/tail capping omitted any records.
+        truncated: bool,
+    },
+}
+
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {
