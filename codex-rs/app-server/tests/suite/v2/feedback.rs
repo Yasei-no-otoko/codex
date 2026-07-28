@@ -12,8 +12,11 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_rollout::read_session_meta_line;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use serde_json::json;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -69,10 +72,13 @@ async fn feedback_upload_json_rpc_includes_logical_reference_attachment() -> Res
 
     let envelope = wait_for_feedback_envelope(&sentry).await?;
     let envelope_text = String::from_utf8_lossy(&envelope);
+    let expected_filename = format!("rollout-history-{child_id}-head-tail.jsonl");
     assert!(
-        envelope_text.contains("rollout-history-"),
-        "feedback envelope should include the logical rollout attachment filename: {envelope_text}"
+        envelope_text.contains(&expected_filename),
+        "feedback envelope should include the truncated logical rollout attachment filename: {envelope_text}"
     );
+    let tags = sentry_event_tags(&envelope).expect("feedback envelope should contain an event");
+    assert_eq!(tags.get("feedback_rollout_truncated"), Some(&json!("true")));
     assert!(
         envelope_text.contains(&parent_id.to_string()),
         "feedback envelope should include the inherited parent session metadata"
@@ -84,6 +90,10 @@ async fn feedback_upload_json_rpc_includes_logical_reference_attachment() -> Res
     assert!(
         envelope_text.contains("child feedback marker"),
         "feedback envelope should include the child delta"
+    );
+    assert!(
+        !envelope_text.contains("parent post-fork marker"),
+        "feedback envelope must exclude parent records appended after the child cutoff"
     );
 
     app_server.shutdown_gracefully().await?;
@@ -102,7 +112,38 @@ async fn write_reference_rollouts(codex_home: &Path) -> Result<(ThreadId, Thread
         None,
     )?)?;
     let parent_path = rollout_path(codex_home, filename_timestamp, &parent_id.to_string());
-    let parent_len = fs::metadata(&parent_path)?.len();
+    let mut parent_file = OpenOptions::new().append(true).open(&parent_path)?;
+    for index in 0..3_000 {
+        let bulk_line = json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("parent bulk record {index} {}", "x".repeat(2_048)),
+                }]
+            }
+        });
+        writeln!(parent_file, "{bulk_line}")?;
+    }
+    parent_file.flush()?;
+    let parent_len = parent_file.metadata()?.len();
+    assert!(
+        parent_len > 4 * 1024 * 1024,
+        "feedback fixture must exercise the bounded head/tail path"
+    );
+    let post_fork_line = json!({
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "parent post-fork marker"}]
+        }
+    });
+    writeln!(parent_file, "{post_fork_line}")?;
     let child_id = ThreadId::new();
     let mut child_meta = read_session_meta_line(&parent_path).await?.meta;
     child_meta.id = child_id;
@@ -140,6 +181,13 @@ async fn write_reference_rollouts(codex_home: &Path) -> Result<(ThreadId, Thread
         ),
     )?;
     Ok((parent_id, child_id))
+}
+
+fn sentry_event_tags(envelope: &[u8]) -> Option<serde_json::Map<String, Value>> {
+    String::from_utf8_lossy(envelope)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| value.get("tags").and_then(Value::as_object).cloned())
 }
 
 async fn wait_for_feedback_envelope(server: &MockServer) -> Result<Vec<u8>> {
