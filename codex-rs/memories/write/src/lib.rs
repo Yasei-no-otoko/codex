@@ -97,6 +97,14 @@ mod stage_one {
     /// Keeping this below 100% leaves room for system instructions, prompt framing,
     /// and model output.
     pub(super) const CONTEXT_WINDOW_PERCENT: i64 = 70;
+
+    /// Hard cap for the complete stage-1 user message item, including its
+    /// rollout framing and truncation marker.
+    pub(super) const MAX_INPUT_ITEM_TOKENS: usize = 10_000;
+
+    /// Leave room for the truncation marker when deriving the rollout-only
+    /// budget from the complete input-item cap.
+    pub(super) const TRUNCATION_MARKER_TOKEN_RESERVE: usize = 32;
 }
 
 mod stage_two {
