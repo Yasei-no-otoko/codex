@@ -1,4 +1,6 @@
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
@@ -138,4 +140,88 @@ async fn cold_reference_attachment_reads_compressed_ancestor_without_materializi
         "read-only attachment must not materialize plain JSONL"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn cold_paginated_reference_attachment_reads_frozen_lineage_without_materializing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let parent_uuid = Uuid::from_u128(0x201);
+    let child_uuid = Uuid::from_u128(0x202);
+    let parent_id = ThreadId::from_string(&parent_uuid.to_string())?;
+    let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+    let day_dir = home.path().join("sessions/2025/01/03");
+    let parent_path = super::test_support::write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T12-02-00",
+        parent_uuid,
+        codex_protocol::protocol::ThreadHistoryMode::Paginated,
+    )?;
+    append_paginated_message(&parent_path, "parent-frozen-marker", 1)?;
+    let parent_cutoff = fs::metadata(&parent_path)?.len();
+    append_paginated_message(&parent_path, "parent-after-fork-marker", 2)?;
+
+    let child_path = write_session_file_with_fork(
+        home.path(),
+        day_dir,
+        "2025-01-03T12-02-01",
+        child_uuid,
+        "unused",
+        Some("test-provider"),
+        Some(parent_uuid),
+        codex_protocol::protocol::ThreadHistoryMode::Paginated,
+    )?;
+    append_paginated_message(&child_path, "child-delta-marker", 3)?;
+    set_history_base_in_session_file(
+        &child_path,
+        &HistoryPosition {
+            thread_id: parent_id,
+            end_ordinal_exclusive: 2,
+            end_byte_offset: parent_cutoff,
+        },
+    )?;
+    let compressed_parent = compress_session_file(&parent_path)?;
+
+    let store = LocalThreadStore::new(test_config(home.path()), None);
+    let output = NamedTempFile::new()?;
+    let outcome = store
+        .write_reference_logical_attachment(WriteReferenceLogicalAttachmentParams {
+            thread_id: child_id,
+            include_archived: true,
+            output_path: output.path().to_path_buf(),
+            max_bytes: 4 * 1024 * 1024,
+        })
+        .await?;
+    assert_eq!(
+        outcome,
+        WriteReferenceLogicalAttachmentOutcome::Written { truncated: false }
+    );
+    let text = fs::read_to_string(output.path())?;
+    assert!(text.contains("parent-frozen-marker"));
+    assert!(text.contains("child-delta-marker"));
+    assert!(!text.contains("parent-after-fork-marker"));
+    assert!(compressed_parent.exists());
+    assert!(!parent_path.exists());
+    Ok(())
+}
+
+fn append_paginated_message(
+    path: &std::path::Path,
+    message: &str,
+    ordinal: u64,
+) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    let line = codex_protocol::protocol::RolloutLine {
+        timestamp: "2025-01-03T12:02:02Z".to_string(),
+        ordinal: Some(ordinal),
+        item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: message.to_string(),
+            ..Default::default()
+        })),
+    };
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&line).expect("serialize paginated line")
+    )
 }
