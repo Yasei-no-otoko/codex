@@ -374,7 +374,7 @@ pub async fn list_threads_db(
         return None;
     }
 
-    let anchor = cursor_to_anchor(cursor);
+    let mut anchor = cursor_to_anchor(cursor);
     let allowed_sources: Vec<String> = allowed_sources
         .iter()
         .map(|value| match serde_json::to_value(value) {
@@ -390,84 +390,161 @@ pub async fn list_threads_db(
             .map(|cwd| normalize_cwd_for_state_db(cwd))
             .collect::<Vec<_>>()
     });
-    let filters = codex_state::ThreadFilterOptions {
-        archived_only: archived,
-        is_pinned,
-        allowed_sources: allowed_sources.as_slice(),
-        model_providers: model_providers.as_deref(),
-        cwd_filters: normalized_cwd_filters.as_deref(),
-        anchor: anchor.as_ref(),
-        sort_key: match sort_key {
-            ThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
-            ThreadSortKey::UpdatedAt => codex_state::SortKey::UpdatedAt,
-            ThreadSortKey::RecencyAt => codex_state::SortKey::RecencyAt,
-        },
-        sort_direction: match sort_direction {
-            SortDirection::Asc => codex_state::SortDirection::Asc,
-            SortDirection::Desc => codex_state::SortDirection::Desc,
-        },
-        search_term,
+    let state_sort_key = match sort_key {
+        ThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
+        ThreadSortKey::UpdatedAt => codex_state::SortKey::UpdatedAt,
+        ThreadSortKey::RecencyAt => codex_state::SortKey::RecencyAt,
     };
-    let page = match relation_filter {
-        Some(relation_filter) => {
-            ctx.list_threads_by_relation(page_size, relation_filter, filters)
+    let state_sort_direction = match sort_direction {
+        SortDirection::Asc => codex_state::SortDirection::Asc,
+        SortDirection::Desc => codex_state::SortDirection::Desc,
+    };
+    if let Some(relation_filter) = relation_filter {
+        let filters = codex_state::ThreadFilterOptions {
+            archived_only: archived,
+            is_pinned,
+            allowed_sources: allowed_sources.as_slice(),
+            model_providers: model_providers.as_deref(),
+            cwd_filters: normalized_cwd_filters.as_deref(),
+            anchor: anchor.as_ref(),
+            sort_key: state_sort_key,
+            sort_direction: state_sort_direction,
+            search_term,
+        };
+        let mut page = match ctx
+            .list_threads_by_relation(page_size, relation_filter, filters)
+            .await
+        {
+            Ok(page) => page,
+            Err(err) => {
+                warn!("state db list_threads failed: {err}");
+                return None;
+            }
+        };
+        let mut valid_items = Vec::with_capacity(page.items.len());
+        for item in page.items {
+            if let Some(existing_path) =
+                crate::compression::existing_rollout_path(item.rollout_path.as_path()).await
+            {
+                let visible = match crate::list::state_db_rollout_path_is_visible(
+                    sqlite.home(),
+                    item.id,
+                    item.rollout_path.as_path(),
+                )
                 .await
-        }
-        None => ctx.list_threads(page_size, filters).await,
-    };
-    match page {
-        Ok(mut page) => {
-            let mut valid_items = Vec::with_capacity(page.items.len());
-            for item in page.items {
-                let existing_path =
-                    crate::compression::existing_rollout_path(item.rollout_path.as_path()).await;
-                if let Some(existing_path) = existing_path {
-                    let visible = match crate::list::state_db_rollout_path_is_visible(
-                        sqlite.home(),
-                        item.id,
-                        item.rollout_path.as_path(),
-                    )
-                    .await
-                    {
-                        Ok(true) => true,
-                        Ok(false) => false,
-                        Err(err) => {
-                            warn!(
-                                "state db path visibility check failed for thread {}: {}",
-                                item.id, err
-                            );
-                            false
-                        }
-                    };
-                    if visible {
-                        let mut item = item;
-                        item.rollout_path = existing_path;
-                        valid_items.push(item);
-                    } else {
+                {
+                    Ok(visible) => visible,
+                    Err(err) => {
                         warn!(
-                            "state db list_threads dropped hidden thread {}: {}",
-                            item.id,
-                            item.rollout_path.display()
+                            "state db path visibility check failed for thread {}: {}",
+                            item.id, err
                         );
+                        false
                     }
+                };
+                if visible {
+                    let mut item = item;
+                    item.rollout_path = existing_path;
+                    valid_items.push(item);
                 } else {
                     warn!(
-                        "state db list_threads returned stale rollout path for thread {}: {}",
+                        "state db list_threads dropped hidden thread {}: {}",
                         item.id,
                         item.rollout_path.display()
                     );
-                    warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
-                    let _ = ctx.delete_thread(item.id).await;
                 }
+            } else {
+                warn!(
+                    "state db list_threads returned stale rollout path for thread {}: {}",
+                    item.id,
+                    item.rollout_path.display()
+                );
+                warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
+                let _ = ctx.delete_thread(item.id).await;
             }
-            page.items = valid_items;
-            Some(page)
         }
-        Err(err) => {
-            warn!("state db list_threads failed: {err}");
-            None
-        }
+        page.items = valid_items;
+        return Some(page);
     }
+
+    let mut items = Vec::with_capacity(page_size);
+    let mut next_anchor = None;
+    let mut num_scanned_rows = 0usize;
+    while items.len() < page_size {
+        let filters = codex_state::ThreadFilterOptions {
+            archived_only: archived,
+            is_pinned,
+            allowed_sources: allowed_sources.as_slice(),
+            model_providers: model_providers.as_deref(),
+            cwd_filters: normalized_cwd_filters.as_deref(),
+            anchor: anchor.as_ref(),
+            sort_key: state_sort_key,
+            sort_direction: state_sort_direction,
+            search_term,
+        };
+        let page = match ctx.list_threads(page_size - items.len(), filters).await {
+            Ok(page) => page,
+            Err(err) => {
+                warn!("state db list_threads failed: {err}");
+                return None;
+            }
+        };
+        num_scanned_rows = num_scanned_rows.saturating_add(page.num_scanned_rows);
+        next_anchor = page.next_anchor;
+
+        for item in page.items {
+            if let Some(existing_path) =
+                crate::compression::existing_rollout_path(item.rollout_path.as_path()).await
+            {
+                let visible = match crate::list::state_db_rollout_path_is_visible(
+                    sqlite.home(),
+                    item.id,
+                    item.rollout_path.as_path(),
+                )
+                .await
+                {
+                    Ok(visible) => visible,
+                    Err(err) => {
+                        warn!(
+                            "state db path visibility check failed for thread {}: {}",
+                            item.id, err
+                        );
+                        false
+                    }
+                };
+                if visible {
+                    let mut item = item;
+                    item.rollout_path = existing_path;
+                    items.push(item);
+                } else {
+                    warn!(
+                        "state db list_threads dropped hidden thread {}: {}",
+                        item.id,
+                        item.rollout_path.display()
+                    );
+                }
+            } else {
+                warn!(
+                    "state db list_threads returned stale rollout path for thread {}: {}",
+                    item.id,
+                    item.rollout_path.display()
+                );
+                warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
+                let _ = ctx.delete_thread(item.id).await;
+            }
+        }
+
+        if items.len() == page_size || next_anchor.is_none() {
+            break;
+        }
+        anchor = next_anchor.clone();
+    }
+    Some(codex_state::ThreadsPage {
+        items,
+        parent_thread_ids: Default::default(),
+        next_anchor,
+        num_scanned_rows,
+    })
 }
 
 /// Look up the rollout path for a thread id using SQLite.

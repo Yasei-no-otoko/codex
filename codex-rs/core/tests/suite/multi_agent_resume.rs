@@ -47,6 +47,7 @@ const ROLE_NAME: &str = "durable_worker";
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_MODEL_PROVIDER_ID: &str = "mock";
 const ROLE_DEVELOPER_INSTRUCTIONS: &str = "Keep the durable worker role configuration.";
+const SUBAGENT_DEVELOPER_INSTRUCTIONS: &str = "Use the default durable worker instructions.";
 
 fn decoded_body(request: &wiremock::Request) -> Option<Vec<u8>> {
     let is_zstd = request
@@ -91,6 +92,8 @@ fn enable_multi_agent_v2(config: &mut codex_core::config::Config) {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
+    config.multi_agent_v2.subagent_developer_instructions =
+        Some(SUBAGENT_DEVELOPER_INSTRUCTIONS.to_string());
 }
 
 fn enable_multi_agent_v2_with_local_compaction(config: &mut codex_core::config::Config) {
@@ -407,6 +410,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     assert!(initial_child_request.requests().iter().any(|request| {
         request.body_contains_text(INITIAL_TASK)
             && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
+            && !request.body_contains_text(SUBAGENT_DEVELOPER_INSTRUCTIONS)
     }));
     let initial_worker_config = worker_thread.config_snapshot().await;
     let initial_worker_role_config = (
@@ -500,6 +504,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     assert!(followup_child_request.requests().iter().any(|request| {
         request.body_contains_text(FOLLOWUP_TASK)
             && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
+            && !request.body_contains_text(SUBAGENT_DEVELOPER_INSTRUCTIONS)
     }));
     let reloaded_worker_config = reloaded_worker.config_snapshot().await;
     let reloaded_worker_role_config = (
