@@ -85,18 +85,17 @@ pub(super) async fn read_thread(
                     return Ok(thread);
                 }
             };
-            if rollout_thread.thread_id == thread_id {
-                validate_reference_rollout_path(store, thread_id, rollout_path.as_path()).await?;
-            } else if external_rollout {
+            if rollout_thread.thread_id != thread_id {
                 return Err(ThreadStoreError::InvalidRequest {
                     message: format!(
-                        "external rollout {} belongs to thread {}, not {}",
+                        "rollout {} belongs to thread {}, not {}",
                         rollout_path.display(),
                         rollout_thread.thread_id,
                         thread_id
                     ),
                 });
             }
+            validate_reference_rollout_path(store, thread_id, rollout_path.as_path()).await?;
             if (params.include_archived || rollout_thread.archived_at.is_none())
                 && !rollout_thread.preview.is_empty()
             {
@@ -2083,6 +2082,50 @@ mod tests {
         let history = thread.history.expect("history should load");
         assert_eq!(history.thread_id, thread_id);
         assert_eq!(history.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_thread_rejects_managed_sqlite_path_pointing_to_another_thread_without_history() {
+        let home = TempDir::new().expect("home temp dir");
+        let config = test_config(home.path());
+        let thread_uuid = Uuid::from_u128(224);
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
+        let other_uuid = Uuid::from_u128(225);
+        let other_path = write_session_file(home.path(), "2025-01-05T12-00-00", other_uuid)
+            .expect("managed rollout");
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        let mut builder = ThreadMetadataBuilder::new(
+            thread_id,
+            other_path.clone(),
+            Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.model_provider = Some(config.default_model_provider_id.clone());
+        builder.cwd = home.path().to_path_buf();
+        let mut metadata = builder.build(config.default_model_provider_id.as_str());
+        metadata.preview = Some("stale thread A summary".to_string());
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("state db upsert should succeed");
+
+        let error = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect_err("managed rollout for another thread must be rejected");
+        assert!(error.to_string().contains("belongs to thread"));
+        assert!(error.to_string().contains(&other_uuid.to_string()));
+        assert!(error.to_string().contains(&thread_uuid.to_string()));
     }
 
     #[tokio::test]
