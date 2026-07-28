@@ -906,6 +906,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_legacy_fork_survives_concurrent_archive_during_mode_detection() {
+        let home = TempDir::new().expect("home temp dir");
+        let source_uuid = uuid::Uuid::from_u128(903);
+        let source_id = ThreadId::from_string(&source_uuid.to_string()).expect("source id");
+        write_session_file(home.path(), "2025-01-03T00-01-00.000Z", source_uuid)
+            .expect("write legacy source");
+        let config = test_config(home.path());
+        let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
+        let maintenance_race_store = maintenance_store.clone();
+
+        let prepare = tokio::spawn(async move {
+            store
+                .prepare_fork(PrepareForkParams {
+                    thread_id: source_id,
+                    boundary: ForkBoundary::Latest,
+                })
+                .await
+        });
+        let archive = tokio::spawn(async move {
+            maintenance_race_store
+                .archive_thread(ArchiveThreadParams {
+                    thread_id: source_id,
+                })
+                .await
+        });
+
+        let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), prepare)
+            .await
+            .expect("fork/archive race must not deadlock")
+            .expect("fork task should not panic")
+            .expect("legacy source must not be dispatched as paginated");
+        let history_base = prepared
+            .history_base
+            .expect("legacy latest fork should retain a byte cutoff");
+        assert_eq!(history_base.thread_id, source_id);
+        assert_eq!(history_base.end_ordinal_exclusive, 0);
+        drop(prepared);
+
+        let archive_result = tokio::time::timeout(std::time::Duration::from_secs(5), archive)
+            .await
+            .expect("archive must finish after fork releases its source guard")
+            .expect("archive task should not panic");
+        match archive_result {
+            Ok(()) => {}
+            Err(ThreadStoreError::Conflict { .. }) => {
+                maintenance_store
+                    .archive_thread(ArchiveThreadParams {
+                        thread_id: source_id,
+                    })
+                    .await
+                    .expect("archive retry should succeed after fork preparation");
+            }
+            Err(error) => panic!("unexpected archive result: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn raw_append_items_does_not_update_sqlite_metadata() {
         // This pins the ThreadStore contract: raw appends are history-only. Callers that need
         // metadata updates must use LiveThread or call update_thread_metadata explicitly.

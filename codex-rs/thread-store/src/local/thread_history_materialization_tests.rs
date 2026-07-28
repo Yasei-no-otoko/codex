@@ -1670,6 +1670,52 @@ async fn sqlite_failure_does_not_fail_durable_jsonl_write() {
 }
 
 #[tokio::test]
+async fn latest_paginated_fork_accepts_physical_tail_after_rejected_complete_lines()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store.persist_thread(thread_id).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("physical-tail-turn"),
+                turn_completed("physical-tail-turn"),
+            ],
+        })
+        .await?;
+    store.flush_thread(thread_id).await?;
+
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("paginated rollout path");
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(rollout_path.as_path())?;
+    file.write_all(b"\n \t\r\n{not json}\n\xff\n")?;
+    file.flush()?;
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path()).await?;
+    let physical_eof = fs::metadata(rollout_path.as_path())?.len();
+
+    let prepared = store
+        .prepare_fork(PrepareForkParams {
+            thread_id,
+            boundary: ForkBoundary::Latest,
+        })
+        .await?;
+    let history_base = prepared
+        .history_base
+        .expect("latest paginated fork should retain a projection cutoff");
+    assert_eq!(history_base.thread_id, thread_id);
+    assert!(history_base.end_ordinal_exclusive > 0);
+    assert_eq!(history_base.end_byte_offset, physical_eof);
+    Ok(())
+}
+
+#[tokio::test]
 async fn blank_and_rejected_rollout_lines_do_not_poison_projection() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
