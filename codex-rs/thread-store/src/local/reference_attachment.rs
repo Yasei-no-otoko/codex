@@ -124,14 +124,6 @@ pub(super) async fn write_reference_logical_attachment(
     let (lineage, _writer_guards) = store
         .resolve_rollout_lineage_for_reference_attachment(params.thread_id)
         .await?;
-    if lineage.history_mode() != codex_protocol::protocol::ThreadHistoryMode::Legacy {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "reference logical attachment only supports legacy history for {}",
-                params.thread_id
-            ),
-        });
-    }
 
     // Keep the process-local writer mutexes for every segment through the raw stream. The
     // resolver validates the snapshot under the same locks; retaining them here prevents a live

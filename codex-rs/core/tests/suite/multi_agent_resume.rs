@@ -359,6 +359,92 @@ async fn full_history_spawn_from_compacted_legacy_parent_is_bounded_and_resumabl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_n_spawn_from_compacted_legacy_parent_uses_public_numeric_fork_turns() -> Result<()> {
+    let server = start_mock_server().await;
+    mount_message_response(
+        &server,
+        FIRST_HISTORY_PROMPT,
+        "numeric-history-1",
+        FIRST_HISTORY_REPLY,
+    )
+    .await;
+    mount_message_response(
+        &server,
+        FIRST_HISTORY_REPLY,
+        "numeric-compact-1",
+        FIRST_HISTORY_SUMMARY,
+    )
+    .await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": INITIAL_TASK,
+        "task_name": "worker",
+        "fork_turns": "1",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, INITIAL_PROMPT),
+        sse(vec![
+            ev_response_created("resp-numeric-spawn"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                COLLABORATION_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-numeric-spawn"),
+        ]),
+    )
+    .await;
+    let child_request = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_has_input_type(request, "agent_message") && body_contains(request, INITIAL_TASK)
+        },
+        sse(vec![
+            ev_response_created("resp-numeric-child"),
+            ev_assistant_message("msg-numeric-child", "numeric child complete"),
+            ev_completed("resp-numeric-child"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, SPAWN_CALL_ID)
+                && !request_has_input_type(request, "agent_message")
+        },
+        sse(vec![
+            ev_response_created("resp-numeric-root-complete"),
+            ev_assistant_message("msg-numeric-root-complete", "numeric worker spawned"),
+            ev_completed("resp-numeric-root-complete"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_history_mode(ThreadHistoryMode::Legacy)
+        .with_config(enable_multi_agent_v2_with_local_compaction);
+    let test = builder.build_with_auto_env(&server).await?;
+    let root_thread_id = test.session_configured.thread_id;
+    test.submit_turn(FIRST_HISTORY_PROMPT).await?;
+    submit_compact(&test.codex).await?;
+    test.submit_turn(INITIAL_PROMPT).await?;
+
+    let (worker_id, worker) = wait_for_spawned_worker(&test, root_thread_id).await?;
+    let worker_id = worker_id.to_string();
+    let request = child_request
+        .requests()
+        .into_iter()
+        .find(|request| request.header("thread-id").as_deref() == Some(worker_id.as_str()))
+        .expect("numeric child inference request");
+    assert!(request.body_contains_text(INITIAL_TASK));
+    assert!(!request.body_contains_text(FIRST_HISTORY_PROMPT));
+    worker.flush_rollout().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Result<()> {
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
