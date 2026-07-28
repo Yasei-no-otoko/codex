@@ -357,15 +357,16 @@ async fn validate_cutoff_bounds(
     }
     match history_mode {
         ThreadHistoryMode::Legacy => {
-            let last_complete_offset = super::legacy_fork::last_complete_jsonl_offset_at_or_before(
-                rollout_path,
-                end.end_byte_offset,
-            )
-            .await?;
+            let last_complete_offset =
+                super::legacy_fork::last_complete_rollout_envelope_offset_at_or_before(
+                    rollout_path,
+                    end.end_byte_offset,
+                )
+                .await?;
             if last_complete_offset != end.end_byte_offset {
                 return Err(malformed_lineage(
                     requested_thread_id,
-                    "cutoff byte offset is not at a complete JSONL record",
+                    "cutoff byte offset is not at a complete rollout envelope",
                 ));
             }
         }

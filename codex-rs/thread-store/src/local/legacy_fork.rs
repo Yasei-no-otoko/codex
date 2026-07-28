@@ -2,10 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use codex_protocol::protocol::HistoryPosition;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::ScanOutcome;
+use serde::Deserialize;
 
 use super::LocalThreadStore;
 use super::live_writer;
@@ -16,6 +16,21 @@ use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+
+/// The stable, outer shape of a persisted rollout line.
+///
+/// The nested payload intentionally remains an opaque JSON value. Rollouts can outlive the
+/// binary that wrote them, so a historical or newer item schema must not make an otherwise
+/// complete rollout envelope unusable as a byte-boundary marker.
+#[derive(Deserialize)]
+struct RolloutEnvelopeBoundary {
+    #[serde(rename = "timestamp")]
+    _timestamp: String,
+    #[serde(rename = "type")]
+    _item_type: String,
+    #[serde(rename = "payload")]
+    _payload: serde_json::Value,
+}
 
 /// Prepare a latest legacy fork without copying the source rollout.
 pub(super) async fn prepare(
@@ -115,7 +130,7 @@ pub(super) async fn prepare(
         .ok_or_else(|| ThreadStoreError::Internal {
             message: "fork lineage has no source segment".to_string(),
         })?;
-    let end_byte_offset = last_complete_jsonl_offset_at_or_before(
+    let end_byte_offset = last_complete_rollout_envelope_offset_at_or_before(
         source_segment.rollout_path.as_path(),
         flushed_file_len,
     )
@@ -136,12 +151,14 @@ pub(super) async fn prepare(
     ))
 }
 
-/// Return the offset immediately after the last newline at or before the flushed file length.
+/// Return the offset immediately after the last complete rollout envelope at or before the
+/// flushed file length.
 ///
 /// Rollout writers are process-local, so another app-server can leave a partial JSONL record at
 /// the tail while this process is taking a fork snapshot. Reading only through this boundary
-/// keeps the reference immutable and excludes that in-flight record.
-pub(super) async fn last_complete_jsonl_offset_at_or_before(
+/// keeps the reference immutable and excludes that in-flight record. The nested payload is kept
+/// opaque so schema evolution does not invalidate an otherwise complete historical record.
+pub(super) async fn last_complete_rollout_envelope_offset_at_or_before(
     path: &Path,
     max_file_len: u64,
 ) -> ThreadStoreResult<u64> {
@@ -179,7 +196,7 @@ pub(super) async fn last_complete_jsonl_offset_at_or_before(
         })?;
         loop {
             match scanner
-                .scan_next::<RolloutLine>()
+                .scan_next::<RolloutEnvelopeBoundary>()
                 .map_err(|err| ThreadStoreError::Internal {
                     message: format!("failed to scan source rollout {}: {err}", path.display()),
                 })? {
@@ -207,14 +224,14 @@ pub(super) async fn last_complete_jsonl_offset_at_or_before(
 }
 
 #[cfg(test)]
-pub(super) async fn last_complete_jsonl_offset(path: &Path) -> ThreadStoreResult<u64> {
+pub(super) async fn last_complete_rollout_envelope_offset(path: &Path) -> ThreadStoreResult<u64> {
     let file_len = tokio::fs::metadata(path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to stat source rollout {}: {err}", path.display()),
         })?
         .len();
-    last_complete_jsonl_offset_at_or_before(path, file_len).await
+    last_complete_rollout_envelope_offset_at_or_before(path, file_len).await
 }
 
 #[cfg(test)]
@@ -240,7 +257,7 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use super::last_complete_jsonl_offset;
+    use super::last_complete_rollout_envelope_offset;
     use crate::AppendThreadItemsParams;
     use crate::CreateThreadParams;
     use crate::DeleteThreadParams;
@@ -277,7 +294,7 @@ mod tests {
         contents.extend_from_slice(b"{\"partial\":");
         fs::write(&path, &contents).expect("write rollout");
 
-        let cutoff = last_complete_jsonl_offset(&path)
+        let cutoff = last_complete_rollout_envelope_offset(&path)
             .await
             .expect("cutoff should resolve");
         assert_eq!(cutoff, valid_rollout_line("complete").len() as u64 + 1);
@@ -292,10 +309,28 @@ mod tests {
         contents.extend_from_slice(b"{\"malformed\":true}\n");
         fs::write(&path, &contents).expect("write rollout");
 
-        let cutoff = last_complete_jsonl_offset(&path)
+        let cutoff = last_complete_rollout_envelope_offset(&path)
             .await
             .expect("cutoff should resolve");
         assert_eq!(cutoff, valid_rollout_line("complete").len() as u64 + 1);
+    }
+
+    #[tokio::test]
+    async fn accepts_complete_envelope_with_unknown_nested_payload_schema() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let mut contents = valid_rollout_line("complete");
+        contents.push(b'\n');
+        contents.extend_from_slice(
+            br#"{"timestamp":"2025-01-03T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":{"future_shape":[1,2,3]}}}}}"#,
+        );
+        contents.push(b'\n');
+        fs::write(&path, &contents).expect("write rollout");
+
+        let cutoff = last_complete_rollout_envelope_offset(&path)
+            .await
+            .expect("cutoff should accept an unknown nested payload schema");
+        assert_eq!(cutoff, contents.len() as u64);
     }
 
     #[tokio::test]
@@ -308,7 +343,7 @@ mod tests {
         contents.push(b'\n');
         fs::write(&path, &contents).expect("write rollout");
 
-        let cutoff = last_complete_jsonl_offset(&path)
+        let cutoff = last_complete_rollout_envelope_offset(&path)
             .await
             .expect("cutoff should resolve");
         assert_eq!(cutoff, contents.len() as u64);
