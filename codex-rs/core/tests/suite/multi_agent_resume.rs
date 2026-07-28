@@ -159,12 +159,29 @@ async fn wait_for_spawned_worker(
 
 async fn submit_compact(thread: &Arc<CodexThread>) -> Result<()> {
     let submission_id = thread.submit(Op::Compact).await?;
-    loop {
-        let event = thread.next_event().await?;
-        if event.id == submission_id && matches!(event.msg, EventMsg::TurnComplete(_)) {
-            break;
+    let completion = async {
+        loop {
+            let event = thread.next_event().await?;
+            if event.id != submission_id {
+                continue;
+            }
+            match event.msg {
+                EventMsg::TurnComplete(_) => break,
+                EventMsg::Error(error) => {
+                    anyhow::bail!("compaction failed: {}", error.message);
+                }
+                _ => {}
+            }
         }
-    }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(10), completion)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for compaction completion for submission {submission_id:?}"
+            )
+        })??;
     Ok(())
 }
 
