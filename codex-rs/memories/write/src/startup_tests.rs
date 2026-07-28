@@ -35,6 +35,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_state::Phase2JobClaimOutcome;
 use codex_utils_absolute_path::test_support::PathExt;
+use codex_utils_output_truncation::approx_token_count;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -472,7 +473,18 @@ async fn memories_phase1_samples_reference_child_prefix_and_delta_only() -> anyh
     phase1::run(context, config).await;
 
     let request = wait_for_single_request(&response).await;
-    let prompt = request.message_input_texts("user").join("\n");
+    let user_texts = request.message_input_texts("user");
+    assert_eq!(
+        user_texts.len(),
+        1,
+        "phase-1 should send one user InputText"
+    );
+    let prompt = &user_texts[0];
+    assert!(
+        approx_token_count(prompt) <= crate::stage_one::MAX_INPUT_ITEM_TOKENS,
+        "phase-1 user InputText exceeded the hard item cap: {} tokens",
+        approx_token_count(prompt)
+    );
     assert!(
         prompt.contains("parent prefix before fork"),
         "phase-1 prompt should include the bounded inherited prefix: {prompt}"
@@ -893,7 +905,11 @@ async fn write_reference_memory_rollouts(
     let parent_meta = memory_session_meta_line(
         codex_home, parent_id, &timestamp, /*forked_from_id*/ None, /*history_base*/ None,
     );
-    let parent_prefix = memory_response_line(&timestamp, "parent prefix before fork");
+    let parent_prefix_text = format!(
+        "parent prefix before fork head marker {}",
+        "x".repeat(100_000)
+    );
+    let parent_prefix = memory_response_line(&timestamp, &parent_prefix_text);
     let parent_append = memory_response_line(&timestamp, "parent append after fork");
     let parent_head = format!(
         "{}\n{}\n",
