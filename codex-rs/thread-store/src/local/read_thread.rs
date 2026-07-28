@@ -362,21 +362,14 @@ async fn persist_legacy_summary_to_state_db(store: &LocalThreadStore, thread: &S
     let Some(state_db) = store.state_db().await else {
         return;
     };
-    let Ok(Some(mut metadata)) = state_db.get_thread(thread.thread_id).await else {
-        return;
-    };
-    let mut changed = false;
-    if !thread.preview.is_empty() && metadata.preview.as_deref() != Some(thread.preview.as_str()) {
-        metadata.preview = Some(thread.preview.clone());
-        changed = true;
-    }
-    if let Some(first_user_message) = thread.first_user_message.as_ref()
-        && metadata.first_user_message.as_ref() != Some(first_user_message)
+    if let Err(err) = state_db
+        .update_thread_summary_if_empty(
+            thread.thread_id,
+            (!thread.preview.is_empty()).then_some(thread.preview.as_str()),
+            thread.first_user_message.as_deref(),
+        )
+        .await
     {
-        metadata.first_user_message = Some(first_user_message.clone());
-        changed = true;
-    }
-    if changed && let Err(err) = state_db.upsert_thread(&metadata).await {
         warn!(
             "failed to persist reference-backed summary for {}: {err}",
             thread.thread_id

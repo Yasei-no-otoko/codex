@@ -136,6 +136,53 @@ WHERE id = ? AND preview = ''
         Ok(result.rows_affected() > 0)
     }
 
+    /// Fill missing display-summary fields without replacing any other thread metadata.
+    ///
+    /// Reference-backed rollout recovery can derive a preview and first user message from
+    /// history after the state row was written. Keep that repair as one targeted SQL update so
+    /// it cannot write a stale snapshot over a concurrent archive or metadata update.
+    pub async fn update_thread_summary_if_empty(
+        &self,
+        thread_id: ThreadId,
+        preview: Option<&str>,
+        first_user_message: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let preview = preview.map(str::trim).filter(|value| !value.is_empty());
+        let first_user_message = first_user_message
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if preview.is_none() && first_user_message.is_none() {
+            return Ok(false);
+        }
+
+        let result = sqlx::query(
+            r#"
+UPDATE threads
+SET
+    preview = CASE WHEN preview = '' AND ? IS NOT NULL THEN ? ELSE preview END,
+    first_user_message = CASE
+        WHEN first_user_message = '' AND ? IS NOT NULL THEN ?
+        ELSE first_user_message
+    END
+WHERE id = ?
+  AND (
+      (preview = '' AND ? IS NOT NULL)
+      OR (first_user_message = '' AND ? IS NOT NULL)
+  )
+            "#,
+        )
+        .bind(preview)
+        .bind(preview)
+        .bind(first_user_message)
+        .bind(first_user_message)
+        .bind(thread_id.to_string())
+        .bind(preview)
+        .bind(first_user_message)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Persist or replace the directional parent-child edge for a spawned thread.
     pub async fn upsert_thread_spawn_edge(
         &self,
@@ -2838,6 +2885,76 @@ mod tests {
             .expect("thread should load")
             .expect("thread should exist");
         assert_eq!(persisted.preview.as_deref(), Some("goal preview"));
+    }
+
+    #[tokio::test]
+    async fn update_thread_summary_if_empty_preserves_concurrent_metadata() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000461").expect("valid thread id");
+        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        metadata.preview = None;
+        metadata.first_user_message = None;
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+
+        // Simulate a metadata/archive writer landing after a summary reader loaded its row.
+        let mut concurrent_metadata = metadata;
+        concurrent_metadata.rollout_path = codex_home.join("sessions/updated-rollout.jsonl");
+        concurrent_metadata.title = "updated title".to_string();
+        concurrent_metadata.model_provider = "updated-provider".to_string();
+        concurrent_metadata.model = Some("updated-model".to_string());
+        concurrent_metadata.tokens_used = 42;
+        concurrent_metadata.archived_at = Some(Utc::now());
+        runtime
+            .upsert_thread(&concurrent_metadata)
+            .await
+            .expect("concurrent metadata upsert should succeed");
+
+        let updated = runtime
+            .update_thread_summary_if_empty(
+                thread_id,
+                Some(" recovered preview "),
+                Some(" recovered first message "),
+            )
+            .await
+            .expect("summary update should succeed");
+        assert!(updated);
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.rollout_path, concurrent_metadata.rollout_path);
+        assert_eq!(persisted.title, "updated title");
+        assert_eq!(persisted.model_provider, "updated-provider");
+        assert_eq!(persisted.model.as_deref(), Some("updated-model"));
+        assert_eq!(persisted.tokens_used, 42);
+        assert!(persisted.archived_at.is_some());
+        assert_eq!(persisted.preview.as_deref(), Some("recovered preview"));
+        assert_eq!(
+            persisted.first_user_message.as_deref(),
+            Some("recovered first message")
+        );
+
+        let overwritten = runtime
+            .update_thread_summary_if_empty(
+                thread_id,
+                Some("new preview"),
+                Some("new first message"),
+            )
+            .await
+            .expect("summary overwrite attempt should succeed");
+        assert!(!overwritten);
     }
 
     #[tokio::test]
