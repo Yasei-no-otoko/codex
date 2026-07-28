@@ -1350,21 +1350,59 @@ impl ThreadManagerState {
         thread_id: ThreadId,
         include_archived: bool,
     ) -> CodexResult<Vec<RolloutItem>> {
-        let stored_thread = self
-            .read_stored_thread(ReadThreadParams {
+        // `read_thread(include_history = true)` intentionally rejects Paginated history. Ask the
+        // store's model-context loader only for that representation: LocalThreadStore resolves
+        // the complete frozen lineage (including a reference child's inherited prefix) instead
+        // of reading the child's physical suffix in isolation. Legacy stores retain their
+        // complete-history path below.
+        match self
+            .thread_store
+            .read_thread(ReadThreadParams {
                 thread_id,
                 include_archived,
                 include_history: true,
             })
-            .await?;
-        stored_thread
-            .history
-            .map(|history| history.items)
-            .ok_or_else(|| {
-                CodexErr::Fatal(format!(
-                    "stored thread {thread_id} did not include persisted history"
-                ))
-            })
+            .await
+        {
+            Ok(stored_thread) => stored_thread
+                .history
+                .map(|history| history.items)
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "stored thread {thread_id} did not include persisted history"
+                    ))
+                }),
+            Err(ThreadStoreError::Unsupported {
+                operation: "paginated_threads",
+            }) => self
+                .thread_store
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived,
+                })
+                .await
+                .map(|context| context.items)
+                .map_err(|err| match err {
+                    ThreadStoreError::ThreadNotFound { thread_id } => {
+                        CodexErr::ThreadNotFound(thread_id)
+                    }
+                    ThreadStoreError::InvalidRequest { message } => {
+                        CodexErr::InvalidRequest(message)
+                    }
+                    err => CodexErr::Fatal(format!(
+                        "failed to load paginated model context for {thread_id}: {err}"
+                    )),
+                }),
+            Err(ThreadStoreError::ThreadNotFound { thread_id }) => {
+                Err(CodexErr::ThreadNotFound(thread_id))
+            }
+            Err(ThreadStoreError::InvalidRequest { message }) => Err(CodexErr::Fatal(format!(
+                "failed to read stored thread {thread_id}: invalid thread-store request: {message}"
+            ))),
+            Err(err) => Err(CodexErr::Fatal(format!(
+                "failed to read stored thread {thread_id}: {err}"
+            ))),
+        }
     }
 
     /// Prefer a loaded conversation's pre-held history path. Cold reads use the thread-store's
