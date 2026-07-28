@@ -140,7 +140,7 @@ pub(super) async fn list_rollout_threads(
     sort_key: codex_rollout::ThreadSortKey,
     sort_direction: codex_rollout::SortDirection,
 ) -> ThreadStoreResult<codex_rollout::ThreadsPage> {
-    if params.relation_filter.is_some() || params.is_pinned.is_some() {
+    if params.relation_filter.is_some() || params.section.is_some() {
         let relation_filter = params
             .relation_filter
             .map(|relation_filter| match relation_filter {
@@ -163,7 +163,7 @@ pub(super) async fn list_rollout_threads(
             params.cwd_filters.as_deref(),
             relation_filter,
             params.archived,
-            params.is_pinned,
+            params.section.as_ref().map(Option::as_deref),
             params.search_term.as_deref(),
         )
         .await
@@ -286,7 +286,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: None,
@@ -352,7 +352,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: Some("needle".to_string()),
                 relation_filter: None,
@@ -448,7 +448,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: Some(ThreadRelationFilter::DirectChildrenOf(parent_id)),
@@ -467,7 +467,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: None,
@@ -541,7 +541,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: Some("canonical".to_string()),
                 relation_filter: None,
@@ -578,7 +578,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: None,
@@ -595,7 +595,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: true,
                 search_term: None,
                 relation_filter: None,
@@ -648,7 +648,7 @@ mod tests {
                 allowed_sources: vec![SessionSource::Cli],
                 model_providers: Some(vec!["test-provider".to_string()]),
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: None,
@@ -686,7 +686,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: None,
