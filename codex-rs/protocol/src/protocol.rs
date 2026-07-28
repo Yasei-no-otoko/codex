@@ -3107,8 +3107,11 @@ pub struct SessionMeta {
     /// Exclusive prefix of another rollout inherited by this thread. Legacy
     /// references use a zero ordinal sentinel and rely on the byte offset as
     /// the authoritative cutoff; paginated references use both fields. Legacy
-    /// reference children require a binary that understands `history_base`; mixed
-    /// old/new binaries sharing one CODEX_HOME are not supported.
+    /// Reference children require a binary that understands `history_base`. This is a
+    /// persistence-format boundary: rolling back to a binary predating this field while
+    /// retaining the same CODEX_HOME is unsupported because that binary can resume only the
+    /// child's local suffix and silently omit its inherited history. Upgrade to a compatible
+    /// binary (or use a separate CODEX_HOME) before resuming reference-backed children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_base: Option<HistoryPosition>,
     /// Optional durable summary for reference-backed legacy children. Unlike inherited rollout
