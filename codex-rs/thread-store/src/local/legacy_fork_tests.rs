@@ -299,6 +299,55 @@ async fn legacy_latest_rejects_external_compressed_reference_without_materializi
 }
 
 #[tokio::test]
+async fn external_legacy_root_uses_copied_history_fallback_for_pathless_latest_fork()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let config = test_config(home.path());
+    let runtime = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await?;
+    let source_uuid = Uuid::from_u128(711);
+    let source_id = ThreadId::from_string(&source_uuid.to_string())?;
+    let source_path = write_session_file_with_fork(
+        external.path(),
+        external.path().join("sessions/2025/01/03"),
+        "2025-01-03T12-11-00",
+        source_uuid,
+        "external legacy root",
+        Some("test-provider"),
+        None,
+        ThreadHistoryMode::Legacy,
+    )?;
+    let mut builder = ThreadMetadataBuilder::new(
+        source_id,
+        source_path.clone(),
+        Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.history_mode = ThreadHistoryMode::Legacy;
+    builder.model_provider = Some(config.default_model_provider_id.clone());
+    builder.cwd = home.path().to_path_buf();
+    runtime
+        .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+        .await?;
+
+    let store = LocalThreadStore::new(config, Some(runtime));
+    let error = store
+        .prepare_fork(PrepareForkParams {
+            thread_id: source_id,
+            boundary: ForkBoundary::Latest,
+        })
+        .await
+        .expect_err("external legacy root must not enter reference preparation");
+    assert!(matches!(error, ThreadStoreError::Unsupported { .. }));
+    assert!(source_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_legacy_prepare_reuses_recorder_lock_and_freezes_cutoff()
 -> Result<(), Box<dyn std::error::Error>> {
     let home = TempDir::new()?;

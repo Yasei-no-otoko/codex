@@ -65,6 +65,7 @@ use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
 use codex_rollout::read_session_meta_line;
 use codex_state::StateRuntime;
+use codex_state::ThreadMetadataBuilder;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -373,6 +374,83 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
         ThreadId::from_string(&conversation_id)?
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_pathless_external_legacy_root_copies_history() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let external_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let source_marker = "external legacy parent marker";
+    let source_id = create_fake_rollout(
+        external_home.path(),
+        "2025-01-05T13-00-00",
+        "2025-01-05T13:00:00Z",
+        source_marker,
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let source_thread_id = ThreadId::from_string(&source_id)?;
+    let source_path = rollout_path(external_home.path(), "2025-01-05T13-00-00", &source_id);
+
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
+    let mut metadata_builder = ThreadMetadataBuilder::new(
+        source_thread_id,
+        source_path.clone(),
+        chrono::Utc::now(),
+        SessionSource::Cli.into(),
+    );
+    metadata_builder.history_mode = ThreadHistoryMode::Legacy.into();
+    metadata_builder.model_provider = Some("mock_provider".to_string());
+    metadata_builder.cwd = codex_home.path().to_path_buf();
+    let mut metadata = metadata_builder.build("mock_provider");
+    metadata.preview = Some(source_marker.to_string());
+    metadata.first_user_message = Some(source_marker.to_string());
+    state_db.upsert_thread(&metadata).await?;
+    drop(state_db);
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread: child, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    assert_eq!(child.forked_from_id, Some(source_id.clone()));
+    assert_eq!(
+        child.turns.len(),
+        1,
+        "copied fallback should replay source history"
+    );
+    assert!(matches!(
+        &child.turns[0].items[0],
+        ThreadItem::UserMessage { content, .. }
+            if content == &vec![UserInput::Text {
+                text: source_marker.to_string(),
+                text_elements: Vec::new(),
+            }]
+    ));
+    let child_path = child.path.expect("persistent copied fork path");
+    let child_meta = read_session_meta_line(child_path.as_path()).await?;
+    assert_eq!(
+        child_meta.meta.history_base, None,
+        "copied fallback should produce a self-contained child"
+    );
+    assert!(source_path.exists(), "external source must remain readable");
     Ok(())
 }
 

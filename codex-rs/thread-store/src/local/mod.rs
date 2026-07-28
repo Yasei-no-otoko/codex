@@ -478,28 +478,40 @@ impl ThreadStore for LocalThreadStore {
                 Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
                 Err(err) => return Err(err),
             }
-            let source_meta =
-                match read_thread::resolve_rollout_path(self, params.thread_id, true).await? {
-                    Some(path) => Some(
-                        codex_rollout::read_session_meta_line(path.as_path())
-                            .await
-                            .map_err(|err| ThreadStoreError::Internal {
-                                message: format!(
-                                    "failed to read fork source metadata {}: {err}",
-                                    path.display()
-                                ),
-                            })?,
-                    ),
-                    None => None,
-                };
-            let Some(source_meta) = source_meta else {
+            let Some(source_path) =
+                read_thread::resolve_rollout_path(self, params.thread_id, true).await?
+            else {
                 return Err(ThreadStoreError::ThreadNotFound {
                     thread_id: params.thread_id,
                 });
             };
+            let source_meta = codex_rollout::read_session_meta_line(source_path.as_path())
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to read fork source metadata {}: {err}",
+                        source_path.display()
+                    ),
+                })?;
             if matches!(&params.boundary, crate::ForkBoundary::Latest)
                 && source_meta.meta.history_mode == ThreadHistoryMode::Legacy
             {
+                // Pathless latest forks of supported external legacy roots must retain the
+                // historical copied-history fallback in app-server. Reference preparation
+                // requires a managed source so that lineage cannot splice arbitrary files.
+                if !read_thread::rollout_path_is_managed(self, source_path.as_path()).await {
+                    if source_meta.meta.history_base.is_some() {
+                        return Err(ThreadStoreError::InvalidRequest {
+                            message: format!(
+                                "reference rollout for thread {} must resolve to its managed Codex home path",
+                                params.thread_id
+                            ),
+                        });
+                    }
+                    return Err(ThreadStoreError::Unsupported {
+                        operation: "external legacy latest fork",
+                    });
+                }
                 return legacy_fork::prepare(self, params, source_guards).await;
             }
             if source_meta.meta.history_mode != ThreadHistoryMode::Paginated {
@@ -2220,8 +2232,8 @@ mod tests {
                 boundary: crate::ForkBoundary::Latest,
             })
             .await
-            .expect_err("external rollouts cannot be referenced by thread id");
-        assert!(error.to_string().contains("must be in Codex home"));
+            .expect_err("external latest forks should use the copied-history fallback");
+        assert!(matches!(error, ThreadStoreError::Unsupported { .. }));
     }
 
     #[tokio::test]
