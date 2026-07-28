@@ -29,7 +29,7 @@ struct RolloutEnvelopeBoundary {
     #[serde(rename = "type")]
     _item_type: String,
     #[serde(rename = "payload")]
-    _payload: serde_json::Value,
+    _payload: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Prepare a latest legacy fork without copying the source rollout.
@@ -331,6 +331,30 @@ mod tests {
             .await
             .expect("cutoff should accept an unknown nested payload schema");
         assert_eq!(cutoff, contents.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_object_envelope_payloads() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let complete = valid_rollout_line("complete");
+        for payload in ["null", "[]"] {
+            let mut contents = complete.clone();
+            contents.push(b'\n');
+            contents.extend_from_slice(
+                format!(
+                    r#"{{"timestamp":"2025-01-03T12:00:01Z","type":"event_msg","payload":{payload}}}"#
+                )
+                .as_bytes(),
+            );
+            contents.push(b'\n');
+            fs::write(&path, &contents).expect("write rollout");
+
+            let cutoff = last_complete_rollout_envelope_offset(&path)
+                .await
+                .expect("cutoff should resolve");
+            assert_eq!(cutoff, complete.len() as u64 + 1);
+        }
     }
 
     #[tokio::test]
