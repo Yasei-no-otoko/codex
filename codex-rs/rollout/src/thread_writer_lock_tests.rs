@@ -6,8 +6,8 @@ use uuid::Uuid;
 #[test]
 fn same_coordinator_operations_conflict_in_both_directions() -> std::io::Result<()> {
     let home = TempDir::new()?;
-    let thread_id = ThreadId::from_string(&Uuid::from_u128(901).to_string())
-        .map_err(std::io::Error::other)?;
+    let thread_id =
+        ThreadId::from_string(&Uuid::from_u128(901).to_string()).map_err(std::io::Error::other)?;
     let coordinator = std::sync::Arc::new(ThreadWriterLockCoordinator::new(home.path()));
     let normal_guard = coordinator.acquire(thread_id)?;
     let maintenance_attempt = match coordinator.acquire(thread_id) {
