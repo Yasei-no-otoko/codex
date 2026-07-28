@@ -272,12 +272,8 @@ async fn legacy_latest_rejects_external_compressed_reference_without_materializi
     let compressed_path = compress_session_file(&plain_path)?;
     let compressed_before = fs::read(&compressed_path)?;
 
-    let mut builder = ThreadMetadataBuilder::new(
-        child_id,
-        plain_path.clone(),
-        Utc::now(),
-        SessionSource::Cli,
-    );
+    let mut builder =
+        ThreadMetadataBuilder::new(child_id, plain_path.clone(), Utc::now(), SessionSource::Cli);
     builder.history_mode = ThreadHistoryMode::Legacy;
     builder.model_provider = Some(config.default_model_provider_id.clone());
     builder.cwd = home.path().to_path_buf();
@@ -563,10 +559,7 @@ async fn nested_legacy_reference_replay_and_model_context_are_cutoff_aware()
     Ok(())
 }
 
-async fn append_user_message(
-    path: &Path,
-    message: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn append_user_message(path: &Path, message: &str) -> Result<(), Box<dyn std::error::Error>> {
     let line = serde_json::to_string(&codex_protocol::protocol::RolloutLine {
         timestamp: "2025-01-03T12:03:00Z".to_string(),
         ordinal: None,
