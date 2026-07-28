@@ -307,7 +307,52 @@ async fn legacy_cutoff_rejects_newline_terminated_malformed_tail() {
     )
     .await
     .expect_err("legacy cutoff must reject malformed tail");
-    assert!(err.to_string().contains("complete JSONL record"), "{err}");
+    assert!(
+        err.to_string().contains("complete rollout envelope"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_cutoff_accepts_unknown_nested_payload_schema() {
+    let home = TempDir::new().expect("temp dir");
+    let root = ThreadId::default();
+    let root_path = write_rollout(
+        home.path(),
+        root,
+        /*history_base*/ None,
+        /*next_ordinal*/ 2,
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("open root rollout")
+        .write_all(
+            br#"{"timestamp":"2026-07-16T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":{"future_shape":[1,2,3]}}}}}"#,
+        )
+        .expect("append schema-evolved envelope");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("reopen root rollout")
+        .write_all(b"\n")
+        .expect("terminate schema-evolved envelope");
+    let cutoff = fs::metadata(root_path.as_path())
+        .expect("root metadata")
+        .len();
+
+    super::validate_cutoff_bounds(
+        root,
+        root_path.as_path(),
+        &HistoryPosition {
+            thread_id: root,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: cutoff,
+        },
+        ThreadHistoryMode::Legacy,
+    )
+    .await
+    .expect("legacy cutoff should accept a complete envelope with an unknown payload schema");
 }
 
 async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, detail: &str) {
