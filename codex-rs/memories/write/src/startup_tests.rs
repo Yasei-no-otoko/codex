@@ -503,6 +503,179 @@ async fn memories_phase1_samples_reference_child_prefix_and_delta_only() -> anyh
 }
 
 #[tokio::test]
+async fn memories_phase1_reads_paginated_rollout_history_for_sampling() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex(&server, Arc::clone(&home)).await?;
+    let db = test
+        .codex
+        .state_db()
+        .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory sampling test"))?;
+    let thread_id = ThreadId::new();
+    let updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    let timestamp = updated_at.to_rfc3339();
+    let day_dir = home.path().join("sessions/2025/01/04");
+    tokio::fs::create_dir_all(&day_dir).await?;
+    let rollout_path = day_dir.join(format!("rollout-2025-01-04T12-00-00-{thread_id}.jsonl"));
+    let mut metadata_line = memory_session_meta_line(
+        home.path(),
+        thread_id,
+        &timestamp,
+        /*forked_from_id*/ None,
+        /*history_base*/ None,
+    );
+    if let RolloutItem::SessionMeta(session_meta) = &mut metadata_line.item {
+        session_meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    }
+    let user_line = memory_response_line(&timestamp, "paginated memory input marker");
+    tokio::fs::write(
+        &rollout_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&metadata_line)?,
+            serde_json::to_string(&user_line)?
+        ),
+    )
+    .await?;
+
+    let mut metadata_builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        rollout_path,
+        updated_at,
+        SessionSource::Cli,
+    );
+    metadata_builder.updated_at = Some(updated_at);
+    metadata_builder.recency_at = Some(updated_at);
+    metadata_builder.cwd = home.path().to_path_buf();
+    metadata_builder.model_provider = Some("test-provider".to_string());
+    metadata_builder.history_mode = ThreadHistoryMode::Paginated;
+    let mut metadata = metadata_builder.build("test-provider");
+    metadata.history_mode = ThreadHistoryMode::Paginated;
+    metadata.preview = Some("paginated memory input marker".to_string());
+    db.upsert_thread(&metadata).await?;
+    db.set_thread_memory_mode(thread_id, "enabled").await?;
+
+    let response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-paginated-memory"),
+            ev_assistant_message(
+                "msg-paginated-memory",
+                r#"{"raw_memory":"raw memory","rollout_summary":"paginated summary","rollout_slug":"paginated"}"#,
+            ),
+            ev_completed("resp-paginated-memory"),
+        ]),
+    )
+    .await;
+    let provider = Arc::new(MockMemoryModelProvider::new(
+        test.config.model_provider.clone(),
+        Some(test.thread_manager.auth_manager()),
+    ));
+    let (context, config) = memory_startup_context_with_provider(&test, provider).await;
+    phase1::run(context, config).await;
+
+    let request = wait_for_single_request(&response).await;
+    let prompt = &request.message_input_texts("user")[0];
+    assert!(
+        prompt.contains("paginated memory input marker"),
+        "phase-1 prompt should preserve paginated rollout input: {prompt}"
+    );
+
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn memories_phase1_samples_paginated_reference_child_prefix_and_delta_only()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex(&server, Arc::clone(&home)).await?;
+    let db = test
+        .codex
+        .state_db()
+        .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory sampling test"))?;
+    let parent_id = ThreadId::new();
+    let child_id = ThreadId::new();
+    let updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    let (parent_path, child_path) =
+        write_paginated_reference_memory_rollouts(home.path(), parent_id, child_id, updated_at)
+            .await?;
+
+    for (thread_id, rollout_path) in [(parent_id, parent_path), (child_id, child_path)] {
+        let mut metadata_builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            updated_at,
+            SessionSource::Cli,
+        );
+        metadata_builder.updated_at = Some(updated_at);
+        metadata_builder.recency_at = Some(updated_at);
+        metadata_builder.cwd = home.path().to_path_buf();
+        metadata_builder.model_provider = Some("test-provider".to_string());
+        let mut metadata = metadata_builder.build("test-provider");
+        metadata.history_mode = ThreadHistoryMode::Paginated;
+        db.upsert_thread(&metadata).await?;
+    }
+    for (thread_id, preview) in [
+        (parent_id, "paginated parent memory source"),
+        (child_id, "paginated child memory source"),
+    ] {
+        db.set_thread_preview_if_empty(thread_id, preview).await?;
+    }
+    db.set_thread_memory_mode(parent_id, "disabled").await?;
+    db.set_thread_memory_mode(child_id, "enabled").await?;
+
+    let response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-paginated-reference-memory"),
+            ev_assistant_message(
+                "msg-paginated-reference-memory",
+                r#"{"raw_memory":"raw memory","rollout_summary":"paginated reference summary","rollout_slug":"paginated-reference-child"}"#,
+            ),
+            ev_completed("resp-paginated-reference-memory"),
+        ]),
+    )
+    .await;
+    let provider = Arc::new(MockMemoryModelProvider::new(
+        test.config.model_provider.clone(),
+        Some(test.thread_manager.auth_manager()),
+    ));
+    let (context, config) = memory_startup_context_with_provider(&test, provider).await;
+    phase1::run(context, config).await;
+
+    let request = wait_for_single_request(&response).await;
+    let user_texts = request.message_input_texts("user");
+    assert_eq!(
+        user_texts.len(),
+        1,
+        "phase-1 should send one user InputText"
+    );
+    let prompt = &user_texts[0];
+    assert!(
+        approx_token_count(prompt) <= crate::stage_one::MAX_INPUT_ITEM_TOKENS,
+        "phase-1 user InputText exceeded the hard item cap: {} tokens",
+        approx_token_count(prompt)
+    );
+    assert!(
+        prompt.contains("paginated parent prefix before fork"),
+        "phase-1 prompt should include the bounded inherited paginated prefix: {prompt}"
+    );
+    assert!(
+        prompt.contains("paginated child delta after fork"),
+        "phase-1 prompt should include the paginated child delta: {prompt}"
+    );
+    assert!(
+        !prompt.contains("paginated parent append after fork"),
+        "phase-1 prompt must exclude paginated parent writes after the fork boundary: {prompt}"
+    );
+
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn memories_startup_phase1_provider_default_drives_request_model() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
@@ -947,6 +1120,78 @@ async fn write_reference_memory_rollouts(
     Ok((parent_path, child_path))
 }
 
+async fn write_paginated_reference_memory_rollouts(
+    codex_home: &Path,
+    parent_id: ThreadId,
+    child_id: ThreadId,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let day_dir = codex_home.join("sessions/2025/01/04");
+    tokio::fs::create_dir_all(&day_dir).await?;
+    let timestamp = updated_at.to_rfc3339();
+    let filename_timestamp = "2025-01-04T12-00-00";
+    let parent_path = day_dir.join(format!("rollout-{filename_timestamp}-{parent_id}.jsonl"));
+    let child_path = day_dir.join(format!("rollout-{filename_timestamp}-{child_id}.jsonl"));
+
+    let mut parent_meta = memory_session_meta_line(
+        codex_home, parent_id, &timestamp, /*forked_from_id*/ None, /*history_base*/ None,
+    );
+    if let RolloutItem::SessionMeta(session_meta) = &mut parent_meta.item {
+        session_meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    }
+    let parent_prefix = memory_response_line_with_ordinal(
+        &timestamp,
+        "paginated parent prefix before fork head marker ".to_string() + &"x".repeat(100_000),
+        1,
+    );
+    let parent_append =
+        memory_response_line_with_ordinal(&timestamp, "paginated parent append after fork", 2);
+    let parent_head = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&parent_meta)?,
+        serde_json::to_string(&parent_prefix)?
+    );
+    let source_cutoff = parent_head.as_bytes().len() as u64;
+    tokio::fs::write(
+        &parent_path,
+        format!(
+            "{}{}\n",
+            parent_head,
+            serde_json::to_string(&parent_append)?
+        ),
+    )
+    .await?;
+
+    let history_base = HistoryPosition {
+        thread_id: parent_id,
+        end_ordinal_exclusive: 2,
+        end_byte_offset: source_cutoff,
+    };
+    let mut child_meta = memory_session_meta_line(
+        codex_home,
+        child_id,
+        &timestamp,
+        Some(parent_id),
+        Some(history_base),
+    );
+    if let RolloutItem::SessionMeta(session_meta) = &mut child_meta.item {
+        session_meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    }
+    let child_delta =
+        memory_response_line_with_ordinal(&timestamp, "paginated child delta after fork", 3);
+    tokio::fs::write(
+        &child_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&child_meta)?,
+            serde_json::to_string(&child_delta)?
+        ),
+    )
+    .await?;
+
+    Ok((parent_path, child_path))
+}
+
 fn memory_session_meta_line(
     codex_home: &Path,
     thread_id: ThreadId,
@@ -989,6 +1234,16 @@ fn memory_response_line(timestamp: &str, text: &str) -> RolloutLine {
             internal_chat_message_metadata_passthrough: None,
         }),
     }
+}
+
+fn memory_response_line_with_ordinal<T: AsRef<str>>(
+    timestamp: &str,
+    text: T,
+    ordinal: u64,
+) -> RolloutLine {
+    let mut line = memory_response_line(timestamp, text.as_ref());
+    line.ordinal = Some(ordinal);
+    line
 }
 
 async fn wait_for_single_request(mock: &ResponseMock) -> ResponsesRequest {
