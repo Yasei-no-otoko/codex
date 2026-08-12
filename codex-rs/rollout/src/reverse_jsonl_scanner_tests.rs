@@ -80,7 +80,9 @@ fn skips_records_over_the_configured_limit() -> std::io::Result<()> {
     let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?
         .with_max_record_bytes(/*max_record_bytes*/ 32);
 
-    assert_records(&mut scanner, &["third", "first"])
+    assert_records(&mut scanner, &["third", "first"])?;
+    assert!(scanner.skipped_oversized_record());
+    Ok(())
 }
 
 #[test]

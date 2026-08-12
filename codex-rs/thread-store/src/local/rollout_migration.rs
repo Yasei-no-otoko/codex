@@ -72,6 +72,7 @@ use telemetry::RolloutMigrationTrigger;
 
 const PROJECTION_BATCH_BYTES: u64 = 256 * 1024;
 const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
+const OVERSIZED_ROLLOUT_RECORD_MESSAGE: &str = "rollout contains an oversized JSONL record";
 
 enum CanonicalizationAttempt {
     Complete {
@@ -1209,7 +1210,7 @@ async fn read_rollout_record(
     bytes: &mut Vec<u8>,
 ) -> ThreadStoreResult<Option<RolloutRecord>> {
     bytes.clear();
-    let mut byte_count = reader
+    let byte_count = reader
         .take((MAX_ROLLOUT_LINE_BYTES + 1) as u64)
         .read_until(b'\n', bytes)
         .await
@@ -1218,26 +1219,7 @@ async fn read_rollout_record(
         return Ok(None);
     }
     if byte_count > MAX_ROLLOUT_LINE_BYTES {
-        // Some historical tool outputs are too large to migrate safely in memory. Discard the
-        // whole record, including any unread suffix.
-        while bytes.last() != Some(&b'\n') {
-            bytes.clear();
-            let chunk_bytes = reader
-                .take((MAX_ROLLOUT_LINE_BYTES + 1) as u64)
-                .read_until(b'\n', bytes)
-                .await
-                .map_err(migration_error)?;
-            if chunk_bytes == 0 {
-                break;
-            }
-            byte_count = byte_count
-                .checked_add(chunk_bytes)
-                .ok_or_else(|| migration_error("rollout record byte count overflow"))?;
-        }
-        return Ok(Some(RolloutRecord {
-            line: None,
-            byte_count: byte_count as u64,
-        }));
+        return Err(migration_error(OVERSIZED_ROLLOUT_RECORD_MESSAGE));
     }
     // Legacy records do not have ordinals, so malformed complete records cannot be repaired.
     // Skip them and let the next newline-delimited record resynchronize the stream.

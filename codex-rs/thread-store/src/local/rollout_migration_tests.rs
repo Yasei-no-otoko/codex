@@ -250,6 +250,68 @@ fn completed(turn_id: &str) -> RolloutItem {
     }))
 }
 
+fn bounded_subagent_items(home: &Path) -> Vec<RolloutItem> {
+    vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "superseded checkpoint".repeat(1024),
+            replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: "latest checkpoint".to_string(),
+            replacement_history: Some(vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "latest compacted context".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ]),
+            mcp_resource_origins: None,
+            window_number: Some(2),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        started("child-turn"),
+        RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some("child-turn".to_string()),
+            cwd: serde_json::from_value(json!(home)).expect("absolute cwd"),
+            workspace_roots: None,
+            current_date: None,
+            timezone: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            active_permission_profile: None,
+            network: None,
+            file_system_sandbox_policy: None,
+            model: "test-model".to_string(),
+            comp_hash: None,
+            personality: None,
+            collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
+            realtime_active: None,
+            cyber_access_program: None,
+            effort: None,
+            summary: ReasoningSummary::Auto,
+        }),
+        user_message("child question"),
+        agent_message("child answer"),
+        completed("child-turn"),
+    ]
+}
+
 fn read_rollout(path: &Path) -> Vec<RolloutLine> {
     fs::read_to_string(path)
         .expect("read migrated rollout")
@@ -1402,65 +1464,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
         home.path(),
         thread_id,
         SessionSource::SubAgent(SubAgentSource::Other("test".to_string())),
-        vec![
-            RolloutItem::Compacted(CompactedItem {
-                message: "superseded checkpoint".repeat(1024),
-                replacement_history: Some(Vec::new()),
-                mcp_resource_origins: None,
-                window_number: Some(1),
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
-            }),
-            RolloutItem::Compacted(CompactedItem {
-                message: "latest checkpoint".to_string(),
-                replacement_history: Some(vec![
-                    ResponseItem::Message {
-                        id: None,
-                        role: "user".to_string(),
-                        content: vec![ContentItem::InputText {
-                            text: "latest compacted context".to_string(),
-                        }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    }
-                    .into(),
-                ]),
-                mcp_resource_origins: None,
-                window_number: Some(2),
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
-            }),
-            started("child-turn"),
-            RolloutItem::TurnContext(TurnContextItem {
-                turn_id: Some("child-turn".to_string()),
-                cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
-                approval_policy: AskForApproval::Never,
-                approvals_reviewer: None,
-                sandbox_policy: SandboxPolicy::new_read_only_policy(),
-                permission_profile: None,
-                active_permission_profile: None,
-                network: None,
-                file_system_sandbox_policy: None,
-                model: "test-model".to_string(),
-                comp_hash: None,
-                personality: None,
-                collaboration_mode: None,
-                multi_agent_version: None,
-                multi_agent_mode: None,
-                realtime_active: None,
-                cyber_access_program: None,
-                effort: None,
-                summary: ReasoningSummary::Auto,
-            }),
-            user_message("child question"),
-            agent_message("child answer"),
-            completed("child-turn"),
-        ],
+        bounded_subagent_items(home.path()),
     );
     writeln!(
         fs::OpenOptions::new()
@@ -1505,6 +1509,60 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             .await
             .turns
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn migration_fails_without_replacing_oversized_bounded_subagent_record() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let mut items = bounded_subagent_items(home.path());
+    items.push(RolloutItem::Compacted(CompactedItem {
+        message: "x".repeat(super::MAX_ROLLOUT_LINE_BYTES),
+        replacement_history: Some(Vec::new()),
+        window_number: Some(3),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    }));
+    items.push(agent_message("valid record after oversized checkpoint"));
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::SubAgent(SubAgentSource::Other("test".to_string())),
+        items,
+    );
+    let original = fs::read(&path).expect("read original rollout");
+    let store = indexed_store(home.path()).await;
+
+    let report = store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("migrate oversized subagent rollout record");
+
+    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Failed);
+    assert!(
+        report.outcomes[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(super::OVERSIZED_ROLLOUT_RECORD_MESSAGE))
+    );
+    assert_eq!(
+        fs::read(&path).expect("read rollout after failure"),
+        original
+    );
+    assert!(!migration_journal_path(home.path(), thread_id).exists());
+    assert_eq!(
+        store
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .get_thread(thread_id)
+            .await
+            .expect("read thread metadata")
+            .expect("thread metadata")
+            .history_mode,
+        ThreadHistoryMode::Legacy
     );
 }
 
@@ -2227,7 +2285,7 @@ async fn migration_recovers_a_compressed_published_rollout() {
 }
 
 #[tokio::test]
-async fn migration_skips_oversized_jsonl_records() {
+async fn migration_fails_without_replacing_oversized_jsonl_records() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
     let path = write_rollout(
@@ -2246,7 +2304,19 @@ async fn migration_skips_oversized_jsonl_records() {
         "{{\"timestamp\":\"{TIMESTAMP}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"{oversized_output}\"}}}}"
     )
     .expect("write oversized rollout record");
+    let later_valid_line = RolloutLine {
+        timestamp: TIMESTAMP.to_string(),
+        ordinal: None,
+        item: agent_message("kept answer"),
+    };
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&later_valid_line).expect("serialize later valid record")
+    )
+    .expect("append later valid record");
     drop(file);
+    let original = fs::read(&path).expect("read original rollout");
     let store = indexed_store(home.path()).await;
 
     let report = store
@@ -2254,16 +2324,30 @@ async fn migration_skips_oversized_jsonl_records() {
         .await
         .expect("migrate oversized rollout record");
 
-    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
+    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Failed);
     assert!(
-        fs::metadata(&path)
-            .expect("read migrated rollout metadata")
-            .len()
-            < super::MAX_ROLLOUT_LINE_BYTES as u64
+        report.outcomes[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(super::OVERSIZED_ROLLOUT_RECORD_MESSAGE))
     );
-    let turns = list_active_summary_turns(&store, thread_id).await;
-    assert_eq!(turns.turns.len(), 1);
-    assert_eq!(turns.turns[0].items.len(), 1);
+    assert_eq!(
+        fs::read(&path).expect("read rollout after failure"),
+        original
+    );
+    assert!(!migration_journal_path(home.path(), thread_id).exists());
+    assert_eq!(
+        store
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .get_thread(thread_id)
+            .await
+            .expect("read thread metadata")
+            .expect("thread metadata")
+            .history_mode,
+        ThreadHistoryMode::Legacy
+    );
 }
 
 #[tokio::test]

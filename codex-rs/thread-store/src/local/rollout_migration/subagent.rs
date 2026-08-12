@@ -46,6 +46,9 @@ pub(super) async fn select_bounded_context(
                 continue;
             };
             if scan.push(line.item) == ModelContextScanProgress::Complete {
+                if scanner.skipped_oversized_record() {
+                    return Err(migration_error(super::OVERSIZED_ROLLOUT_RECORD_MESSAGE));
+                }
                 let mut items = scan.finish(session_meta);
                 items.retain(|item| !matches!(item, RolloutItem::SessionMeta(_)));
                 return Ok(Some(items));

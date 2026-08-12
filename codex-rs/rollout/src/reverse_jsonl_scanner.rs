@@ -25,6 +25,7 @@ pub struct ReverseJsonlScanner<R> {
     record_reversed: Vec<u8>,
     max_record_bytes: Option<usize>,
     discarding_oversized_record: bool,
+    skipped_oversized_record: bool,
 }
 
 impl<R> ReverseJsonlScanner<R>
@@ -56,6 +57,7 @@ where
             record_reversed: Vec::new(),
             max_record_bytes: None,
             discarding_oversized_record: false,
+            skipped_oversized_record: false,
         })
     }
 
@@ -63,6 +65,11 @@ where
     pub fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = Some(max_record_bytes);
         self
+    }
+
+    /// Returns whether a record was skipped because it exceeded the configured limit.
+    pub fn skipped_oversized_record(&self) -> bool {
+        self.skipped_oversized_record
     }
 
     /// Scans the next nonblank record.
@@ -100,6 +107,7 @@ where
                     }) {
                         self.record_reversed.clear();
                         self.discarding_oversized_record = true;
+                        self.skipped_oversized_record = true;
                     } else {
                         self.record_reversed.extend(fragment.iter().rev().copied());
                     }
@@ -119,6 +127,7 @@ where
                     }) {
                         self.record_reversed.clear();
                         self.discarding_oversized_record = true;
+                        self.skipped_oversized_record = true;
                     } else {
                         self.record_reversed.extend(chunk.iter().rev().copied());
                     }
