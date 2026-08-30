@@ -29,6 +29,65 @@ use crate::ThreadStoreResult;
 #[path = "model_context_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
+#[cfg(test)]
+use tokio::sync::oneshot;
+
+#[cfg(test)]
+struct SourceGuardPause {
+    acquired: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static SOURCE_GUARD_PAUSES: OnceLock<Mutex<HashMap<codex_protocol::ThreadId, SourceGuardPause>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn source_guard_pauses() -> &'static Mutex<HashMap<codex_protocol::ThreadId, SourceGuardPause>> {
+    SOURCE_GUARD_PAUSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn pause_after_source_guards(
+    thread_id: codex_protocol::ThreadId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (acquired_sender, acquired) = oneshot::channel();
+    let (resume, resume_receiver) = oneshot::channel();
+    let previous = source_guard_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            thread_id,
+            SourceGuardPause {
+                acquired: acquired_sender,
+                resume: resume_receiver,
+            },
+        );
+    assert!(previous.is_none(), "source-guard pause already installed");
+    (acquired, resume)
+}
+
+#[cfg(test)]
+async fn pause_after_source_guards_if_requested(thread_id: codex_protocol::ThreadId) {
+    let pause = source_guard_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&thread_id);
+    if let Some(SourceGuardPause { acquired, resume }) = pause {
+        let _ = acquired.send(());
+        let _ = resume.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn pause_after_source_guards_if_requested(_thread_id: codex_protocol::ThreadId) {}
+
 /// Loads rollout items needed to reconstruct the latest model-visible context.
 ///
 /// Plain Legacy JSONL rollouts use a reverse scan. When it finds both a usable replacement-history
@@ -43,6 +102,14 @@ pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
 ) -> ThreadStoreResult<StoredModelContext> {
+    // Retain the source lifecycle and filesystem leases before resolving its current
+    // representation. Reference lineages add matching stable filesystem guards for every
+    // ancestor, so archive/delete/compression cannot race the complete context scan.
+    let source_guards = store.acquire_fork_source_guards(params.thread_id).await?;
+    let super::ForkSourceGuards {
+        lifecycle: _source_lifecycle_guard,
+        filesystem: source_filesystem_guard,
+    } = source_guards;
     let resolved = if params.include_archived {
         thread_rollout_resolver::resolve_current_including_archived(store, params.thread_id).await?
     } else {
@@ -76,14 +143,27 @@ pub(super) async fn load_latest_model_context(
         // model-visible context, including when one or more segments currently have zstd
         // siblings.
         ThreadHistoryMode::Legacy if session_meta.meta.history_base.is_some() => {
-            let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+            let (lineage, _ancestor_filesystem_guards) = store
+                .resolve_rollout_lineage_for_reference_attachment(
+                    params.thread_id,
+                    source_filesystem_guard.clone(),
+                )
+                .await?;
+            pause_after_source_guards_if_requested(params.thread_id).await;
             scan_model_context_from_lineage(lineage, session_meta).await?
         }
         ThreadHistoryMode::Legacy => {
+            pause_after_source_guards_if_requested(params.thread_id).await;
             scan_model_context_from_rollout(path, session_meta, None).await?
         }
         ThreadHistoryMode::Paginated => {
-            let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+            let (lineage, _ancestor_filesystem_guards) = store
+                .resolve_rollout_lineage_for_reference_attachment(
+                    params.thread_id,
+                    source_filesystem_guard.clone(),
+                )
+                .await?;
+            pause_after_source_guards_if_requested(params.thread_id).await;
             scan_model_context_from_lineage(lineage, session_meta).await?
         }
     };

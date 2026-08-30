@@ -30,7 +30,9 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
+use crate::ArchiveThreadParams;
 use crate::ThreadStore;
+use crate::ThreadStoreError;
 use crate::local::test_support::test_config;
 use crate::local::test_support::write_session_file_with_history_mode;
 
@@ -274,6 +276,73 @@ async fn legacy_reference_context_replays_model_visible_ancestor_for_plain_and_z
     let serialized = serde_json::to_string(&context.items).expect("serialize model context");
     assert!(serialized.contains("ancestor model summary"));
     assert!(serialized.contains("child suffix"));
+}
+
+#[tokio::test]
+async fn latest_legacy_reference_context_holds_source_and_ancestor_leases_through_scan() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let root_uuid = Uuid::from_u128(/*v*/ 1024);
+    let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root thread id");
+    let root_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-23",
+        root_uuid,
+        [legacy_user_message("ancestor context")],
+    );
+    let root_cutoff = std::fs::metadata(root_path.as_path())
+        .expect("read root metadata")
+        .len();
+
+    let child_uuid = Uuid::from_u128(/*v*/ 1025);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child thread id");
+    let child_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-24",
+        child_uuid,
+        [legacy_user_message("child context")],
+    );
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: root_id,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: root_cutoff,
+        },
+    );
+
+    let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+    let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
+    let (source_guards_acquired, resume_scan) = pause_after_source_guards(child_id);
+    let context_store = store.clone();
+    let context_task = tokio::spawn(async move {
+        context_store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id: child_id,
+                include_archived: false,
+            })
+            .await
+    });
+
+    source_guards_acquired
+        .await
+        .expect("model context acquired source and ancestor guards");
+    for thread_id in [child_id, root_id] {
+        let error = maintenance_store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("model-context lease must block archive mutation");
+        assert!(matches!(error, ThreadStoreError::Conflict { .. }));
+    }
+
+    resume_scan.send(()).expect("resume model-context scan");
+    let context = context_task
+        .await
+        .expect("model-context task should join")
+        .expect("model context should finish after mutation attempts fail");
+    let serialized = serde_json::to_string(&context.items).expect("serialize model context");
+    assert!(serialized.contains("ancestor context"));
+    assert!(serialized.contains("child context"));
 }
 
 #[tokio::test]
