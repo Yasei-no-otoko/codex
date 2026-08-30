@@ -407,16 +407,16 @@ async fn worker_compresses_archived_fork_chain_only_with_shared_mode() -> anyhow
     ] {
         // Each mode gets a fresh home, without bypassing the worker's maintenance cooldown.
         let home = TempDir::new()?;
-        let thread_id = ThreadId::from_string(&Uuid::from_u128(15).to_string())?;
         let source_uuid = Uuid::from_u128(16);
         let source_rollout_id = ThreadId::from_string(&source_uuid.to_string())?;
         let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
-        write_rollout(&source_path, thread_id, "referenced source")?;
+        write_rollout(&source_path, source_rollout_id, "referenced source")?;
         set_old_mtime(&source_path)?;
 
         let child_uuid = Uuid::from_u128(17);
+        let child_id = ThreadId::from_string(&child_uuid.to_string())?;
         let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
-        write_rollout(&child_path, thread_id, "fork child")?;
+        write_rollout(&child_path, child_id, "fork child")?;
         set_history_base(
             child_path.as_path(),
             HistoryPosition {
