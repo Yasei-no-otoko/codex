@@ -11,8 +11,8 @@ use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use super::LocalThreadStore;
-use super::helpers::rollout_path_is_archived;
 use super::helpers::managed_rollout_path;
+use super::helpers::rollout_path_is_archived;
 use super::rollout_lineage::RolloutLineageSegment;
 use super::thread_rollout_resolver;
 use crate::ThreadStoreError;
@@ -39,14 +39,12 @@ pub(super) async fn write_reference_logical_attachment(
         filesystem: source_filesystem_guard,
     } = source_guards;
     let source_filesystem_guard_for_resolver = source_filesystem_guard.clone();
-    let resolved = thread_rollout_resolver::resolve_current_including_archived(
-        store,
-        params.thread_id,
-    )
-    .await?
-    .ok_or(ThreadStoreError::ThreadNotFound {
-        thread_id: params.thread_id,
-    })?;
+    let resolved =
+        thread_rollout_resolver::resolve_current_including_archived(store, params.thread_id)
+            .await?
+            .ok_or(ThreadStoreError::ThreadNotFound {
+                thread_id: params.thread_id,
+            })?;
     let path = codex_rollout::existing_rollout_path(resolved.path.as_path())
         .await
         .unwrap_or(resolved.path);
@@ -125,15 +123,13 @@ pub(super) async fn stream_segment(
     while let Some(record) = reader
         .next_raw_line_limited(writer.max_bytes())
         .await
-        .map_err(|err| {
-            ThreadStoreError::Internal {
-                message: format!(
-                    "failed to read rollout {} for reference attachment: {err}",
-                    segment.rollout_path.display()
-                ),
-            }
-        }
-        )? {
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to read rollout {} for reference attachment: {err}",
+                segment.rollout_path.display()
+            ),
+        })?
+    {
         let (line, byte_count, terminated, oversized) = match record {
             codex_rollout::RawRolloutLine::Complete(line) => {
                 let byte_count = line.len();
@@ -143,9 +139,7 @@ pub(super) async fn stream_segment(
             codex_rollout::RawRolloutLine::Oversized {
                 byte_count,
                 terminated,
-            } => {
-                (None, byte_count, terminated, true)
-            }
+            } => (None, byte_count, terminated, true),
         };
         let next_offset = offset.saturating_add(byte_count as u64);
         if segment

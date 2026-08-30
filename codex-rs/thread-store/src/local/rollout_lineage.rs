@@ -129,7 +129,11 @@ impl LocalThreadStore {
             // that filename first, take the stable-ID guard, then resolve the immutable ID again
             // under the guard before reading any rollout content.
             let ancestor_logical_thread_id = match (representation, next_rollout_id) {
-                (LineageRepresentation::PlainForReference | LineageRepresentation::ReadOnlyForAttachment, Some(rollout_id)) => {
+                (
+                    LineageRepresentation::PlainForReference
+                    | LineageRepresentation::ReadOnlyForAttachment,
+                    Some(rollout_id),
+                ) => {
                     let path = resolve_rollout_path_by_id(self, rollout_id)
                         .await?
                         .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
@@ -141,7 +145,8 @@ impl LocalThreadStore {
             };
             let _writer_guard = match representation {
                 LineageRepresentation::Existing => None,
-                LineageRepresentation::PlainForReference | LineageRepresentation::ReadOnlyForAttachment => Some(
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => Some(
                     self.live_writer_locks
                         .lock(ancestor_logical_thread_id)
                         .await,
@@ -149,7 +154,10 @@ impl LocalThreadStore {
             };
             let _filesystem_guard = match representation {
                 LineageRepresentation::Existing => None,
-                (LineageRepresentation::PlainForReference | LineageRepresentation::ReadOnlyForAttachment) if next_rollout_id.is_none() => {
+                (LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment)
+                    if next_rollout_id.is_none() =>
+                {
                     let guard = match preheld_source_guard.as_ref() {
                         Some(guard) => guard.clone(),
                         // This branch has no external caller retaining a source guard; acquire
@@ -160,7 +168,8 @@ impl LocalThreadStore {
                     };
                     Some(guard)
                 }
-                LineageRepresentation::PlainForReference | LineageRepresentation::ReadOnlyForAttachment => {
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => {
                     let guard = match self.existing_writer_lock(ancestor_logical_thread_id).await {
                         Some(guard) => guard,
                         None => self
@@ -198,9 +207,10 @@ impl LocalThreadStore {
             // lineage is just as security-sensitive as one we are about to share.
             let rollout_path = match representation {
                 LineageRepresentation::ReadOnlyForAttachment => {
-                    let existing_path = codex_rollout::existing_rollout_path(rollout_path.as_path())
-                        .await
-                        .unwrap_or(rollout_path);
+                    let existing_path =
+                        codex_rollout::existing_rollout_path(rollout_path.as_path())
+                            .await
+                            .unwrap_or(rollout_path);
                     super::helpers::managed_rollout_path(
                         self.config.codex_home.as_path(),
                         existing_path.as_path(),
@@ -258,7 +268,8 @@ impl LocalThreadStore {
                 // Already-shared compressed history requires a compatible reader regardless of
                 // new forks. Read it without publishing decoded copies into ancestors' folders;
                 // their owners may concurrently archive or unarchive those immutable files.
-                LineageRepresentation::PlainForReference | LineageRepresentation::ReadOnlyForAttachment => rollout_path,
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => rollout_path,
             };
             if let Some(end) = end {
                 if matches!(representation, LineageRepresentation::ReadOnlyForAttachment) {
@@ -488,10 +499,8 @@ async fn validate_raw_rollout_cutoff(
     while let Some(record) = reader
         .next_raw_line_limited(CUTOFF_LINE_LIMIT)
         .await
-        .map_err(|err| {
-            ThreadStoreError::Internal {
-                message: format!("failed to scan lineage {}: {err}", rollout_path.display()),
-            }
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to scan lineage {}: {err}", rollout_path.display()),
         })?
     {
         let (line, byte_count, terminated, oversized) = match record {

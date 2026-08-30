@@ -103,9 +103,9 @@ use crate::TimelinePage;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
+use crate::UpdatedProject;
 use crate::WriteReferenceLogicalAttachmentOutcome;
 use crate::WriteReferenceLogicalAttachmentParams;
-use crate::UpdatedProject;
 use crate::local::writer_lock::WriterLockCoordinator;
 use crate::local::writer_lock::WriterLockGuard;
 

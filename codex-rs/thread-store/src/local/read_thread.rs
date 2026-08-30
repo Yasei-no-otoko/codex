@@ -374,6 +374,19 @@ async fn read_legacy_segment_prefix(
         })?;
     let mut offset = 0_u64;
     loop {
+        if end_byte_offset.is_some_and(|end| offset == end) {
+            // The cutoff is a complete LF boundary. Do not inspect later physical records, which
+            // may have been appended to the ancestor after the child forked.
+            break;
+        }
+        if end_byte_offset.is_some_and(|end| offset > end) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "legacy history cutoff is behind decoded offset {offset} in {}",
+                    path.display()
+                ),
+            });
+        }
         let Some(record) = reader
             .next_raw_line_limited(LEGACY_READ_LINE_LIMIT)
             .await
@@ -952,37 +965,36 @@ mod tests {
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let parent_uuid = Uuid::from_u128(213);
         let child_uuid = Uuid::from_u128(214);
-        let parent_path = write_session_file(
-            home.path(),
-            "2025-01-03T12-00-00",
-            parent_uuid,
-        )
-        .expect("parent session file");
+        let parent_path = write_session_file(home.path(), "2025-01-03T12-00-00", parent_uuid)
+            .expect("parent session file");
         let parent_bytes = std::fs::read(&parent_path).expect("read parent");
+        let parent_cutoff = parent_bytes.len();
+        let parent_suffix = serde_json::json!({
+            "timestamp": "2025-01-03T12-00-00",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "post-cutoff-secret"},
+        });
+        let mut parent_with_suffix = parent_bytes.clone();
+        parent_with_suffix.extend_from_slice(parent_suffix.to_string().as_bytes());
+        parent_with_suffix.push(b'\n');
         let parent_compressed = parent_path.with_extension("jsonl.zst");
         std::fs::write(
             &parent_compressed,
-            zstd::stream::encode_all(parent_bytes.as_slice(), 3).expect("compress parent"),
+            zstd::stream::encode_all(parent_with_suffix.as_slice(), 3).expect("compress parent"),
         )
         .expect("write compressed parent");
         std::fs::remove_file(&parent_path).expect("remove plain parent");
 
-        let child_path = write_session_file(
-            home.path(),
-            "2025-01-03T12-01-00",
-            child_uuid,
-        )
-        .expect("child session file");
+        let child_path = write_session_file(home.path(), "2025-01-03T12-01-00", child_uuid)
+            .expect("child session file");
         let child_text = std::fs::read_to_string(&child_path).expect("read child");
-        let (child_meta, child_delta) = child_text
-            .split_once('\n')
-            .expect("child metadata line");
+        let (child_meta, child_delta) = child_text.split_once('\n').expect("child metadata line");
         let mut child_meta: serde_json::Value =
             serde_json::from_str(child_meta).expect("parse child metadata");
         child_meta["payload"]["history_base"] = serde_json::json!({
             "thread_id": parent_uuid,
             "end_ordinal_exclusive": 2,
-            "end_byte_offset": parent_bytes.len(),
+            "end_byte_offset": parent_cutoff,
         });
         let child_bytes = format!("{}\n{}", child_meta, child_delta)
             .replace("Hello from user", "child compressed delta");
@@ -1008,6 +1020,45 @@ mod tests {
         let serialized = serde_json::to_string(&history.items).expect("serialize history");
         assert!(serialized.contains("Hello from user"));
         assert!(serialized.contains("child"));
+        assert!(!serialized.contains("post-cutoff-secret"));
+    }
+
+    #[tokio::test]
+    async fn plain_legacy_ancestor_stops_before_post_cutoff_append() {
+        let home = TempDir::new().expect("temp dir");
+        let ancestor_uuid = Uuid::from_u128(215);
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", ancestor_uuid)
+            .expect("ancestor session file");
+        let cutoff = std::fs::metadata(&path).expect("ancestor metadata").len();
+        let suffix = serde_json::json!({
+            "timestamp": "2025-01-03T12-00-00",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "post-cutoff-secret"},
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open ancestor for append");
+        writeln!(file, "{suffix}").expect("append ancestor suffix");
+
+        let mut items = Vec::new();
+        let mut child_head_seen = false;
+        read_legacy_segment_prefix(
+            &path,
+            Some(cutoff),
+            0,
+            0,
+            &mut child_head_seen,
+            &mut |item| {
+                items.push(item);
+                true
+            },
+        )
+        .await
+        .expect("read plain ancestor cutoff");
+        let serialized = serde_json::to_string(&items).expect("serialize ancestor history");
+        assert!(serialized.contains("Hello from user"));
+        assert!(!serialized.contains("post-cutoff-secret"));
     }
 
     #[tokio::test]

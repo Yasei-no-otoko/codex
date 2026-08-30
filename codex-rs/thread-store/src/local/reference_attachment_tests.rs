@@ -38,26 +38,28 @@ async fn bounded_output_over_four_megabytes_keeps_complete_lines() {
         .push_header_line(&envelope("session_meta", serde_json::json!({})))
         .await
         .expect("write header");
-    writer
-        .push_line(b"head-marker")
-        .await
-        .expect("write head");
+    writer.push_line(b"head-marker").await.expect("write head");
     let oversized = format!("padding:{}", "x".repeat(4 * 1024 * 1024));
     writer
         .push_line(oversized.as_bytes())
         .await
         .expect("write oversized line");
-    writer
-        .push_line(b"tail-marker")
-        .await
-        .expect("write tail");
+    writer.push_line(b"tail-marker").await.expect("write tail");
     assert!(writer.finish().await.expect("finish"));
 
     let bytes = fs::read(output.path()).expect("read output");
     assert!(bytes.len() <= 4 * 1024 * 1024);
     assert!(bytes.ends_with(b"\n"));
-    assert!(bytes.windows(b"head-marker".len()).any(|w| w == b"head-marker"));
-    assert!(bytes.windows(b"tail-marker".len()).any(|w| w == b"tail-marker"));
+    assert!(
+        bytes
+            .windows(b"head-marker".len())
+            .any(|w| w == b"head-marker")
+    );
+    assert!(
+        bytes
+            .windows(b"tail-marker".len())
+            .any(|w| w == b"tail-marker")
+    );
     assert!(!bytes.windows(b"padding:".len()).any(|w| w == b"padding:"));
 }
 
@@ -81,10 +83,7 @@ async fn oversized_single_line_is_drained_without_unbounded_reader_allocation() 
         })
     ));
     assert_eq!(
-        reader
-            .next_raw_line_limited(1024)
-            .await
-            .expect("read tail"),
+        reader.next_raw_line_limited(1024).await.expect("read tail"),
         Some(codex_rollout::RawRolloutLine::Complete(b"tail\n".to_vec()))
     );
 }
@@ -94,7 +93,10 @@ async fn oversized_record_at_ancestor_cutoff_cannot_leak_post_cutoff_secret() {
     let source = NamedTempFile::new().expect("create source");
     let prefix = envelope("event_msg", serde_json::json!({"message": "small-prefix"}));
     let oversized = format!("{}\n", "x".repeat(4 * 1024 * 1024));
-    let secret = envelope("event_msg", serde_json::json!({"message": "post-cutoff-secret"}));
+    let secret = envelope(
+        "event_msg",
+        serde_json::json!({"message": "post-cutoff-secret"}),
+    );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(prefix.as_slice());
     bytes.push(b'\n');
@@ -171,7 +173,10 @@ async fn zstd_rollout_streams_logical_lines_without_plain_materialization() {
     let compressed_path = source.path().with_extension("jsonl.zst");
     let lines = join_lines([
         envelope("session_meta", serde_json::json!({})),
-        envelope("event_msg", serde_json::json!({"message": "compressed-marker"})),
+        envelope(
+            "event_msg",
+            serde_json::json!({"message": "compressed-marker"}),
+        ),
     ]);
     let compressed = zstd::stream::encode_all(lines.as_slice(), 3).expect("compress rollout");
     fs::write(&compressed_path, compressed).expect("write compressed rollout");
@@ -200,7 +205,10 @@ async fn zstd_rollout_streams_logical_lines_without_plain_materialization() {
 #[tokio::test]
 async fn valid_json_without_lf_is_not_written_as_a_child_tail() {
     let source = NamedTempFile::new().expect("create source");
-    let tail = envelope("event_msg", serde_json::json!({"message": "partial-child-tail"}));
+    let tail = envelope(
+        "event_msg",
+        serde_json::json!({"message": "partial-child-tail"}),
+    );
     fs::write(source.path(), tail).expect("write partial child");
     let output = NamedTempFile::new().expect("create output");
     let mut writer = AsyncAttachmentWriter::new(output.path().to_path_buf(), 4096)
@@ -218,13 +226,20 @@ async fn valid_json_without_lf_is_not_written_as_a_child_tail() {
     .await
     .expect("stream partial child");
     writer.finish().await.expect("finish");
-    assert!(fs::read_to_string(output.path()).expect("read output").is_empty());
+    assert!(
+        fs::read_to_string(output.path())
+            .expect("read output")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
 async fn ancestor_cutoff_accepts_only_newline_terminated_records() {
     let source = NamedTempFile::new().expect("create source");
-    let partial = envelope("event_msg", serde_json::json!({"message": "partial-ancestor"}));
+    let partial = envelope(
+        "event_msg",
+        serde_json::json!({"message": "partial-ancestor"}),
+    );
     let cutoff = partial.len() as u64;
     fs::write(source.path(), partial).expect("write partial ancestor");
     let output = NamedTempFile::new().expect("create output");
@@ -247,7 +262,11 @@ async fn ancestor_cutoff_accepts_only_newline_terminated_records() {
     .await
     .expect("stream partial ancestor");
     writer.finish().await.expect("finish");
-    assert!(fs::read_to_string(output.path()).expect("read output").is_empty());
+    assert!(
+        fs::read_to_string(output.path())
+            .expect("read output")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -263,7 +282,10 @@ async fn prefix_and_child_delta_are_streamed_as_complete_lines() {
         child.path(),
         join_lines([
             envelope("session_meta", serde_json::json!({})),
-            envelope("event_msg", serde_json::json!({"message": "child-delta-marker"})),
+            envelope(
+                "event_msg",
+                serde_json::json!({"message": "child-delta-marker"}),
+            ),
         ]),
     )
     .expect("write child");
@@ -318,7 +340,10 @@ async fn paginated_reference_stream_preserves_ordinal_lines() {
             ),
         })
         .expect("serialize ordinal line"),
-        envelope("event_msg", serde_json::json!({"message": "paginated-marker"})),
+        envelope(
+            "event_msg",
+            serde_json::json!({"message": "paginated-marker"}),
+        ),
     ]);
     fs::write(source.path(), lines).expect("write source");
     let output = NamedTempFile::new().expect("create output");
@@ -339,7 +364,10 @@ async fn paginated_reference_stream_preserves_ordinal_lines() {
     writer.finish().await.expect("finish");
     let text = fs::read_to_string(output.path()).expect("read output");
     assert!(text.contains("paginated-marker"));
-    assert!(text.lines().all(|line| line.ends_with('}') || line.ends_with(']')));
+    assert!(
+        text.lines()
+            .all(|line| line.ends_with('}') || line.ends_with(']'))
+    );
 }
 
 #[test]
@@ -357,8 +385,14 @@ fn numeric_legacy_fork_metadata_is_a_valid_non_reference_envelope() {
 async fn legacy_ghost_snapshot_is_omitted_without_payload_materialization() {
     let source = NamedTempFile::new().expect("create source");
     let lines = join_lines([
-        envelope("response_item", serde_json::json!({"type": "ghost_snapshot"})),
-        envelope("event_msg", serde_json::json!({"message": "retained-marker"})),
+        envelope(
+            "response_item",
+            serde_json::json!({"type": "ghost_snapshot"}),
+        ),
+        envelope(
+            "event_msg",
+            serde_json::json!({"message": "retained-marker"}),
+        ),
     ]);
     fs::write(source.path(), lines).expect("write source");
     let output = NamedTempFile::new().expect("create output");

@@ -50,9 +50,9 @@ use crate::ThreadStoreResult;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
+use crate::UpdatedProject;
 use crate::WriteReferenceLogicalAttachmentOutcome;
 use crate::WriteReferenceLogicalAttachmentParams;
-use crate::UpdatedProject;
 
 /// Future returned by [`ThreadStore`] operations.
 pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResult<T>> + Send + 'a>>;

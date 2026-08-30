@@ -233,10 +233,7 @@ pub struct RawRolloutLineReader {
 #[derive(Debug, PartialEq, Eq)]
 pub enum RawRolloutLine {
     Complete(Vec<u8>),
-    Oversized {
-        byte_count: usize,
-        terminated: bool,
-    },
+    Oversized { byte_count: usize, terminated: bool },
 }
 
 enum RawRolloutLineReaderInner {
@@ -1274,10 +1271,10 @@ mod reader {
     use std::io::Read;
     use std::path::Path;
 
-    use super::RolloutLineReader;
-    use super::RolloutLineReaderInner;
     use super::RawRolloutLineReader;
     use super::RawRolloutLineReaderInner;
+    use super::RolloutLineReader;
+    use super::RolloutLineReaderInner;
     use super::path;
     use tokio::io::AsyncBufReadExt;
 
@@ -1313,9 +1310,7 @@ mod reader {
             let reader = tokio::task::spawn_blocking(move || {
                 let input = File::open(path.as_path())?;
                 let decoder = zstd::stream::read::Decoder::new(input)?;
-                Ok::<_, io::Error>(io::BufReader::new(
-                    Box::new(decoder) as Box<dyn Read + Send>
-                ))
+                Ok::<_, io::Error>(io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>))
             })
             .await
             .map_err(io::Error::other)??;
