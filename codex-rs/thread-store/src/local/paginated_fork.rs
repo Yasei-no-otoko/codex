@@ -20,6 +20,7 @@ pub(super) async fn prepare(
     let PrepareForkParams {
         thread_id,
         boundary,
+        ..
     } = params;
     let super::ForkSourceGuards {
         lifecycle: source_reservation,

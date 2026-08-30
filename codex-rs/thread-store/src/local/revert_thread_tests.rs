@@ -113,6 +113,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .prepare_fork(PrepareForkParams {
             thread_id,
             boundary: ForkBoundary::Latest,
+            legacy_source_rollout_path: None,
         })
         .await
         .expect("prepare fork from reverted rollout");

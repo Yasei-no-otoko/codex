@@ -551,19 +551,33 @@ impl ThreadStore for LocalThreadStore {
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move {
             let source_guards = self.acquire_fork_source_guards(params.thread_id).await?;
-            match live_writer::persist_thread(self, params.thread_id).await {
-                Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
-                Err(err) => return Err(err),
+            if params.legacy_source_rollout_path.is_none() {
+                match live_writer::persist_thread(self, params.thread_id).await {
+                    Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                    Err(err) => return Err(err),
+                }
             }
             // A different LocalThreadStore can share this source lease, but it cannot flush that
             // store's unpersisted recorder. Resolution below therefore remains fail-closed when
             // no durable rollout exists; only an owning store can persist an empty live source.
-            let source =
-                thread_rollout_resolver::resolve_current_including_archived(self, params.thread_id)
+            let source = match params.legacy_source_rollout_path.as_ref() {
+                Some(path) => {
+                    thread_rollout_resolver::resolve_path_including_archived(
+                        self,
+                        params.thread_id,
+                        path.clone(),
+                    )
                     .await?
-                    .ok_or(ThreadStoreError::ThreadNotFound {
-                        thread_id: params.thread_id,
-                    })?;
+                }
+                None => thread_rollout_resolver::resolve_current_including_archived(
+                    self,
+                    params.thread_id,
+                )
+                .await?
+                .ok_or(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                })?,
+            };
             let session_meta = codex_rollout::read_session_meta_line(source.path.as_path())
                 .await
                 .map_err(|err| ThreadStoreError::Internal {
@@ -572,9 +586,16 @@ impl ThreadStore for LocalThreadStore {
                         source.path.display()
                     ),
                 })?;
+            let path_pinned_legacy_source = params.legacy_source_rollout_path.is_some();
             match session_meta.meta.history_mode {
                 ThreadHistoryMode::Legacy => {
-                    legacy_fork::prepare(self, params, source_guards).await
+                    legacy_fork::prepare(self, params, source, source_guards).await
+                }
+                ThreadHistoryMode::Paginated if path_pinned_legacy_source => {
+                    Err(ThreadStoreError::InvalidRequest {
+                        message: "path-pinned legacy fork source must use legacy history"
+                            .to_string(),
+                    })
                 }
                 ThreadHistoryMode::Paginated => {
                     paginated_fork::prepare(self, params, source_guards).await
@@ -1767,6 +1788,7 @@ mod tests {
             .prepare_fork(PrepareForkParams {
                 thread_id,
                 boundary: crate::ForkBoundary::Latest,
+                legacy_source_rollout_path: None,
             })
             .await
             .expect_err("external rollouts cannot be referenced by thread id");

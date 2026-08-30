@@ -1208,8 +1208,16 @@ mod tests {
         .expect("parse replacement metadata");
         replacement_meta["payload"]["id"] = serde_json::json!(logical_child_uuid);
         replacement_meta["payload"]["session_id"] = serde_json::json!(logical_child_uuid);
-        std::fs::write(&replacement_path, format!("{replacement_meta}\n"))
-            .expect("rewrite replacement");
+        let replacement_marker = serde_json::json!({
+            "timestamp": "2025-01-03T12:02:00",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "current-only replacement delta"},
+        });
+        std::fs::write(
+            &replacement_path,
+            format!("{replacement_meta}\n{replacement_marker}\n"),
+        )
+        .expect("rewrite replacement");
         let replacement_path = replacement_path.with_file_name(format!(
             "rollout-2025-01-03T12-02-00-{logical_child_uuid}_{replacement_rollout_uuid}.jsonl"
         ));
@@ -1228,8 +1236,12 @@ mod tests {
         )
         .await
         .expect("initialize state database");
-        let mut builder =
-            ThreadMetadataBuilder::new(thread_id, replacement_path, Utc::now(), SessionSource::Cli);
+        let mut builder = ThreadMetadataBuilder::new(
+            thread_id,
+            replacement_path.clone(),
+            Utc::now(),
+            SessionSource::Cli,
+        );
         builder.history_mode = ThreadHistoryMode::Paginated;
         let metadata = builder.build(config.default_model_provider_id.as_str());
         runtime
@@ -1237,6 +1249,46 @@ mod tests {
             .await
             .expect("select replacement rollout");
         let store = LocalThreadStore::new(config, Some(runtime));
+
+        let error = store
+            .prepare_fork(crate::PrepareForkParams {
+                thread_id,
+                boundary: crate::ForkBoundary::Latest,
+                legacy_source_rollout_path: Some(replacement_path),
+            })
+            .await
+            .expect_err("reject paginated source passed to legacy path-pinned fork");
+        assert!(matches!(
+            error,
+            crate::ThreadStoreError::InvalidRequest { message }
+                if message == "path-pinned legacy fork source must use legacy history"
+        ));
+
+        let prepared = store
+            .prepare_fork(crate::PrepareForkParams {
+                thread_id,
+                boundary: crate::ForkBoundary::Latest,
+                legacy_source_rollout_path: Some(historical_path.clone()),
+            })
+            .await
+            .expect("prepare fork from requested historical rollout");
+        let source_history_base = prepared.history_base.expect("source history base");
+        assert_eq!(
+            source_history_base.thread_id,
+            ThreadId::from_string(&historical_rollout_uuid.to_string())
+                .expect("historical rollout id")
+        );
+        assert_ne!(
+            source_history_base.thread_id,
+            ThreadId::from_string(&replacement_rollout_uuid.to_string())
+                .expect("replacement rollout id")
+        );
+        let prepared_history =
+            serde_json::to_string(prepared.model_context.as_ref()).expect("serialize fork history");
+        assert!(prepared_history.contains("Hello from user"));
+        assert!(prepared_history.contains("path-pinned legacy delta"));
+        assert!(!prepared_history.contains("current-only replacement delta"));
+        drop(prepared);
 
         let thread = store
             .read_thread_by_rollout_path(

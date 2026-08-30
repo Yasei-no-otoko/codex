@@ -4768,6 +4768,12 @@ impl ThreadRequestProcessor {
                 .prepare_fork(codex_thread_store::PrepareForkParams {
                     thread_id: source_thread_id,
                     boundary,
+                    legacy_source_rollout_path: (legacy_latest_reference
+                        && path
+                            .as_ref()
+                            .is_some_and(|path| !path.as_os_str().is_empty()))
+                    .then(|| source_thread.rollout_path.clone())
+                    .flatten(),
                 })
                 .await
             {

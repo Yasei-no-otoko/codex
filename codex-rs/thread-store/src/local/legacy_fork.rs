@@ -8,7 +8,7 @@ use super::helpers::managed_rollout_path;
 use super::legacy_envelope;
 use super::live_writer;
 use super::model_context;
-use super::thread_rollout_resolver;
+use super::thread_rollout_resolver::ResolvedThreadRollout;
 use crate::ForkBoundary;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
@@ -18,11 +18,13 @@ use crate::ThreadStoreResult;
 pub(super) async fn prepare(
     store: &LocalThreadStore,
     params: PrepareForkParams,
+    source: ResolvedThreadRollout,
     source_guards: super::ForkSourceGuards,
 ) -> ThreadStoreResult<PreparedFork> {
     let PrepareForkParams {
         thread_id,
         boundary,
+        legacy_source_rollout_path,
     } = params;
     if !matches!(boundary, ForkBoundary::Latest) {
         return Err(ThreadStoreError::Unsupported {
@@ -36,17 +38,16 @@ pub(super) async fn prepare(
         lifecycle: source_reservation,
         filesystem: source_filesystem_guard,
     } = source_guards;
-    match live_writer::persist_thread(store, thread_id).await {
-        Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
-        Err(err) => return Err(err),
+    if legacy_source_rollout_path.is_none() {
+        match live_writer::persist_thread(store, thread_id).await {
+            Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
+        match live_writer::flush_thread(store, thread_id).await {
+            Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
     }
-    match live_writer::flush_thread(store, thread_id).await {
-        Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
-        Err(err) => return Err(err),
-    }
-    let source = thread_rollout_resolver::resolve_current_including_archived(store, thread_id)
-        .await?
-        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
     // Read enough metadata to classify an unsafe source before accepting its pathname. A root
     // legacy thread may still take the existing physical-copy fallback; a reference child must
     // never do so, because that would silently lose its inherited prefix.
@@ -75,7 +76,7 @@ pub(super) async fn prepare(
     let source_path = match managed_rollout_path(
         store.config.codex_home.as_path(),
         source.path.as_path(),
-        thread_id,
+        source.rollout_id,
     ) {
         Ok(path) => path,
         Err(_) => {
@@ -85,7 +86,9 @@ pub(super) async fn prepare(
             ));
         }
     };
-    if source_meta.meta.id != thread_id {
+    if codex_rollout::rollout_thread_id_from_path(source.path.as_path()) != Some(thread_id)
+        || source_meta.meta.id != thread_id
+    {
         return Err(unsafe_source_error(
             reference_child,
             "mismatched legacy reference fork",
@@ -99,7 +102,7 @@ pub(super) async fn prepare(
         ));
     }
     let history_base = HistoryPosition {
-        thread_id,
+        thread_id: source.rollout_id,
         end_ordinal_exclusive: 0,
         end_byte_offset,
     };
@@ -109,8 +112,10 @@ pub(super) async fn prepare(
         // managed-path rules before creating another reference; accepting only the leaf would
         // make a later copy fallback drop that prefix.
         let (lineage, guards) = store
-            .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+            .resolve_rollout_lineage_for_reference_from_source_locked_with_source_guard(
                 thread_id,
+                source.rollout_id,
+                source_path.clone(),
                 source_filesystem_guard.clone(),
             )
             .await?;

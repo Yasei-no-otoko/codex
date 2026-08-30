@@ -214,6 +214,11 @@ pub struct PrepareForkParams {
     pub thread_id: ThreadId,
     /// Requested inclusive or exclusive fork boundary.
     pub boundary: ForkBoundary,
+    /// Exact immutable legacy source rollout selected by a path-addressed latest-fork caller.
+    ///
+    /// When present, implementations must validate that this rollout belongs to `thread_id`
+    /// and must not re-resolve the logical thread to its current rollout.
+    pub legacy_source_rollout_path: Option<PathBuf>,
 }
 
 /// Parameters for reverting a paginated thread's durable history.
