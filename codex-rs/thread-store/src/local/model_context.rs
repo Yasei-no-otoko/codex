@@ -174,7 +174,7 @@ fn scan_model_context_from_lineage_blocking(
     lineage: &RolloutLineage,
     session_meta: SessionMetaLine,
 ) -> io::Result<Vec<RolloutItem>> {
-    let mut scan = ModelContextScan::new(ThreadHistoryMode::Paginated);
+    let mut scan = ModelContextScan::new(lineage.history_mode());
     'segments: for segment in lineage.segments().iter().rev() {
         let file = codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
         let mut scanner = match segment.end.map(|end| end.end_byte_offset) {

@@ -27,6 +27,7 @@ pub(super) struct RolloutLineageSegment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RolloutLineage {
     pub(super) segments: Vec<RolloutLineageSegment>,
+    history_mode: ThreadHistoryMode,
 }
 
 impl LocalThreadStore {
@@ -61,6 +62,7 @@ impl LocalThreadStore {
         let mut seen = HashSet::new();
         let mut next_rollout_id = None;
         let mut end = None;
+        let mut history_mode = None;
 
         loop {
             let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
@@ -114,12 +116,15 @@ impl LocalThreadStore {
                     "source rollout belongs to another thread",
                 ));
             }
-            if meta.meta.history_mode != ThreadHistoryMode::Paginated {
+            if history_mode
+                .is_some_and(|expected| expected != meta.meta.history_mode)
+            {
                 return Err(malformed_lineage(
                     requested_thread_id,
-                    "source rollout is not paginated",
+                    "source rollout mixes history modes",
                 ));
             }
+            history_mode = Some(meta.meta.history_mode);
             let rollout_path = match representation {
                 LineageRepresentation::Existing => rollout_path,
                 LineageRepresentation::PlainForReference
@@ -143,11 +148,14 @@ impl LocalThreadStore {
             if let Some(end) = end {
                 validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
             }
-            let start_ordinal = match meta.meta.history_base {
-                Some(base) => base.end_ordinal_exclusive.checked_add(1).ok_or_else(|| {
-                    malformed_lineage(requested_thread_id, "source ordinal overflow")
-                })?,
-                None => 1,
+            let start_ordinal = match meta.meta.history_mode {
+                ThreadHistoryMode::Legacy => 0,
+                ThreadHistoryMode::Paginated => match meta.meta.history_base {
+                    Some(base) => base.end_ordinal_exclusive.checked_add(1).ok_or_else(|| {
+                        malformed_lineage(requested_thread_id, "source ordinal overflow")
+                    })?,
+                    None => 1,
+                },
             };
             segments.push(RolloutLineageSegment {
                 rollout_id,
@@ -164,7 +172,12 @@ impl LocalThreadStore {
         }
 
         segments.reverse();
-        Ok(RolloutLineage { segments })
+        Ok(RolloutLineage {
+            segments,
+            history_mode: history_mode.ok_or_else(|| {
+                malformed_lineage(requested_thread_id, "source lineage is empty")
+            })?,
+        })
     }
 }
 
@@ -188,6 +201,10 @@ enum LineageRepresentation {
 impl RolloutLineage {
     pub(super) fn segments(&self) -> &[RolloutLineageSegment] {
         self.segments.as_slice()
+    }
+
+    pub(super) fn history_mode(&self) -> ThreadHistoryMode {
+        self.history_mode
     }
 
     pub(super) fn segment_index_for_ordinal(&self, ordinal: u64) -> Option<usize> {
@@ -242,12 +259,6 @@ async fn validate_cutoff_bounds(
     rollout_path: &Path,
     end: &HistoryPosition,
 ) -> ThreadStoreResult<()> {
-    if end.end_ordinal_exclusive == 0 {
-        return Err(malformed_lineage(
-            requested_thread_id,
-            "cutoff cannot include source session metadata",
-        ));
-    }
     let path = rollout_path.to_path_buf();
     let end_byte_offset = end.end_byte_offset;
     let contains_prefix = tokio::task::spawn_blocking(move || {
