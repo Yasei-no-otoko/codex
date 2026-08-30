@@ -4998,7 +4998,7 @@ impl ThreadRequestProcessor {
                     config,
                     InitialHistory::Resumed(ResumedHistory {
                         conversation_id: source_thread_id,
-                        history: history_items,
+                        history: Arc::clone(&history_items),
                         rollout_path: source_thread.rollout_path.clone(),
                     }),
                     thread_source,
