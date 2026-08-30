@@ -146,7 +146,7 @@ impl LocalThreadStore {
         let mut segments = Vec::new();
         let mut seen = HashSet::new();
         let mut next_rollout_id = None;
-        let mut end = None;
+        let mut end: Option<HistoryPosition> = None;
         let mut history_mode = None;
         let mut ancestor_guards = Vec::new();
 
@@ -181,8 +181,8 @@ impl LocalThreadStore {
             };
             let _filesystem_guard = match representation {
                 LineageRepresentation::Existing => None,
-                (LineageRepresentation::PlainForReference
-                | LineageRepresentation::ReadOnlyForAttachment)
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment
                     if next_rollout_id.is_none() =>
                 {
                     let guard = match preheld_source_guard.as_ref() {

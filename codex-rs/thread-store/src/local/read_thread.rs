@@ -149,7 +149,7 @@ pub(super) async fn read_thread_by_rollout_path(
     if let Some(mut metadata) = read_sqlite_metadata(store, thread.thread_id).await {
         if thread.history_mode == ThreadHistoryMode::Paginated {
             // Paginated display metadata lives in SQLite because rollout history may be partial.
-            metadata.rollout_path = path;
+            metadata.rollout_path = path.clone();
             metadata.archived_at = thread.archived_at;
             thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
         } else {
@@ -468,7 +468,10 @@ async fn read_legacy_segment_prefix(
             .await
             .map_err(|err| ThreadStoreError::Internal {
                 message: format!("failed to read rollout {}: {err}", path.display()),
-            })?;
+            })?
+        else {
+            break;
+        };
         let (raw_line, byte_count, terminated) = match record {
             codex_rollout::RawRolloutLine::Complete(line) => {
                 let byte_count = line.len() as u64;
