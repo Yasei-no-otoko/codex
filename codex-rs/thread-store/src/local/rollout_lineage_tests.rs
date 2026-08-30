@@ -239,6 +239,99 @@ async fn reference_lineage_rejects_mismatched_leaf_and_ancestor_metadata() {
     assert_invalid_reference_lineage(&store, mismatched_leaf, "belongs to another thread").await;
 }
 
+#[tokio::test]
+async fn locked_reference_lineage_retains_ancestor_guard_across_stores() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+    let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
+    let root = ThreadId::default();
+    let child = ThreadId::default();
+    let root_path = write_rollout(home.path(), root, None, /*next_ordinal*/ 2);
+    write_rollout(
+        home.path(),
+        child,
+        Some(history_position(
+            root_path.as_path(),
+            root,
+            /*end_ordinal_exclusive*/ 2,
+        )),
+        /*next_ordinal*/ 2,
+    );
+
+    let source_guard = store
+        .writer_lock_coordinator
+        .acquire(child)
+        .expect("hold source writer guard");
+    let (lineage, ancestor_guards) = store
+        .resolve_rollout_lineage_for_reference_locked_with_source_guard(child, source_guard)
+        .await
+        .expect("resolve locked lineage");
+    assert_eq!(lineage.segments().len(), 2);
+    assert_eq!(ancestor_guards.len(), 1);
+    let err = maintenance_store
+        .writer_lock_coordinator
+        .acquire(root)
+        .expect_err("ancestor guard must block another store's maintenance");
+    assert!(matches!(err, crate::ThreadStoreError::Conflict { .. }));
+    drop(ancestor_guards);
+    assert!(
+        maintenance_store
+            .writer_lock_coordinator
+            .acquire(root)
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn resolves_reverted_rollout_with_distinct_logical_and_immutable_ids() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let root = ThreadId::default();
+    let logical_thread = ThreadId::default();
+    let replacement_rollout = ThreadId::default();
+    let root_path = write_rollout(home.path(), root, None, /*next_ordinal*/ 2);
+    write_reverted_rollout(
+        home.path(),
+        logical_thread,
+        replacement_rollout,
+        Some(history_position(
+            root_path.as_path(),
+            root,
+            /*end_ordinal_exclusive*/ 2,
+        )),
+        /*next_ordinal*/ 3,
+    );
+
+    let lineage = store
+        .resolve_rollout_lineage(logical_thread)
+        .await
+        .expect("resolve reverted rollout lineage");
+    assert_eq!(lineage.segments()[0].rollout_id(), root);
+    assert_eq!(lineage.segments()[1].rollout_id(), replacement_rollout);
+}
+
+#[tokio::test]
+async fn rejects_reverted_filename_with_mismatched_logical_thread_id() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let root = ThreadId::default();
+    let child = ThreadId::default();
+    let unrelated = ThreadId::default();
+    let root_path = write_reverted_rollout(home.path(), unrelated, root, None, 2);
+    write_rollout(
+        home.path(),
+        child,
+        Some(history_position(
+            root_path.as_path(),
+            root,
+            /*end_ordinal_exclusive*/ 2,
+        )),
+        /*next_ordinal*/ 2,
+    );
+    assert_invalid_reference_lineage(&store, child, "filename or metadata belongs").await;
+}
+
 async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, detail: &str) {
     let err = store
         .resolve_rollout_lineage(thread_id)
@@ -334,6 +427,44 @@ fn write_rollout_with_meta_id(
         }),
     );
     fs::write(path.as_path(), format!("{line}\n")).expect("write rollout");
+    path
+}
+
+fn write_reverted_rollout(
+    home: &Path,
+    logical_thread_id: ThreadId,
+    rollout_id: ThreadId,
+    history_base: Option<HistoryPosition>,
+    next_ordinal: u64,
+) -> std::path::PathBuf {
+    let directory = home.join("sessions/2026/07/16");
+    fs::create_dir_all(directory.as_path()).expect("create rollout directory");
+    let path = directory.join(format!(
+        "rollout-2026-07-16T00-00-00-{logical_thread_id}_{rollout_id}.jsonl"
+    ));
+    let initial_ordinal = history_base.map_or(0, |base| base.end_ordinal_exclusive);
+    let mut lines = vec![rollout_line(
+        initial_ordinal,
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: logical_thread_id.into(),
+                id: logical_thread_id,
+                history_mode: ThreadHistoryMode::Paginated,
+                history_base,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    )];
+    for offset in 1..next_ordinal {
+        lines.push(rollout_line(
+            initial_ordinal
+                .checked_add(offset)
+                .expect("fixture ordinal"),
+            RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ShutdownComplete),
+        ));
+    }
+    fs::write(path.as_path(), format!("{}\n", lines.join("\n"))).expect("write rollout");
     path
 }
 

@@ -25,10 +25,10 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::RolloutRecorder;
 use crate::RolloutRecorderParams;
+use crate::ThreadWriterLockCoordinator;
 use crate::append_rollout_item_to_path;
 use crate::read_session_meta_line;
 use crate::search_rollout_matches;
-use crate::ThreadWriterLockCoordinator;
 
 #[test]
 fn compression_and_reference_writer_use_the_same_thread_lock() -> anyhow::Result<()> {

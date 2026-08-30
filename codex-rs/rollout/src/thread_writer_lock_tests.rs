@@ -54,3 +54,32 @@ fn topology_barrier_serializes_reference_scans_and_renames() -> std::io::Result<
     assert!(second.acquire_topology().is_ok());
     Ok(())
 }
+
+#[test]
+fn per_thread_source_guards_allow_independent_preparations() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let first_thread =
+        ThreadId::from_string(&Uuid::from_u128(903).to_string()).map_err(std::io::Error::other)?;
+    let second_thread =
+        ThreadId::from_string(&Uuid::from_u128(904).to_string()).map_err(std::io::Error::other)?;
+    let first = std::sync::Arc::new(ThreadWriterLockCoordinator::new(home.path()));
+    let second = std::sync::Arc::new(ThreadWriterLockCoordinator::new(home.path()));
+    let _first_prepared = first.acquire(first_thread)?;
+    let _second_prepared = second.acquire(second_thread)?;
+    let maintenance = std::sync::Arc::new(ThreadWriterLockCoordinator::new(home.path()));
+    assert_eq!(
+        maintenance
+            .acquire(first_thread)
+            .expect_err("first source guard must block maintenance")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        maintenance
+            .acquire(second_thread)
+            .expect_err("second source guard must block maintenance")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    Ok(())
+}

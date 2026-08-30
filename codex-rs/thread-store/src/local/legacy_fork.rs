@@ -35,7 +35,6 @@ pub(super) async fn prepare(
     let super::ForkSourceGuards {
         lifecycle: source_reservation,
         filesystem: source_filesystem_guard,
-        topology: source_topology_guard,
     } = source_guards;
     match live_writer::persist_thread(store, thread_id).await {
         Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
@@ -108,10 +107,12 @@ pub(super) async fn prepare(
         // A legacy child carries an immutable prefix. Resolve every ancestor under the same
         // managed-path rules before creating another reference; accepting only the leaf would
         // make a later copy fallback drop that prefix.
-        let lineage = store
-            .resolve_rollout_lineage_for_reference(thread_id)
+        let (lineage, _ancestor_guards) = store
+            .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+                thread_id,
+                source_filesystem_guard.clone(),
+            )
             .await?;
-        let _ancestor_guards = store.acquire_lineage_ancestor_locks(&lineage).await?;
         Arc::new(model_context::load_for_fork(lineage, Some(history_base)).await?)
     } else {
         Arc::new(model_context::load_legacy_fork_context(source_path, end_byte_offset).await?)
@@ -120,11 +121,7 @@ pub(super) async fn prepare(
         thread_id,
         Some(history_base),
         model_context,
-        (
-            source_reservation,
-            source_filesystem_guard,
-            source_topology_guard,
-        ),
+        (source_reservation, source_filesystem_guard),
     ))
 }
 

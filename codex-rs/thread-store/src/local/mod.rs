@@ -171,7 +171,6 @@ struct ThreadCoordination {
 pub(super) struct ForkSourceGuards {
     pub(super) lifecycle: OwnedRwLockReadGuard<()>,
     pub(super) filesystem: WriterLockGuard,
-    pub(super) topology: writer_lock::TopologyLockGuard,
 }
 
 impl LiveWriterLocks {
@@ -343,34 +342,10 @@ impl LocalThreadStore {
             Some(guard) => guard,
             None => self.writer_lock_coordinator.acquire(thread_id)?,
         };
-        let topology = self.writer_lock_coordinator.acquire_topology()?;
         Ok(ForkSourceGuards {
             lifecycle,
             filesystem,
-            topology,
         })
-    }
-
-    /// Retain cross-process locks for inherited physical segments while a fork materializes or
-    /// scans them. The immediate source is already protected by `ForkSourceGuards`.
-    async fn acquire_lineage_ancestor_locks(
-        &self,
-        lineage: &rollout_lineage::RolloutLineage,
-    ) -> ThreadStoreResult<Vec<WriterLockGuard>> {
-        let mut guards = Vec::new();
-        for segment in lineage
-            .segments()
-            .iter()
-            .take(lineage.segments().len().saturating_sub(1))
-        {
-            let rollout_id = segment.rollout_id();
-            let guard = match self.existing_writer_lock(rollout_id).await {
-                Some(guard) => guard,
-                None => self.writer_lock_coordinator.acquire(rollout_id)?,
-            };
-            guards.push(guard);
-        }
-        Ok(guards)
     }
 
     async fn insert_live_recorder(

@@ -17,6 +17,7 @@ use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ListTurnsParams;
+use crate::LoadThreadHistoryParams;
 use crate::RevertThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
@@ -92,6 +93,15 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .meta;
     assert_eq!(replacement_meta.id, thread_id);
     assert_eq!(replacement_meta.memory_mode, None);
+    assert_eq!(
+        store
+            .resolve_rollout_lineage(thread_id)
+            .await
+            .expect("resolve first reverted lineage")
+            .segments()
+            .len(),
+        2
+    );
     assert_eq!(turn_ids(&store, thread_id).await, vec!["turn-1"]);
 
     store
@@ -101,6 +111,22 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         })
         .await
         .expect("revert before first turn");
+    assert_eq!(
+        store
+            .resolve_rollout_lineage(thread_id)
+            .await
+            .expect("resolve twice-reverted lineage")
+            .segments()
+            .len(),
+        3
+    );
+    store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load context after second revert");
     assert_eq!(turn_ids(&store, thread_id).await, Vec::<String>::new());
 
     store

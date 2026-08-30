@@ -9,6 +9,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use super::LocalThreadStore;
 use super::legacy_envelope;
 use super::thread_rollout_resolver;
+use super::writer_lock::WriterLockGuard;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
@@ -47,9 +48,28 @@ impl LocalThreadStore {
         &self,
         requested_thread_id: ThreadId,
     ) -> ThreadStoreResult<RolloutLineage> {
-        self.resolve_rollout_lineage_with_representation(
+        let (lineage, _guards) = self
+            .resolve_rollout_lineage_with_representation_and_guards(
+                requested_thread_id,
+                LineageRepresentation::PlainForReference,
+                None,
+            )
+            .await?;
+        Ok(lineage)
+    }
+
+    /// Resolve a reference lineage while retaining guards for every ancestor before its path or
+    /// metadata is read. The caller already owns the source guard and keeps it through child
+    /// durability; this method only returns guards acquired for inherited segments.
+    pub(super) async fn resolve_rollout_lineage_for_reference_locked_with_source_guard(
+        &self,
+        requested_thread_id: ThreadId,
+        source_guard: WriterLockGuard,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_guards(
             requested_thread_id,
             LineageRepresentation::PlainForReference,
+            Some(source_guard),
         )
         .await
     }
@@ -59,11 +79,28 @@ impl LocalThreadStore {
         requested_thread_id: ThreadId,
         representation: LineageRepresentation,
     ) -> ThreadStoreResult<RolloutLineage> {
+        let (lineage, _guards) = self
+            .resolve_rollout_lineage_with_representation_and_guards(
+                requested_thread_id,
+                representation,
+                None,
+            )
+            .await?;
+        Ok(lineage)
+    }
+
+    async fn resolve_rollout_lineage_with_representation_and_guards(
+        &self,
+        requested_thread_id: ThreadId,
+        representation: LineageRepresentation,
+        preheld_source_guard: Option<WriterLockGuard>,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
         let mut segments = Vec::new();
         let mut seen = HashSet::new();
         let mut next_rollout_id = None;
         let mut end = None;
         let mut history_mode = None;
+        let mut ancestor_guards = Vec::new();
 
         loop {
             let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
@@ -71,6 +108,26 @@ impl LocalThreadStore {
                 LineageRepresentation::Existing => None,
                 LineageRepresentation::PlainForReference => {
                     Some(self.live_writer_locks.lock(coordination_id).await)
+                }
+            };
+            let _filesystem_guard = match representation {
+                LineageRepresentation::Existing => None,
+                LineageRepresentation::PlainForReference if next_rollout_id.is_none() => {
+                    let guard = match preheld_source_guard.as_ref() {
+                        Some(guard) => guard.clone(),
+                        // This branch has no external caller retaining a source guard; acquire
+                        // one for the resolver itself and retain it through its path reads.
+                        None => self.writer_lock_coordinator.acquire(coordination_id)?,
+                    };
+                    Some(guard)
+                }
+                LineageRepresentation::PlainForReference => {
+                    let guard = match self.existing_writer_lock(coordination_id).await {
+                        Some(guard) => guard,
+                        None => self.writer_lock_coordinator.acquire(coordination_id)?,
+                    };
+                    ancestor_guards.push(guard.clone());
+                    Some(guard)
                 }
             };
             let (rollout_id, rollout_path) = match next_rollout_id {
@@ -114,12 +171,13 @@ impl LocalThreadStore {
                         rollout_path.display()
                     ),
                 })?;
-            if meta.meta.id != rollout_id
+            if codex_rollout::rollout_thread_id_from_path(rollout_path.as_path())
+                != Some(meta.meta.id)
                 || codex_rollout::rollout_id_from_path(rollout_path.as_path()) != Some(rollout_id)
             {
                 return Err(malformed_lineage(
                     requested_thread_id,
-                    "source rollout path or metadata belongs to another thread",
+                    "source rollout filename or metadata belongs to another thread",
                 ));
             }
             if history_mode.is_some_and(|expected| expected != meta.meta.history_mode) {
@@ -182,11 +240,15 @@ impl LocalThreadStore {
         }
 
         segments.reverse();
-        Ok(RolloutLineage {
-            segments,
-            history_mode: history_mode
-                .ok_or_else(|| malformed_lineage(requested_thread_id, "source lineage is empty"))?,
-        })
+        Ok((
+            RolloutLineage {
+                segments,
+                history_mode: history_mode.ok_or_else(|| {
+                    malformed_lineage(requested_thread_id, "source lineage is empty")
+                })?,
+            },
+            ancestor_guards,
+        ))
     }
 }
 
