@@ -5,6 +5,7 @@ use codex_protocol::protocol::HistoryPosition;
 
 use super::LocalThreadStore;
 use super::legacy_envelope;
+use super::helpers::scoped_rollout_path;
 use super::live_writer;
 use super::model_context;
 use super::thread_rollout_resolver;
@@ -44,7 +45,19 @@ pub(super) async fn prepare(
             operation: "compressed legacy reference fork",
         });
     }
-    let end_byte_offset = last_complete_rollout_envelope_offset(source.path.as_path()).await?;
+    let source_path = match scoped_rollout_path(
+        store.config.codex_home.clone(),
+        source.path.as_path(),
+        "Codex home",
+    ) {
+        Ok(path) => path,
+        Err(_) => return Err(ThreadStoreError::Unsupported { operation: "external legacy reference fork" }),
+    };
+    let source_meta = codex_rollout::read_session_meta_line(source_path.as_path()).await.map_err(|err| ThreadStoreError::Internal { message: format!("failed to read legacy source metadata {}: {err}", source_path.display()) })?;
+    if source_meta.meta.id != thread_id {
+        return Err(ThreadStoreError::Unsupported { operation: "mismatched legacy reference fork" });
+    }
+    let end_byte_offset = last_complete_rollout_envelope_offset(source_path.as_path()).await?;
     if end_byte_offset == 0 {
         return Err(ThreadStoreError::Unsupported {
             operation: "legacy reference fork without complete rollout envelope",
@@ -56,7 +69,7 @@ pub(super) async fn prepare(
         end_byte_offset,
     };
     let model_context = Arc::new(
-        model_context::load_legacy_fork_context(source.path, end_byte_offset).await?,
+        model_context::load_legacy_fork_context(source_path, end_byte_offset).await?,
     );
     Ok(PreparedFork::new(
         thread_id,
