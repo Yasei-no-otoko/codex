@@ -2,6 +2,7 @@ mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
+mod legacy_envelope;
 mod legacy_fork;
 mod list_threads;
 mod live_writer;

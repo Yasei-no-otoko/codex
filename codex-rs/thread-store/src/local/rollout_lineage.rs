@@ -7,6 +7,7 @@ use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 
 use super::LocalThreadStore;
+use super::legacy_envelope;
 use super::thread_rollout_resolver;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -277,27 +278,10 @@ async fn validate_cutoff_bounds(
     if history_mode == ThreadHistoryMode::Legacy {
         let validation_path = path.clone();
         let complete_envelope = tokio::task::spawn_blocking(move || {
-            let bytes = std::fs::read(&validation_path)?;
-            let end = usize::try_from(end_byte_offset)
-                .ok()
-                .filter(|end| *end <= bytes.len());
-            let Some(end) = end else {
-                return Ok::<_, std::io::Error>(false);
-            };
-            if end == 0 || bytes[end - 1] != b'\n' {
-                return Ok(false);
-            }
-            let start = bytes[..end - 1]
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(0, |index| index + 1);
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes[start..end - 1])
-            else {
-                return Ok(false);
-            };
-            Ok(value.get("timestamp").is_some_and(serde_json::Value::is_string)
-                && value.get("type").is_some_and(serde_json::Value::is_string)
-                && value.get("payload").is_some_and(serde_json::Value::is_object))
+            legacy_envelope::validate_rollout_envelope_cutoff(
+                validation_path.as_path(),
+                end_byte_offset,
+            )
         })
         .await
         .map_err(|err| ThreadStoreError::Internal {
