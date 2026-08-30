@@ -55,6 +55,18 @@ fn root_unsafe_source_allows_copy_fallback_but_reference_child_fails_closed() {
 }
 
 #[test]
+fn compressed_reference_child_cannot_fall_back_to_a_physical_suffix_copy() {
+    assert!(matches!(
+        unsafe_source_error(false, "compressed legacy reference fork"),
+        ThreadStoreError::Unsupported { .. }
+    ));
+    assert!(matches!(
+        unsafe_source_error(true, "compressed legacy reference fork"),
+        ThreadStoreError::InvalidRequest { .. }
+    ));
+}
+
+#[test]
 fn managed_source_requires_session_tree_and_canonical_filename_id() {
     let home = tempdir().expect("temporary Codex home");
     let thread_id = ThreadId::default();

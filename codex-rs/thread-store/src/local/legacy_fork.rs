@@ -40,24 +40,22 @@ pub(super) async fn prepare(
     let source = thread_rollout_resolver::resolve_current_including_archived(store, thread_id)
         .await?
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    if source.path.extension().is_some_and(|extension| extension == "zst") {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "compressed legacy reference fork",
-        });
-    }
     // Read enough metadata to classify an unsafe source before accepting its pathname. A root
     // legacy thread may still take the existing physical-copy fallback; a reference child must
     // never do so, because that would silently lose its inherited prefix.
     let source_meta = match codex_rollout::read_session_meta_line(source.path.as_path()).await {
         Ok(meta) => meta,
-        Err(_) => {
-            return Err(unsafe_source_error(
-                false,
-                "unreadable legacy reference source",
-            ));
-        }
+        // Without the header we cannot prove this is a standalone root. Fail closed rather than
+        // allow the app-server's physical-copy fallback to discard a possible inherited prefix.
+        Err(_) => return Err(unsafe_source_error(true, "unreadable legacy reference source")),
     };
     let reference_child = source_meta.meta.history_base.is_some();
+    if source.path.extension().is_some_and(|extension| extension == "zst") {
+        return Err(unsafe_source_error(
+            reference_child,
+            "compressed legacy reference fork",
+        ));
+    }
     let source_path = match managed_rollout_path(
         store.config.codex_home.as_path(),
         source.path.as_path(),
