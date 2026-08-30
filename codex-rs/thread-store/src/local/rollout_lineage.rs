@@ -146,7 +146,13 @@ impl LocalThreadStore {
                 LineageRepresentation::PlainForReference => rollout_path,
             };
             if let Some(end) = end {
-                validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
+                validate_cutoff_bounds(
+                    requested_thread_id,
+                    rollout_path.as_path(),
+                    &end,
+                    meta.meta.history_mode,
+                )
+                .await?;
             }
             let start_ordinal = match meta.meta.history_mode {
                 ThreadHistoryMode::Legacy => 0,
@@ -234,7 +240,13 @@ impl RolloutLineage {
             .ok_or_else(|| ThreadStoreError::Internal {
                 message: "rollout lineage has no segments".to_string(),
             })?;
-        validate_cutoff_bounds(end.thread_id, segment.rollout_path.as_path(), &end).await?;
+        validate_cutoff_bounds(
+            end.thread_id,
+            segment.rollout_path.as_path(),
+            &end,
+            self.history_mode,
+        )
+        .await?;
         segment.end = Some(end);
         Ok(self)
     }
@@ -258,9 +270,41 @@ async fn validate_cutoff_bounds(
     requested_thread_id: ThreadId,
     rollout_path: &Path,
     end: &HistoryPosition,
+    history_mode: ThreadHistoryMode,
 ) -> ThreadStoreResult<()> {
-    let path = rollout_path.to_path_buf();
     let end_byte_offset = end.end_byte_offset;
+    let path = rollout_path.to_path_buf();
+    if history_mode == ThreadHistoryMode::Legacy {
+        let validation_path = path.clone();
+        let complete_envelope = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&validation_path)?;
+            let mut scanner = codex_rollout::ReverseJsonlScanner::new_at(file, end_byte_offset)?;
+            let Some(codex_rollout::ScanOutcome::Parsed(value)) =
+                scanner.scan_next::<serde_json::Value>()?
+            else {
+                return Ok::<_, std::io::Error>(false);
+            };
+            Ok(scanner.last_record_end_offset() == Some(end_byte_offset)
+                && scanner.last_record_terminated_by_newline() == Some(true)
+                && value.get("timestamp").is_some_and(serde_json::Value::is_string)
+                && value.get("type").is_some_and(serde_json::Value::is_string)
+                && value.get("payload").is_some_and(serde_json::Value::is_object))
+        })
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to join legacy cutoff validation: {err}"),
+        })?
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to validate legacy cutoff {}: {err}", rollout_path.display()),
+        })?;
+        if !complete_envelope {
+            return Err(malformed_lineage(
+                requested_thread_id,
+                "cutoff byte offset is not at a complete JSONL record",
+            ));
+        }
+        return Ok(());
+    }
     let contains_prefix = tokio::task::spawn_blocking(move || {
         codex_rollout::rollout_contains_prefix(&path, end_byte_offset)
     })
