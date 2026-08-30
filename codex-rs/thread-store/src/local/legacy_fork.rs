@@ -57,6 +57,11 @@ pub(super) async fn prepare(
     if source_meta.meta.id != thread_id {
         return Err(ThreadStoreError::Unsupported { operation: "mismatched legacy reference fork" });
     }
+    if codex_rollout::rollout_id_from_path(source_path.as_path()) != Some(thread_id) {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "legacy reference source rollout id",
+        });
+    }
     let end_byte_offset = last_complete_rollout_envelope_offset(source_path.as_path()).await?;
     if end_byte_offset == 0 {
         return Err(ThreadStoreError::Unsupported {
