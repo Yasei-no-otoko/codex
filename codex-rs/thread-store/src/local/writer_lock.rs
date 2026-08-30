@@ -11,8 +11,6 @@ use crate::ThreadStoreResult;
 pub(super) const WRITER_LOCK_DIR: &str = codex_rollout::THREAD_WRITER_LOCK_DIR;
 #[cfg(test)]
 pub(super) const COORDINATION_LOCK_FILE: &str = codex_rollout::THREAD_WRITER_COORDINATION_LOCK_FILE;
-#[cfg(test)]
-pub(super) const TOPOLOGY_LOCK_FILE: &str = codex_rollout::THREAD_WRITER_TOPOLOGY_LOCK_FILE;
 
 pub(super) type WriterLockGuard = codex_rollout::ThreadWriterLockGuard;
 pub(super) type TopologyLockGuard = codex_rollout::ThreadWriterTopologyLockGuard;

@@ -520,13 +520,22 @@ async fn validate_raw_rollout_cutoff(
     let mut offset = 0_u64;
     let mut last_complete = 0_u64;
     let mut last_valid = 0_u64;
-    while let Some(record) = reader
-        .next_raw_line_limited(CUTOFF_LINE_LIMIT)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to scan lineage {}: {err}", rollout_path.display()),
-        })?
-    {
+    loop {
+        let Some(record) = reader
+            .next_raw_line_limited(CUTOFF_LINE_LIMIT)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to scan lineage {}: {err}", rollout_path.display()),
+            })?
+        else {
+            if offset < end_byte_offset {
+                return Err(malformed_lineage(
+                    requested_thread_id,
+                    "cutoff byte offset is past the source rollout",
+                ));
+            }
+            break;
+        };
         let (line, byte_count, terminated, oversized) = match record {
             codex_rollout::RawRolloutLine::Complete(line) => {
                 let byte_count = line.len();
@@ -545,6 +554,12 @@ async fn validate_raw_rollout_cutoff(
         offset = next;
         // An EOF-partial record is never a valid cutoff, even when its JSON happens to parse.
         if !terminated {
+            if offset < end_byte_offset {
+                return Err(malformed_lineage(
+                    requested_thread_id,
+                    "cutoff byte offset is past the source rollout",
+                ));
+            }
             break;
         }
         last_complete = offset;

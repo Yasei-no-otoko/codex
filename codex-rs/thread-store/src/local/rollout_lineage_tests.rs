@@ -25,25 +25,33 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
     let root = ThreadId::default();
     let middle = ThreadId::default();
     let child = ThreadId::default();
-    let root_path = write_rollout(
+    let root_path = fs::canonicalize(write_rollout(
         home.path(),
         root,
         /*history_base*/ None,
         /*next_ordinal*/ 6,
-    );
+    ))
+    .expect("canonical root rollout path");
     let root_end = history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 4);
-    let middle_path = write_rollout(home.path(), middle, Some(root_end), /*next_ordinal*/ 1);
+    let middle_path = fs::canonicalize(write_rollout(
+        home.path(),
+        middle,
+        Some(root_end),
+        /*next_ordinal*/ 1,
+    ))
+    .expect("canonical middle rollout path");
     let middle_end = history_position(
         middle_path.as_path(),
         middle,
         /*end_ordinal_exclusive*/ 5,
     );
-    let child_path = write_rollout(
+    let child_path = fs::canonicalize(write_rollout(
         home.path(),
         child,
         Some(middle_end),
         /*next_ordinal*/ 3,
-    );
+    ))
+    .expect("canonical child rollout path");
 
     let lineage = store
         .resolve_rollout_lineage(child)
@@ -81,12 +89,13 @@ async fn resolves_archived_ancestors() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let root = ThreadId::default();
     let child = ThreadId::default();
-    let root_path = write_rollout_under(
+    let root_path = fs::canonicalize(write_rollout_under(
         home.path().join("archived_sessions"),
         root,
         /*history_base*/ None,
         /*next_ordinal*/ 3,
-    );
+    ))
+    .expect("canonical archived root rollout path");
     write_rollout(
         home.path(),
         child,
@@ -112,14 +121,21 @@ async fn resolves_lineage_at_explicit_history_position() {
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let root = ThreadId::default();
     let child = ThreadId::default();
-    let root_path = write_rollout(
+    let root_path = fs::canonicalize(write_rollout(
         home.path(),
         root,
         /*history_base*/ None,
         /*next_ordinal*/ 6,
-    );
+    ))
+    .expect("canonical root rollout path");
     let root_end = history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 4);
-    let child_path = write_rollout(home.path(), child, Some(root_end), /*next_ordinal*/ 4);
+    let child_path = fs::canonicalize(write_rollout(
+        home.path(),
+        child,
+        Some(root_end),
+        /*next_ordinal*/ 4,
+    ))
+    .expect("canonical child rollout path");
     let end = history_position(
         child_path.as_path(),
         child,
@@ -477,11 +493,14 @@ async fn rejects_reverted_filename_with_mismatched_logical_thread_id() {
     let child = ThreadId::default();
     let unrelated = ThreadId::default();
     let root_path = write_reverted_rollout(home.path(), unrelated, root, None, 2);
+    let mismatched_root_path =
+        root_path.with_file_name(format!("rollout-2026-07-16T00-00-00-{child}_{root}.jsonl"));
+    fs::rename(root_path, mismatched_root_path.as_path()).expect("rename mismatched fixture");
     write_rollout(
         home.path(),
         child,
         Some(history_position(
-            root_path.as_path(),
+            mismatched_root_path.as_path(),
             root,
             /*end_ordinal_exclusive*/ 2,
         )),
