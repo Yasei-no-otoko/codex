@@ -21,7 +21,7 @@ pub(super) fn last_complete_rollout_envelope_offset(path: &Path) -> io::Result<u
     let Some(end) = last_newline_end(&mut file, file_len)? else {
         return Ok(0);
     };
-    let start = previous_newline_start(&mut file, end)?;
+    let start = previous_newline_start(&mut file, end - 1)?;
     if !is_rollout_envelope(&mut file, start, end - 1)? {
         return Ok(0);
     }
