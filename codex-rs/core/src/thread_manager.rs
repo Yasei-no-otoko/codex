@@ -1560,7 +1560,7 @@ impl ThreadManagerState {
                     include_archived,
                 })
                 .await
-                .map(|context| context.items)
+                .map(|context| Self::expand_paginated_model_context(context.items))
                 .map_err(|err| match err {
                     ThreadStoreError::ThreadNotFound { thread_id } => {
                         CodexErr::ThreadNotFound(thread_id)
@@ -1582,6 +1582,31 @@ impl ThreadManagerState {
                 "failed to read stored thread {thread_id}: {err}"
             ))),
         }
+    }
+
+    /// Expands only the latest Paginated compaction checkpoint for logical memory consumers.
+    fn expand_paginated_model_context(items: Vec<RolloutItem>) -> Vec<RolloutItem> {
+        let latest = items
+            .iter()
+            .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
+        let mut expanded = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            if Some(index) != latest {
+                expanded.push(item);
+                continue;
+            }
+            match item {
+                RolloutItem::Compacted(mut compacted) => {
+                    if let Some(history) = compacted.replacement_history.take() {
+                        expanded.extend(history.into_iter().map(RolloutItem::ResponseItem));
+                    } else {
+                        expanded.push(RolloutItem::Compacted(compacted));
+                    }
+                }
+                item => expanded.push(item),
+            }
+        }
+        expanded
     }
 
     pub(crate) async fn load_latest_model_context(
