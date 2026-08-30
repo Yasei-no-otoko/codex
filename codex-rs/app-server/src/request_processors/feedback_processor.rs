@@ -645,7 +645,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn physical_rollout_path_resolves_zstd_only_without_materializing_plain() {
+    async fn physical_rollout_path_resolves_zstd_only_without_materializing_plain()
+    -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
         let logical = home.path().join("rollout-2026-08-30T00-00-00-test.jsonl");
         let compressed = logical.with_extension("jsonl.zst");
@@ -656,11 +657,12 @@ mod tests {
         assert_eq!(resolved, Some(compressed.clone()));
         assert!(!logical.exists());
         assert!(compressed.exists());
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     }
 
     #[tokio::test]
-    async fn physical_rollout_path_prefers_plain_when_both_representations_exist() {
+    async fn physical_rollout_path_prefers_plain_when_both_representations_exist()
+    -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
         let logical = home.path().join("rollout-2026-08-30T00-00-00-test.jsonl");
         let compressed = logical.with_extension("jsonl.zst");
@@ -670,7 +672,7 @@ mod tests {
         let resolved = existing_physical_rollout_path(&logical).await;
 
         assert_eq!(resolved, Some(logical));
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     }
 
     #[test]
