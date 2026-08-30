@@ -1127,8 +1127,20 @@ async fn seed_stage1_candidate(
             .into(),
         ),
     };
-    let jsonl = serde_json::to_string(&line)?;
-    tokio::fs::write(&rollout_path, format!("{jsonl}\n")).await?;
+    let timestamp = updated_at.to_rfc3339();
+    let session_meta = memory_session_meta_line(
+        codex_home,
+        thread_id,
+        &timestamp,
+        /*forked_from_id*/ None,
+        /*history_base*/ None,
+    );
+    let jsonl = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&session_meta)?,
+        serde_json::to_string(&line)?
+    );
+    tokio::fs::write(&rollout_path, jsonl).await?;
 
     let mut metadata_builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
