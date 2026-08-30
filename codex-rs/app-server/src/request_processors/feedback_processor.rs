@@ -442,7 +442,7 @@ impl FeedbackRequestProcessor {
         // A loaded thread or SQLite row may retain the logical `.jsonl` path after compression.
         // Resolve the physical representation once so metadata, turn tags, and attachment paths
         // all observe the same plain/zstd file without materializing it.
-        match codex_rollout::existing_rollout_path(candidate.as_path()).await {
+        match existing_physical_rollout_path(candidate.as_path()).await {
             Some(path) => Some(path),
             None => {
                 warn!(
@@ -454,6 +454,12 @@ impl FeedbackRequestProcessor {
             }
         }
     }
+}
+
+/// Resolve a logical rollout filename to the physical file that currently exists. Compression
+/// changes the representation in place; this helper never materializes a missing plain sibling.
+async fn existing_physical_rollout_path(candidate: &Path) -> Option<PathBuf> {
+    codex_rollout::existing_rollout_path(candidate).await
 }
 
 async fn feedback_cwd(
@@ -635,6 +641,35 @@ mod tests {
 
         assert_eq!(cwd, test.cwd_path());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_rollout_path_resolves_zstd_only_without_materializing_plain() {
+        let home = tempfile::tempdir()?;
+        let logical = home.path().join("rollout-2026-08-30T00-00-00-test.jsonl");
+        let compressed = logical.with_extension("jsonl.zst");
+        std::fs::write(&compressed, b"compressed bytes")?;
+
+        let resolved = existing_physical_rollout_path(&logical).await;
+
+        assert_eq!(resolved, Some(compressed.clone()));
+        assert!(!logical.exists());
+        assert!(compressed.exists());
+        Ok::<_, anyhow::Error>(())
+    }
+
+    #[tokio::test]
+    async fn physical_rollout_path_prefers_plain_when_both_representations_exist() {
+        let home = tempfile::tempdir()?;
+        let logical = home.path().join("rollout-2026-08-30T00-00-00-test.jsonl");
+        let compressed = logical.with_extension("jsonl.zst");
+        std::fs::write(&logical, b"plain bytes")?;
+        std::fs::write(&compressed, b"compressed bytes")?;
+
+        let resolved = existing_physical_rollout_path(&logical).await;
+
+        assert_eq!(resolved, Some(logical));
+        Ok::<_, anyhow::Error>(())
     }
 
     #[test]
