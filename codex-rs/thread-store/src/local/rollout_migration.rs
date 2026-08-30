@@ -487,7 +487,8 @@ impl LocalThreadStore {
                     let recovered_path = self
                         .recover_published_migration(thread_id, &path, limiter)
                         .await?;
-                    self.clear_published_migration_journal(&journal_path).await?;
+                    self.clear_published_migration_journal(&journal_path)
+                        .await?;
                     Ok::<_, ThreadStoreError>(recovered_path)
                 }
                 .await;

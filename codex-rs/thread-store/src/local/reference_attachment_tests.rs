@@ -69,7 +69,7 @@ async fn logical_attachment_stays_pinned_when_current_rollout_changes_after_meta
         selected_rollout_id,
         "2026-07-16T00-00-01",
         "selected-revision",
-        Some(root_end.clone()),
+        Some(root_end),
     );
     let selected_metadata = codex_rollout::read_session_meta_line(selected_path.as_path())
         .await
@@ -84,13 +84,11 @@ async fn logical_attachment_stays_pinned_when_current_rollout_changes_after_meta
         Some(root_end),
     );
 
-    let current = thread_rollout_resolver::resolve_current_including_archived(
-        &store,
-        logical_thread_id,
-    )
-    .await
-    .expect("resolve replacement rollout")
-    .expect("current replacement rollout");
+    let current =
+        thread_rollout_resolver::resolve_current_including_archived(&store, logical_thread_id)
+            .await
+            .expect("resolve replacement rollout")
+            .expect("current replacement rollout");
     assert_eq!(current.rollout_id, replacement_rollout_id);
     assert_eq!(current.path, replacement_path);
 
@@ -107,9 +105,7 @@ async fn logical_attachment_stays_pinned_when_current_rollout_changes_after_meta
         .expect("write selected reference attachment");
     assert_eq!(
         outcome,
-        WriteReferenceLogicalAttachmentOutcome::Written {
-            truncated: false
-        }
+        WriteReferenceLogicalAttachmentOutcome::Written { truncated: false }
     );
 
     let header = fs::read_to_string(output.path())
@@ -136,7 +132,9 @@ fn write_attachment_rollout(
     let directory = home.join("sessions/2026/07/16");
     fs::create_dir_all(directory.as_path()).expect("create rollout directory");
     let path = if logical_thread_id == rollout_id {
-        directory.join(format!("rollout-{filename_timestamp}-{logical_thread_id}.jsonl"))
+        directory.join(format!(
+            "rollout-{filename_timestamp}-{logical_thread_id}.jsonl"
+        ))
     } else {
         directory.join(format!(
             "rollout-{filename_timestamp}-{logical_thread_id}_{rollout_id}.jsonl"

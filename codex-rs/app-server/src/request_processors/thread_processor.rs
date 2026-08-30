@@ -5067,7 +5067,9 @@ impl ThreadRequestProcessor {
             .await;
             let preview = preview_from_rollout_items(&history_items);
             if !preview.is_empty()
-                && let Err(err) = state_db.set_thread_preview_if_empty(thread_id, &preview).await
+                && let Err(err) = state_db
+                    .set_thread_preview_if_empty(thread_id, &preview)
+                    .await
             {
                 warn!(
                     %thread_id,

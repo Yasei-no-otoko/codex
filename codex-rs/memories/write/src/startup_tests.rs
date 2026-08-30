@@ -1129,11 +1129,7 @@ async fn seed_stage1_candidate(
     };
     let timestamp = updated_at.to_rfc3339();
     let session_meta = memory_session_meta_line(
-        codex_home,
-        thread_id,
-        &timestamp,
-        /*forked_from_id*/ None,
-        /*history_base*/ None,
+        codex_home, thread_id, &timestamp, /*forked_from_id*/ None, /*history_base*/ None,
     );
     let jsonl = format!(
         "{}\n{}\n",
@@ -1183,7 +1179,7 @@ async fn write_reference_memory_rollouts(
         serde_json::to_string(&parent_meta)?,
         serde_json::to_string(&parent_prefix)?
     );
-    let source_cutoff = parent_head.as_bytes().len() as u64;
+    let source_cutoff = parent_head.len() as u64;
     let parent_contents = format!(
         "{}{}\n",
         parent_head,

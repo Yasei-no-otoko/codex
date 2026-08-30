@@ -694,9 +694,7 @@ impl Session {
                 (
                     ForkPersistence::Referenced { history_base, .. },
                     ThreadHistoryMode::Paginated,
-                ) => {
-                    history_base.map(|position| position.end_ordinal_exclusive)
-                }
+                ) => history_base.map(|position| position.end_ordinal_exclusive),
                 (ForkPersistence::Referenced { .. }, ThreadHistoryMode::Legacy) => None,
                 (ForkPersistence::Copied, _) => match &initial_history {
                     InitialHistory::Resumed(resumed) => {
@@ -715,9 +713,9 @@ impl Session {
                             _ => None,
                         })
                     }
-                    InitialHistory::New
-                    | InitialHistory::Cleared
-                    | InitialHistory::Forked(_) => None,
+                    InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+                        None
+                    }
                 },
             }
             .filter(|_| forked_from_id.is_some());

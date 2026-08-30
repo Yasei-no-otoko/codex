@@ -1078,7 +1078,7 @@ mod tests {
             "end_ordinal_exclusive": 2,
             "end_byte_offset": parent_cutoff,
         });
-        let child_bytes = format!("{}\n{}", child_meta, child_delta)
+        let child_bytes = format!("{child_meta}\n{child_delta}")
             .replace("Hello from user", "child compressed delta");
         std::fs::write(&child_path, child_bytes.as_bytes()).expect("rewrite child metadata");
         let child_compressed = child_path.with_extension("jsonl.zst");
@@ -1514,12 +1514,8 @@ mod tests {
         .await
         .expect("state db should initialize");
         let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
-        let mut builder = ThreadMetadataBuilder::new(
-            thread_id,
-            rollout_path,
-            Utc::now(),
-            SessionSource::Cli,
-        );
+        let mut builder =
+            ThreadMetadataBuilder::new(thread_id, rollout_path, Utc::now(), SessionSource::Cli);
         builder.history_mode = ThreadHistoryMode::Legacy;
         builder.model_provider = Some(config.default_model_provider_id.clone());
         runtime

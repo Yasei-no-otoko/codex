@@ -594,13 +594,8 @@ pub async fn reconcile_rollout(
         .await;
         return;
     }
-    if let Err(err) = reconcile_rollout_metadata(
-        Some(ctx),
-        rollout_path,
-        default_provider,
-        archived_only,
-    )
-    .await
+    if let Err(err) =
+        reconcile_rollout_metadata(Some(ctx), rollout_path, default_provider, archived_only).await
     {
         warn!(
             "state db reconcile_rollout failed {}: {err}",
