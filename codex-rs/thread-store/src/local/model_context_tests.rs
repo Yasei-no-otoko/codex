@@ -187,9 +187,11 @@ async fn latest_legacy_context_uses_replacement_history_not_pre_compaction_repla
             RolloutItem::Compacted(compacted)
                 if compacted.message == "latest checkpoint"
                     && compacted.replacement_history.as_ref().is_some_and(|history| {
-                        serde_json::to_string(history)
-                            .expect("serialize replacement history")
-                            .contains("model-visible summary")
+                        history.iter().any(|item| {
+                            serde_json::to_string(&item.item)
+                                .expect("serialize replacement history item")
+                                .contains("model-visible summary")
+                        })
                     })
         )
     }));
@@ -251,7 +253,7 @@ async fn legacy_reference_context_replays_model_visible_ancestor_for_plain_and_z
             })
             .await
             .expect("load logical legacy reference context");
-        let serialized = serde_json::to_string(context.items).expect("serialize model context");
+        let serialized = serde_json::to_string(&context.items).expect("serialize model context");
         assert!(serialized.contains("ancestor model summary"));
         assert!(serialized.contains("child suffix"));
 
@@ -269,7 +271,7 @@ async fn legacy_reference_context_replays_model_visible_ancestor_for_plain_and_z
         })
         .await
         .expect("load compressed logical legacy reference context");
-    let serialized = serde_json::to_string(context.items).expect("serialize model context");
+    let serialized = serde_json::to_string(&context.items).expect("serialize model context");
     assert!(serialized.contains("ancestor model summary"));
     assert!(serialized.contains("child suffix"));
 }
@@ -347,7 +349,7 @@ async fn legacy_reference_context_normalizes_ancestor_ghost_snapshot() {
         checkpoint.replacement_history.as_ref().map(Vec::len),
         Some(1)
     );
-    let serialized = serde_json::to_string(context.items).expect("serialize model context");
+    let serialized = serde_json::to_string(&context.items).expect("serialize model context");
     assert!(serialized.contains("retained root history"));
     assert!(serialized.contains("child suffix"));
     assert!(!serialized.contains("ghost_snapshot"));
@@ -1021,7 +1023,7 @@ async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
         .await
         .expect("scan model context")
         .items;
-    let full_items = read_thread::load_history_items(path)
+    let full_items = super::super::read_thread::load_history_items(path)
         .await
         .expect("load full history");
 
