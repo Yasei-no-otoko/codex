@@ -503,6 +503,9 @@ impl ThreadStore for LocalThreadStore {
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move {
+            // Mode selection and source metadata must observe the same lifecycle generation as
+            // fork preparation. The prepared fork retains its own lease through child durability.
+            let _source_lifecycle = self.live_writer_locks.reserve_lifecycle(params.thread_id).await;
             let source = thread_rollout_resolver::resolve_current_including_archived(
                 self,
                 params.thread_id,

@@ -53,7 +53,17 @@ pub(super) async fn prepare(
     let source = thread_rollout_resolver::resolve_current_including_archived(store, thread_id)
         .await?
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+    if source.path.extension().is_some_and(|extension| extension == "zst") {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "compressed legacy reference fork",
+        });
+    }
     let end_byte_offset = last_complete_rollout_envelope_offset(source.path.as_path()).await?;
+    if end_byte_offset == 0 {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "legacy reference fork without complete rollout envelope",
+        });
+    }
     let history_base = HistoryPosition {
         thread_id,
         end_ordinal_exclusive: 0,
