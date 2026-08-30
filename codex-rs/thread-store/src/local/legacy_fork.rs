@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use codex_protocol::protocol::HistoryPosition;
 
-use super::LocalThreadStore;
+use super::helpers::managed_rollout_path;
 use super::legacy_envelope;
-use super::helpers::scoped_rollout_path;
 use super::live_writer;
 use super::model_context;
 use super::thread_rollout_resolver;
+use super::LocalThreadStore;
 use crate::ForkBoundary;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
@@ -45,21 +45,34 @@ pub(super) async fn prepare(
             operation: "compressed legacy reference fork",
         });
     }
-    let reference_child = source_meta_placeholder_is_reference(store, thread_id).await?;
-    let source_path = match scoped_rollout_path(
-        store.config.codex_home.clone(),
+    // Read enough metadata to classify an unsafe source before accepting its pathname. A root
+    // legacy thread may still take the existing physical-copy fallback; a reference child must
+    // never do so, because that would silently lose its inherited prefix.
+    let source_meta = match codex_rollout::read_session_meta_line(source.path.as_path()).await {
+        Ok(meta) => meta,
+        Err(_) => {
+            return Err(unsafe_source_error(
+                false,
+                "unreadable legacy reference source",
+            ));
+        }
+    };
+    let reference_child = source_meta.meta.history_base.is_some();
+    let source_path = match managed_rollout_path(
+        store.config.codex_home.as_path(),
         source.path.as_path(),
-        "Codex home",
+        thread_id,
     ) {
         Ok(path) => path,
-        Err(_) => return Err(unsafe_source_error(reference_child, "external legacy reference fork")),
+        Err(_) => {
+            return Err(unsafe_source_error(
+                reference_child,
+                "unmanaged legacy reference source",
+            ));
+        }
     };
-    let source_meta = codex_rollout::read_session_meta_line(source_path.as_path()).await.map_err(|err| ThreadStoreError::Internal { message: format!("failed to read legacy source metadata {}: {err}", source_path.display()) })?;
     if source_meta.meta.id != thread_id {
         return Err(unsafe_source_error(reference_child, "mismatched legacy reference fork"));
-    }
-    if codex_rollout::rollout_id_from_path(source_path.as_path()) != Some(thread_id) {
-        return Err(unsafe_source_error(reference_child, "legacy reference source rollout id"));
     }
     let end_byte_offset = last_complete_rollout_envelope_offset(source_path.as_path()).await?;
     if end_byte_offset == 0 {
@@ -72,28 +85,21 @@ pub(super) async fn prepare(
         end_ordinal_exclusive: 0,
         end_byte_offset,
     };
-    let model_context = Arc::new(
-        model_context::load_legacy_fork_context(source_path, end_byte_offset).await?,
-    );
+    let model_context = if reference_child {
+        // A legacy child carries an immutable prefix. Resolve every ancestor under the same
+        // managed-path rules before creating another reference; accepting only the leaf would
+        // make a later copy fallback drop that prefix.
+        let lineage = store.resolve_rollout_lineage_for_reference(thread_id).await?;
+        Arc::new(model_context::load_for_fork(lineage, Some(history_base)).await?)
+    } else {
+        Arc::new(model_context::load_legacy_fork_context(source_path, end_byte_offset).await?)
+    };
     Ok(PreparedFork::new(
         thread_id,
         Some(history_base),
         model_context,
         source_reservation,
     ))
-}
-
-async fn source_meta_placeholder_is_reference(
-    store: &LocalThreadStore,
-    thread_id: codex_protocol::ThreadId,
-) -> ThreadStoreResult<bool> {
-    let Some(source) = thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await? else {
-        return Ok(false);
-    };
-    Ok(codex_rollout::read_session_meta_line(source.path.as_path())
-        .await
-        .map(|meta| meta.meta.history_base.is_some())
-        .unwrap_or(true))
 }
 
 fn unsafe_source_error(reference_child: bool, operation: &'static str) -> ThreadStoreError {

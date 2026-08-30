@@ -97,10 +97,13 @@ impl LocalThreadStore {
             }
             let rollout_path = match representation {
                 LineageRepresentation::Existing => rollout_path,
-                LineageRepresentation::PlainForReference => super::helpers::scoped_rollout_path(
-                    self.config.codex_home.clone(),
+                // Every reference segment, including its leaf, must retain a canonical managed
+                // pathname. Otherwise a later copy fallback could preserve only the child's
+                // physical suffix and silently discard an inherited ancestor.
+                LineageRepresentation::PlainForReference => super::helpers::managed_rollout_path(
+                    self.config.codex_home.as_path(),
                     rollout_path.as_path(),
-                    "Codex home",
+                    rollout_id,
                 )?,
             };
             let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())

@@ -213,11 +213,45 @@ async fn rejects_missing_cycles_and_out_of_bounds_offsets() {
     .await;
 }
 
+#[tokio::test]
+async fn reference_lineage_rejects_mismatched_leaf_and_ancestor_metadata() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let root = ThreadId::default();
+    let child = ThreadId::default();
+    let unrelated = ThreadId::default();
+    let root_path = write_rollout_with_meta_id(home.path(), root, unrelated, None);
+    write_rollout(
+        home.path(),
+        child,
+        Some(history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 1)),
+        /*next_ordinal*/ 2,
+    );
+    assert_invalid_reference_lineage(&store, child, "belongs to another thread").await;
+
+    let mismatched_leaf = ThreadId::default();
+    write_rollout_with_meta_id(home.path(), mismatched_leaf, unrelated, None);
+    assert_invalid_reference_lineage(&store, mismatched_leaf, "belongs to another thread").await;
+}
+
 async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, detail: &str) {
     let err = store
         .resolve_rollout_lineage(thread_id)
         .await
         .expect_err("lineage should be invalid");
+    assert!(err.to_string().contains(detail), "{err}");
+}
+
+async fn assert_invalid_reference_lineage(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    detail: &str,
+) {
+    let err = store
+        .resolve_rollout_lineage_for_reference(thread_id)
+        .await
+        .expect_err("reference lineage should be invalid");
     assert!(err.to_string().contains(detail), "{err}");
 }
 
@@ -267,6 +301,33 @@ fn write_rollout_under(
         ));
     }
     fs::write(path.as_path(), format!("{}\n", lines.join("\n"))).expect("write rollout");
+    path
+}
+
+fn write_rollout_with_meta_id(
+    home: &Path,
+    path_thread_id: ThreadId,
+    meta_thread_id: ThreadId,
+    history_base: Option<HistoryPosition>,
+) -> std::path::PathBuf {
+    let directory = home.join("sessions/2026/07/16");
+    fs::create_dir_all(directory.as_path()).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-07-16T00-00-00-{path_thread_id}.jsonl"));
+    let initial_ordinal = history_base.map_or(0, |base| base.end_ordinal_exclusive);
+    let line = rollout_line(
+        initial_ordinal,
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: meta_thread_id.into(),
+                id: meta_thread_id,
+                history_mode: ThreadHistoryMode::Paginated,
+                history_base,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    );
+    fs::write(path.as_path(), format!("{line}\n")).expect("write rollout");
     path
 }
 

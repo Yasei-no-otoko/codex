@@ -20,6 +20,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+use codex_rollout::SESSIONS_SUBDIR;
 use codex_rollout::RolloutReferenceIndex;
 use codex_rollout::ThreadItem;
 use codex_rollout::find_thread_names_by_ids;
@@ -59,6 +60,50 @@ pub(super) fn scoped_rollout_path(
             ),
         })
     }
+}
+
+/// Canonicalize a rollout path and require it to live in one of Codex's managed session trees.
+///
+/// A path merely being below `codex_home` is not enough: callers use this before publishing a
+/// reference, so allowing arbitrary files in that directory would make an external or renamed
+/// rollout appear to be a durable immutable ancestor. Canonical paths make both `..` and symlink
+/// escapes fail closed.
+pub(super) fn managed_rollout_path(
+    codex_home: &Path,
+    rollout_path: &Path,
+    expected_rollout_id: ThreadId,
+) -> ThreadStoreResult<PathBuf> {
+    let canonical_rollout_path = std::fs::canonicalize(rollout_path).map_err(|_| {
+        ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout path `{}` must be in a managed Codex sessions directory",
+                rollout_path.display()
+            ),
+        }
+    })?;
+    let is_managed = [SESSIONS_SUBDIR, ARCHIVED_SESSIONS_SUBDIR]
+        .into_iter()
+        .filter_map(|subdir| std::fs::canonicalize(codex_home.join(subdir)).ok())
+        .any(|root| canonical_rollout_path.starts_with(root));
+    if !is_managed {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout path `{}` must be in a managed Codex sessions directory",
+                rollout_path.display()
+            ),
+        });
+    }
+    if codex_rollout::rollout_id_from_path(canonical_rollout_path.as_path())
+        != Some(expected_rollout_id)
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout path `{}` does not have canonical rollout id {expected_rollout_id}",
+                rollout_path.display()
+            ),
+        });
+    }
+    Ok(canonical_rollout_path)
 }
 
 pub(super) fn rollout_path_is_archived(codex_home: &Path, path: &Path) -> bool {
