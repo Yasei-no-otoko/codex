@@ -12,7 +12,6 @@ use tempfile::NamedTempFile;
 use tempfile::TempDir;
 
 use super::super::LocalThreadStore;
-use super::super::test_support::test_config;
 use super::reference_attachment::AsyncAttachmentWriter;
 use super::reference_attachment::envelope_kind;
 use super::reference_attachment::stream_segment;
@@ -21,6 +20,7 @@ use super::thread_rollout_resolver;
 use crate::ThreadStore;
 use crate::WriteReferenceLogicalAttachmentOutcome;
 use crate::WriteReferenceLogicalAttachmentParams;
+use crate::local::test_support::test_config;
 
 fn envelope(kind: &str, payload: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
