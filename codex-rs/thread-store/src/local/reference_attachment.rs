@@ -39,12 +39,12 @@ pub(super) async fn write_reference_logical_attachment(
         filesystem: source_filesystem_guard,
     } = source_guards;
     let source_filesystem_guard_for_resolver = source_filesystem_guard.clone();
-    let resolved =
-        thread_rollout_resolver::resolve_current_including_archived(store, params.thread_id)
-            .await?
-            .ok_or(ThreadStoreError::ThreadNotFound {
-                thread_id: params.thread_id,
-            })?;
+    let resolved = thread_rollout_resolver::resolve_path_including_archived(
+        store,
+        params.thread_id,
+        params.rollout_path,
+    )
+    .await?;
     let path = codex_rollout::existing_rollout_path(resolved.path.as_path())
         .await
         .unwrap_or(resolved.path);
@@ -81,8 +81,10 @@ pub(super) async fn write_reference_logical_attachment(
     }
 
     let (lineage, _ancestor_filesystem_guards) = store
-        .resolve_rollout_lineage_for_reference_attachment(
+        .resolve_rollout_lineage_for_reference_attachment_from_source_locked_with_source_guard(
             params.thread_id,
+            resolved.rollout_id,
+            path.clone(),
             source_filesystem_guard_for_resolver,
         )
         .await?;

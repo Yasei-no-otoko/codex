@@ -390,6 +390,7 @@ impl FeedbackRequestProcessor {
         };
         let params = WriteReferenceLogicalAttachmentParams {
             thread_id,
+            rollout_path: rollout_path.to_path_buf(),
             include_archived: true,
             output_path: temp_file.path().to_path_buf(),
             max_bytes: MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES,

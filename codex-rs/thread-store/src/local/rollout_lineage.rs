@@ -104,19 +104,25 @@ impl LocalThreadStore {
         .await
     }
 
-    /// Resolve an attachment lineage while retaining stable filesystem guards for every
-    /// immutable source and ancestor. The caller owns the source lifecycle lease and passes the
-    /// source filesystem guard in; both remain held by the caller through streaming.
-    pub(super) async fn resolve_rollout_lineage_for_reference_attachment(
+    /// Resolve an attachment lineage from a caller-selected immutable source without switching
+    /// back to the logical thread's current rollout after a revert. The caller owns the source
+    /// lifecycle lease and passes the source filesystem guard in; both remain held through
+    /// streaming.
+    pub(super) async fn resolve_rollout_lineage_for_reference_attachment_from_source_locked_with_source_guard(
         &self,
         requested_thread_id: ThreadId,
+        source_rollout_id: ThreadId,
+        source_rollout_path: PathBuf,
         source_guard: WriterLockGuard,
     ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
         self.resolve_rollout_lineage_with_representation_and_guards(
             requested_thread_id,
             LineageRepresentation::ReadOnlyForAttachment,
             Some(source_guard),
-            None,
+            Some(LineageSource {
+                rollout_id: source_rollout_id,
+                path: source_rollout_path,
+            }),
         )
         .await
     }

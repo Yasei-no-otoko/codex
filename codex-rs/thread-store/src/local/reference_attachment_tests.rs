@@ -1,14 +1,26 @@
 use std::fs;
+use std::path::Path;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use tempfile::NamedTempFile;
+use tempfile::TempDir;
 
+use super::super::LocalThreadStore;
+use super::super::test_support::test_config;
 use super::reference_attachment::AsyncAttachmentWriter;
 use super::reference_attachment::envelope_kind;
 use super::reference_attachment::stream_segment;
 use super::rollout_lineage::RolloutLineageSegment;
+use super::thread_rollout_resolver;
+use crate::ThreadStore;
+use crate::WriteReferenceLogicalAttachmentOutcome;
+use crate::WriteReferenceLogicalAttachmentParams;
 
 fn envelope(kind: &str, payload: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -26,6 +38,142 @@ fn join_lines(lines: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
         output.push(b'\n');
     }
     output
+}
+
+#[tokio::test]
+async fn logical_attachment_stays_pinned_when_current_rollout_changes_after_metadata_read() {
+    let home = TempDir::new().expect("create Codex home");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let root_id = ThreadId::default();
+    let logical_thread_id = ThreadId::default();
+    let selected_rollout_id = ThreadId::default();
+    let replacement_rollout_id = ThreadId::default();
+    let root_path = write_attachment_rollout(
+        home.path(),
+        root_id,
+        root_id,
+        "2026-07-16T00-00-00",
+        "root",
+        /*history_base*/ None,
+    );
+    let root_end = HistoryPosition {
+        thread_id: root_id,
+        end_ordinal_exclusive: 2,
+        end_byte_offset: fs::metadata(root_path.as_path())
+            .expect("root metadata")
+            .len(),
+    };
+    let selected_path = write_attachment_rollout(
+        home.path(),
+        logical_thread_id,
+        selected_rollout_id,
+        "2026-07-16T00-00-01",
+        "selected-revision",
+        Some(root_end.clone()),
+    );
+    let selected_metadata = codex_rollout::read_session_meta_line(selected_path.as_path())
+        .await
+        .expect("read selected metadata before revert");
+    assert_eq!(selected_metadata.meta.timestamp, "selected-revision");
+    let replacement_path = write_attachment_rollout(
+        home.path(),
+        logical_thread_id,
+        replacement_rollout_id,
+        "2026-07-16T00-00-02",
+        "replacement-revision",
+        Some(root_end),
+    );
+
+    let current = thread_rollout_resolver::resolve_current_including_archived(
+        &store,
+        logical_thread_id,
+    )
+    .await
+    .expect("resolve replacement rollout")
+    .expect("current replacement rollout");
+    assert_eq!(current.rollout_id, replacement_rollout_id);
+    assert_eq!(current.path, replacement_path);
+
+    let output = NamedTempFile::new().expect("create attachment");
+    let outcome = store
+        .write_reference_logical_attachment(WriteReferenceLogicalAttachmentParams {
+            thread_id: logical_thread_id,
+            rollout_path: selected_path,
+            include_archived: true,
+            output_path: output.path().to_path_buf(),
+            max_bytes: 4096,
+        })
+        .await
+        .expect("write selected reference attachment");
+    assert_eq!(
+        outcome,
+        WriteReferenceLogicalAttachmentOutcome::Written {
+            truncated: false
+        }
+    );
+
+    let header = fs::read_to_string(output.path())
+        .expect("read attachment")
+        .lines()
+        .next()
+        .map(str::to_owned)
+        .expect("attachment header");
+    let header: RolloutLine = serde_json::from_str(header.as_str()).expect("parse header");
+    let RolloutItem::SessionMeta(meta) = header.item else {
+        panic!("attachment must begin with SessionMeta");
+    };
+    assert_eq!(meta.meta.timestamp, "selected-revision");
+}
+
+fn write_attachment_rollout(
+    home: &Path,
+    logical_thread_id: ThreadId,
+    rollout_id: ThreadId,
+    filename_timestamp: &str,
+    session_timestamp: &str,
+    history_base: Option<HistoryPosition>,
+) -> std::path::PathBuf {
+    let directory = home.join("sessions/2026/07/16");
+    fs::create_dir_all(directory.as_path()).expect("create rollout directory");
+    let path = if logical_thread_id == rollout_id {
+        directory.join(format!("rollout-{filename_timestamp}-{logical_thread_id}.jsonl"))
+    } else {
+        directory.join(format!(
+            "rollout-{filename_timestamp}-{logical_thread_id}_{rollout_id}.jsonl"
+        ))
+    };
+    let initial_ordinal = history_base
+        .as_ref()
+        .map_or(0, |base| base.end_ordinal_exclusive);
+    let lines = [
+        RolloutLine {
+            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+            ordinal: Some(initial_ordinal),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: logical_thread_id.into(),
+                    id: logical_thread_id,
+                    timestamp: session_timestamp.to_string(),
+                    history_mode: ThreadHistoryMode::Paginated,
+                    history_base,
+                    ..SessionMeta::default()
+                },
+                git: None,
+            }),
+        },
+        RolloutLine {
+            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+            ordinal: Some(initial_ordinal + 1),
+            item: RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ShutdownComplete),
+        },
+    ];
+    let lines = lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("serialize rollout");
+    fs::write(path.as_path(), format!("{}\n", lines.join("\n"))).expect("write rollout");
+    path
 }
 
 #[tokio::test]

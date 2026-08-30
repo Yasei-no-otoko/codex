@@ -162,6 +162,8 @@ pub struct LoadThreadHistoryParams {
 #[derive(Clone, Debug)]
 pub struct WriteReferenceLogicalAttachmentParams {
     pub thread_id: ThreadId,
+    /// Immutable physical rollout selected by the caller for this attachment.
+    pub rollout_path: PathBuf,
     pub include_archived: bool,
     pub output_path: PathBuf,
     pub max_bytes: usize,
