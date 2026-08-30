@@ -79,6 +79,7 @@ mod user_authorization;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
+    /// The complete current model-visible context, not the physical pre-compaction replay.
     FullHistory,
     LastNTurns(usize),
 }

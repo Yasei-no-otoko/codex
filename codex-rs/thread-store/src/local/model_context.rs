@@ -13,6 +13,11 @@ use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use codex_rollout::ScanOutcome;
 
+const MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES: usize =
+    codex_rollout::MAX_ROLLOUT_RECORD_PAYLOAD_BYTES;
+const OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE: &str =
+    "model context contains an oversized JSONL record";
+
 use super::LocalThreadStore;
 use super::read_thread;
 use super::rollout_lineage::RolloutLineage;
@@ -73,6 +78,12 @@ pub(super) async fn load_latest_model_context(
         .and_then(|file_name| file_name.to_str())
         .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"));
     let items = match session_meta.meta.history_mode {
+        // A legacy reference child inherits an immutable prefix. Its physical suffix alone is
+        // not its model-visible context, including when the child currently has a zstd sibling.
+        ThreadHistoryMode::Legacy if session_meta.meta.history_base.is_some() => {
+            let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+            scan_model_context_from_lineage(lineage, session_meta).await?
+        }
         ThreadHistoryMode::Legacy if is_compressed => {
             read_thread::load_history_items(path.as_path()).await?
         }
@@ -189,8 +200,12 @@ fn scan_model_context_from_lineage_blocking(
         let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
             Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
             None => ReverseJsonlScanner::new(file)?,
-        };
+        }
+        .with_max_record_bytes(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES);
         while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
+            if scanner.skipped_oversized_record() {
+                return Err(oversized_model_context_record_error());
+            }
             let ScanOutcome::Parsed(line) = outcome else {
                 continue;
             };
@@ -203,6 +218,9 @@ fn scan_model_context_from_lineage_blocking(
                 ModelContextScanProgress::Continue => {}
                 ModelContextScanProgress::Complete => break 'segments,
             }
+        }
+        if scanner.skipped_oversized_record() {
+            return Err(oversized_model_context_record_error());
         }
     }
 
@@ -229,8 +247,12 @@ fn scan_model_context_segment(
     let mut scanner = match end_byte_offset {
         Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
         None => ReverseJsonlScanner::new(file)?,
-    };
+    }
+    .with_max_record_bytes(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES);
     while let Some(outcome) = scanner.scan_next::<serde_json::Value>()? {
+        if scanner.skipped_oversized_record() {
+            return Err(oversized_model_context_record_error());
+        }
         let ScanOutcome::Parsed(mut value) = outcome else {
             continue;
         };
@@ -250,7 +272,17 @@ fn scan_model_context_segment(
             ModelContextScanProgress::Complete => return Ok(true),
         }
     }
+    if scanner.skipped_oversized_record() {
+        return Err(oversized_model_context_record_error());
+    }
     Ok(false)
+}
+
+fn oversized_model_context_record_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE,
+    )
 }
 
 fn finish_model_context_scan(

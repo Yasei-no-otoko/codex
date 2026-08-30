@@ -152,6 +152,214 @@ async fn loads_latest_legacy_checkpoint_without_window_metadata() {
 }
 
 #[tokio::test]
+async fn latest_legacy_context_uses_replacement_history_not_pre_compaction_replay() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1015);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let RolloutItem::ResponseItem(replacement_item) = user_message("model-visible summary") else {
+        unreachable!("user_message returns a response item");
+    };
+    write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-14",
+        uuid,
+        [
+            legacy_user_message("obsolete physical history"),
+            legacy_compacted("latest checkpoint", Some(vec![replacement_item.item])),
+            turn_started("current-turn"),
+            legacy_user_message("current suffix"),
+            turn_context(home.path(), "current-turn"),
+        ],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load latest model-visible context");
+
+    assert!(context.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::Compacted(compacted)
+                if compacted.message == "latest checkpoint"
+                    && compacted.replacement_history.as_ref().is_some_and(|history| {
+                        serde_json::to_string(history)
+                            .expect("serialize replacement history")
+                            .contains("model-visible summary")
+                    })
+        )
+    }));
+    assert!(!context.items.iter().any(|item| {
+        serde_json::to_string(item)
+            .expect("serialize model context item")
+            .contains("obsolete physical history")
+    }));
+}
+
+#[tokio::test]
+async fn legacy_reference_context_replays_model_visible_ancestor_for_plain_and_zstd() {
+    let home = TempDir::new().expect("temp dir");
+    let root_uuid = Uuid::from_u128(/*v*/ 1018);
+    let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root thread id");
+    let RolloutItem::ResponseItem(replacement_item) = user_message("ancestor model summary") else {
+        unreachable!("user_message returns a response item");
+    };
+    let root_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-17",
+        root_uuid,
+        [legacy_compacted(
+            "ancestor checkpoint",
+            Some(vec![replacement_item.item]),
+        )],
+    );
+    let root_cutoff = std::fs::metadata(root_path.as_path())
+        .expect("read root metadata")
+        .len();
+
+    let child_uuid = Uuid::from_u128(/*v*/ 1019);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child thread id");
+    let child_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-18",
+        child_uuid,
+        [
+            turn_started("child-turn"),
+            legacy_user_message("child suffix"),
+            turn_context(home.path(), "child-turn"),
+        ],
+    );
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: root_id,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: root_cutoff,
+        },
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    for path in [root_path.as_path(), child_path.as_path()] {
+        let context = store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id: child_id,
+                include_archived: false,
+            })
+            .await
+            .expect("load logical legacy reference context");
+        let serialized = serde_json::to_string(context.items).expect("serialize model context");
+        assert!(serialized.contains("ancestor model summary"));
+        assert!(serialized.contains("child suffix"));
+
+        let input = std::fs::File::open(path).expect("open rollout");
+        let output = std::fs::File::create(path.with_extension("jsonl.zst"))
+            .expect("create compressed rollout");
+        zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+        std::fs::remove_file(path).expect("remove plain rollout");
+    }
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load compressed logical legacy reference context");
+    let serialized = serde_json::to_string(context.items).expect("serialize model context");
+    assert!(serialized.contains("ancestor model summary"));
+    assert!(serialized.contains("child suffix"));
+}
+
+#[tokio::test]
+async fn legacy_model_context_rejects_oversized_record() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1016);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-15",
+        uuid,
+        [legacy_user_message("bounded context")],
+    );
+    append_items(
+        path.as_path(),
+        [legacy_user_message(
+            &"x".repeat(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES + 1),
+        )],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized legacy model-context record must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+}
+
+#[tokio::test]
+async fn paginated_model_context_rejects_oversized_plain_and_zstd_records() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1017);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-00-16",
+        uuid,
+        [user_message("bounded context")],
+    );
+    append_items(
+        path.as_path(),
+        [user_message(
+            &"x".repeat(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES + 1),
+        )],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let plain_error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized paginated record must fail closed");
+    assert!(
+        plain_error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+
+    let input = std::fs::File::open(path.as_path()).expect("open plain rollout");
+    let output =
+        std::fs::File::create(path.with_extension("jsonl.zst")).expect("create compressed rollout");
+    zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+    std::fs::remove_file(path.as_path()).expect("remove plain rollout");
+
+    let compressed_error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized compressed paginated record must fail closed");
+    assert!(
+        compressed_error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+}
+
+#[tokio::test]
 async fn normalizes_legacy_ghost_snapshots_during_reverse_scan() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1014);
@@ -278,7 +486,12 @@ async fn fork_context_excludes_items_after_frozen_cutoff() {
     );
     let history_base =
         history_position(path.as_path(), thread_id, /*end_ordinal_exclusive*/ 3);
-    append_items(path.as_path(), [user_message("later message")]);
+    append_items(
+        path.as_path(),
+        [user_message(
+            &"x".repeat(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES + 1),
+        )],
+    );
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let lineage = store
         .resolve_rollout_lineage(thread_id)

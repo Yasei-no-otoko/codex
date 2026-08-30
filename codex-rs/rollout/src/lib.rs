@@ -136,6 +136,7 @@ pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
 pub use recorder::append_rollout_item_to_path;
 pub use recorder::strip_legacy_ghost_snapshot_rollout_line;
+pub use reverse_jsonl_scanner::MAX_ROLLOUT_RECORD_PAYLOAD_BYTES;
 pub use reverse_jsonl_scanner::ReverseJsonlScanner;
 pub use reverse_jsonl_scanner::ScanOutcome;
 pub use rollout_reference_index::RolloutReferenceIndex;
