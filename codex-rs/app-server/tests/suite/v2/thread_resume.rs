@@ -969,6 +969,9 @@ async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Res
         let (items, _, _) =
             RolloutRecorder::load_rollout_items(fork_thread.path.as_ref().expect("fork rollout"))
                 .await?;
+        // Latest Legacy forks reference their immutable parent prefix through history_base, so the
+        // physical child rollout retains only child-owned settings. The cold-resume assertions
+        // below verify the logical parent settings still restore for the parent thread.
         assert_eq!(
             items
                 .into_iter()
@@ -978,10 +981,7 @@ async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Res
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![
-                ThreadId::from_string(&thread.id)?,
-                ThreadId::from_string(&fork_thread.id)?,
-            ]
+            vec![ThreadId::from_string(&fork_thread.id)?]
         );
 
         (thread.id, fork_thread.id)
