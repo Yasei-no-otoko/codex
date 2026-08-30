@@ -233,12 +233,12 @@ async fn attach_history_if_requested(
         return Ok(());
     }
     let thread_id = thread.thread_id;
-    let Some(path) = thread.rollout_path.clone() else {
+    if thread.rollout_path.is_none() {
         return Err(ThreadStoreError::Internal {
             message: format!("failed to load thread history for thread {thread_id}"),
         });
-    };
-    let items = load_history_items_for_thread(store, thread_id, &path).await?;
+    }
+    let items = load_history_items_for_thread(store, thread_id, include_archived).await?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())
 }
@@ -298,31 +298,65 @@ pub(super) async fn load_history_items(
 async fn load_history_items_for_thread(
     store: &LocalThreadStore,
     thread_id: codex_protocol::ThreadId,
-    path: &std::path::Path,
+    include_archived: bool,
 ) -> ThreadStoreResult<Vec<RolloutItem>> {
-    let path = codex_rollout::existing_rollout_path(path)
-        .await
-        .unwrap_or_else(|| path.to_path_buf());
+    // Reserve the source before resolving its physical representation or reading metadata. Keep
+    // both guards alive through the complete replay so archive/delete/compression cannot rename or
+    // remove the source while the lineage is being consumed.
+    let source_guards = store.acquire_fork_source_guards(thread_id).await?;
+    let super::ForkSourceGuards {
+        lifecycle: _source_lifecycle_guard,
+        filesystem: source_filesystem_guard,
+    } = source_guards;
+    let resolved = (if include_archived {
+        thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
+    } else {
+        thread_rollout_resolver::resolve_current(store, thread_id).await?
+    })
+    .ok_or_else(|| ThreadStoreError::InvalidRequest {
+        message: format!("no rollout found for thread id {thread_id}"),
+    })?;
+    let path = resolved.path;
     let requested_meta = read_session_meta_line(path.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to read session metadata {}: {err}", path.display()),
         })?;
+    if requested_meta.meta.id != thread_id
+        || codex_rollout::rollout_id_from_path(path.as_path())
+            .is_some_and(|rollout_id| rollout_id != resolved.rollout_id)
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!("rollout metadata does not belong to thread {thread_id}"),
+        });
+    }
     if requested_meta.meta.history_mode != ThreadHistoryMode::Legacy
         || requested_meta.meta.history_base.is_none()
     {
         return load_history_items(path.as_path()).await;
     }
 
-    let lineage = store
-        .resolve_rollout_lineage_for_reference(thread_id)
+    let (lineage, ancestor_filesystem_guards) = store
+        .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+            thread_id,
+            source_filesystem_guard.clone(),
+        )
         .await?;
-    load_legacy_lineage_history(lineage, requested_meta).await
+    let mut no_op_probe = || Ok(());
+    load_legacy_lineage_history(
+        lineage,
+        requested_meta,
+        &ancestor_filesystem_guards,
+        &mut no_op_probe,
+    )
+    .await
 }
 
 async fn load_legacy_lineage_history(
     lineage: RolloutLineage,
     requested_meta: SessionMetaLine,
+    _ancestor_filesystem_guards: &[super::writer_lock::WriterLockGuard],
+    after_segment: &mut impl FnMut() -> ThreadStoreResult<()>,
 ) -> ThreadStoreResult<Vec<RolloutItem>> {
     if lineage.history_mode() != ThreadHistoryMode::Legacy {
         return Err(ThreadStoreError::InvalidRequest {
@@ -348,6 +382,7 @@ async fn load_legacy_lineage_history(
             },
         )
         .await?;
+        after_segment()?;
     }
     Ok(items)
 }
@@ -964,7 +999,9 @@ mod tests {
     #[tokio::test]
     async fn read_thread_replays_compressed_legacy_reference_child_and_ancestor() {
         let home = TempDir::new().expect("temp dir");
-        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let config = test_config(home.path());
+        let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
         let parent_uuid = Uuid::from_u128(213);
         let child_uuid = Uuid::from_u128(214);
         let parent_path = write_session_file(home.path(), "2025-01-03T12-00-00", parent_uuid)
@@ -1023,6 +1060,50 @@ mod tests {
         assert!(serialized.contains("Hello from user"));
         assert!(serialized.contains("child"));
         assert!(!serialized.contains("post-cutoff-secret"));
+
+        // Exercise the guarded read path directly and probe the filesystem lock after the first
+        // segment. Archive/delete use this same cross-process lock, so a conflict here proves the
+        // ancestor lease remains held while the logical read is still consuming its segments.
+        let source_guards = store
+            .acquire_fork_source_guards(child_id)
+            .await
+            .expect("acquire source guards");
+        let crate::local::ForkSourceGuards {
+            lifecycle: _source_lifecycle_guard,
+            filesystem: source_filesystem_guard,
+        } = source_guards;
+        let requested_meta = codex_rollout::read_session_meta_line(&child_compressed)
+            .await
+            .expect("read child metadata");
+        let (lineage, ancestor_filesystem_guards) = store
+            .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+                child_id,
+                source_filesystem_guard.clone(),
+            )
+            .await
+            .expect("resolve guarded lineage");
+        let parent_id = ThreadId::from_string(&parent_uuid.to_string()).expect("parent id");
+        let mut archive_probe = || {
+            let lock_result = maintenance_store.writer_lock_coordinator.acquire(parent_id);
+            assert!(matches!(
+                lock_result,
+                Err(ThreadStoreError::Conflict { .. })
+            ));
+            Ok(())
+        };
+        let items = load_legacy_lineage_history(
+            lineage,
+            requested_meta,
+            &ancestor_filesystem_guards,
+            &mut archive_probe,
+        )
+        .await
+        .expect("read guarded lineage");
+        assert!(
+            serde_json::to_string(&items)
+                .expect("serialize guarded history")
+                .contains("Hello from user")
+        );
     }
 
     #[tokio::test]
