@@ -48,6 +48,7 @@ pub(super) async fn read_thread(
     {
         let metadata_sandbox_policy = metadata.sandbox_policy.clone();
         let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
+        let sqlite_history_mode = thread.history_mode;
         // Paginated history may contain only a suffix, so its display metadata lives in SQLite.
         // Legacy display metadata remains rollout-derived.
         if thread.history_mode == ThreadHistoryMode::Legacy
@@ -74,6 +75,7 @@ pub(super) async fn read_thread(
                 &metadata_sandbox_policy,
                 rollout_thread.cwd.as_path(),
             );
+            rollout_thread.history_mode = sqlite_history_mode;
             thread = rollout_thread;
         }
         reject_paginated_history(&thread, params.include_history)?;
@@ -589,10 +591,9 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
     };
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
     let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
-    let history_mode = session_meta
-        .as_ref()
-        .map(|meta| meta.history_mode)
-        .unwrap_or(metadata.history_mode);
+    // SQLite is the public readiness authority for a migration. The physical
+    // rollout can be paginated before the migration has safely published it.
+    let history_mode = metadata.history_mode;
     let name = thread_name_from_metadata(store, &metadata, history_mode).await;
     let mut thread = stored_thread_from_state_metadata(store, metadata, parent_thread_id);
     thread.forked_from_id = forked_from_id;
@@ -1476,6 +1477,67 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_thread_keeps_sqlite_history_mode_while_loading_legacy_display_metadata() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(229);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let rollout_path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T12-00-00",
+            uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("session file");
+        codex_rollout::append_rollout_item_to_path(
+            &rollout_path,
+            &RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                    text: "Rollout user message".to_string(),
+                    text_elements: Vec::new(),
+                }])),
+                started_at_ms: Some(0),
+                completed_at_ms: 0,
+            })),
+        )
+        .await
+        .expect("append rollout user message");
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        let mut builder = ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.history_mode = ThreadHistoryMode::Legacy;
+        builder.model_provider = Some(config.default_model_provider_id.clone());
+        runtime
+            .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should succeed");
+
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read thread");
+
+        assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
+        assert_eq!(thread.preview, "Rollout user message");
     }
 
     #[tokio::test]
