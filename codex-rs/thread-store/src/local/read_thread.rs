@@ -366,7 +366,9 @@ async fn read_legacy_segment_prefix(
     // Keep legacy logical replay bounded for both plain and zstd rollouts. The limit matches the
     // migration reader's established record bound; oversized records fail closed instead of
     // allocating an unbounded Vec or silently dropping a valid record.
-    const LEGACY_READ_LINE_LIMIT: usize = 16 * 1024 * 1024;
+    const LEGACY_READ_PAYLOAD_LIMIT: usize = 16 * 1024 * 1024;
+    // RawRolloutLineReader counts the terminating LF in max_bytes.
+    const LEGACY_READ_LINE_LIMIT: usize = LEGACY_READ_PAYLOAD_LIMIT + 1;
     let mut reader = codex_rollout::open_rollout_raw_line_reader(path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -419,7 +421,7 @@ async fn read_legacy_segment_prefix(
                 }
                 return Err(ThreadStoreError::InvalidRequest {
                     message: format!(
-                        "legacy rollout record exceeds {LEGACY_READ_LINE_LIMIT} bytes: {}",
+                        "legacy rollout payload exceeds {LEGACY_READ_PAYLOAD_LIMIT} bytes: {}",
                         path.display()
                     ),
                 });

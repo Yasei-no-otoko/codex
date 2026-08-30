@@ -89,6 +89,67 @@ async fn oversized_single_line_is_drained_without_unbounded_reader_allocation() 
 }
 
 #[tokio::test]
+async fn raw_reader_allows_exact_payload_limit_plus_lf_for_plain_and_zstd() {
+    const PAYLOAD_LIMIT: usize = 16 * 1024 * 1024;
+    for compressed in [false, true] {
+        let source = NamedTempFile::new().expect("create source");
+        let mut exact = vec![b'x'; PAYLOAD_LIMIT];
+        exact.push(b'\n');
+        let path = if compressed {
+            let path = source.path().with_extension("jsonl.zst");
+            fs::write(
+                &path,
+                zstd::stream::encode_all(exact.as_slice(), 3).expect("compress exact record"),
+            )
+            .expect("write compressed exact record");
+            path
+        } else {
+            fs::write(source.path(), exact.as_slice()).expect("write exact record");
+            source.path().to_path_buf()
+        };
+        let mut reader = codex_rollout::open_rollout_raw_line_reader(&path)
+            .await
+            .expect("open exact record");
+        assert!(matches!(
+            reader
+                .next_raw_line_limited(PAYLOAD_LIMIT + 1)
+                .await
+                .expect("read exact record"),
+            Some(codex_rollout::RawRolloutLine::Complete(line)) if line.len() == PAYLOAD_LIMIT + 1
+        ));
+
+        let mut over = vec![b'x'; PAYLOAD_LIMIT + 1];
+        over.push(b'\n');
+        let over_path = if compressed {
+            let path = source.path().with_file_name("over.jsonl.zst");
+            fs::write(
+                &path,
+                zstd::stream::encode_all(over.as_slice(), 3).expect("compress over-limit record"),
+            )
+            .expect("write compressed over-limit record");
+            path
+        } else {
+            let path = source.path().with_file_name("over.jsonl");
+            fs::write(&path, over.as_slice()).expect("write over-limit record");
+            path
+        };
+        let mut reader = codex_rollout::open_rollout_raw_line_reader(&over_path)
+            .await
+            .expect("open over-limit record");
+        assert!(matches!(
+            reader
+                .next_raw_line_limited(PAYLOAD_LIMIT + 1)
+                .await
+                .expect("read over-limit record"),
+            Some(codex_rollout::RawRolloutLine::Oversized {
+                byte_count: _,
+                terminated: true,
+            })
+        ));
+    }
+}
+
+#[tokio::test]
 async fn oversized_record_at_ancestor_cutoff_cannot_leak_post_cutoff_secret() {
     let source = NamedTempFile::new().expect("create source");
     let prefix = envelope("event_msg", serde_json::json!({"message": "small-prefix"}));
