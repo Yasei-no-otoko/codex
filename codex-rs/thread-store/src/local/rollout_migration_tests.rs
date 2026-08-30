@@ -55,8 +55,8 @@ use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
 #[cfg(unix)]
 use super::decompress_rollout_to_path;
-use super::migration_journal_path;
 use super::decompressed_staged_rollout_path;
+use super::migration_journal_path;
 use super::staged_rollout_path;
 use super::telemetry::RolloutMigrationTrigger;
 use super::thread_history;
@@ -399,8 +399,11 @@ async fn migration_record_limit_accepts_exactly_16_mib_and_rejects_16_mib_plus_o
     exact_record.push(b' ');
     let oversized_eof_path = home.path().join("oversized-eof.jsonl");
     fs::write(&oversized_eof_path, exact_record).expect("write oversized EOF record");
-    let mut oversized_eof_reader =
-        BufReader::new(File::open(&oversized_eof_path).await.expect("open oversized EOF record"));
+    let mut oversized_eof_reader = BufReader::new(
+        File::open(&oversized_eof_path)
+            .await
+            .expect("open oversized EOF record"),
+    );
     let error = match super::read_rollout_record(&mut oversized_eof_reader, &mut bytes).await {
         Ok(_) => panic!("reject 16 MiB plus one EOF record"),
         Err(error) => error,
@@ -422,24 +425,36 @@ async fn assert_dry_run_rejects_oversized_rollout(
     original: &[u8],
 ) {
     let report = store
-        .migrate_rollouts(RolloutMigrationOptions::default())
+        .migrate_rollouts(RolloutMigrationOptions {
+            // Keep the limiter enabled while avoiding a long test sleep for the ~16 MiB fixture.
+            max_mib_per_second: Some(1024),
+            ..RolloutMigrationOptions::default()
+        })
         .await
         .expect("preflight legacy rollout");
 
-    assert_eq!(
-        report.outcomes,
-        vec![super::RolloutMigrationOutcome {
-            thread_id: Some(thread_id),
-            rollout_path: path.to_path_buf(),
-            status: RolloutMigrationStatus::Failed,
-            failure_reason: Some(RolloutMigrationFailureReason::OversizedRolloutRecord),
-            bytes_processed: 0,
-            message: Some(format!(
-                "thread-store internal error: rollout migration failed: {}",
-                super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
-            )),
-        }]
+    let outcome = report.outcomes.first().expect("preflight outcome");
+    let expected_message = format!(
+        "thread-store internal error: rollout migration failed: {}",
+        super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
     );
+    assert_eq!(
+        (
+            outcome.thread_id,
+            &outcome.rollout_path,
+            outcome.status,
+            outcome.failure_reason,
+            outcome.message.as_deref(),
+        ),
+        (
+            Some(thread_id),
+            path,
+            RolloutMigrationStatus::Failed,
+            Some(RolloutMigrationFailureReason::RolloutReadFailed),
+            Some(expected_message.as_str()),
+        )
+    );
+    assert!(outcome.bytes_processed > 0);
     assert_eq!(fs::read(path).expect("read source after dry run"), original);
     assert!(
         !staged_rollout_path(path)
@@ -1909,6 +1924,12 @@ async fn dry_run_reports_migration_order() {
             .collect::<Vec<_>>(),
         expected,
     );
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.bytes_processed > 0)
+    );
     assert_eq!(
         progress.last(),
         Some(&RolloutMigrationProgress {
@@ -1932,6 +1953,7 @@ async fn dry_run_reports_migration_order() {
         selected.outcomes[0].status,
         RolloutMigrationStatus::Eligible
     );
+    assert!(selected.outcomes[0].bytes_processed > 0);
 }
 
 #[tokio::test]

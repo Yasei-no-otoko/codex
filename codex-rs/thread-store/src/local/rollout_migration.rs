@@ -33,6 +33,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::BufWriter;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::LocalThreadStore;
@@ -148,7 +149,6 @@ pub enum RolloutMigrationFailureReason {
     MissingSqliteMetadata,
     InvalidSessionMetadata,
     RolloutReadFailed,
-    OversizedRolloutRecord,
     LegacyRolloutConversionFailed,
     SqliteMaterializationFailed,
     RolloutPublishFailed,
@@ -531,10 +531,11 @@ impl LocalThreadStore {
         }
 
         if options.mode == RolloutMigrationMode::DryRun {
-            let result = match has_oversized_rollout_record(&path).await {
+            let bytes_before = limiter.bytes_processed;
+            let result = match has_oversized_rollout_record(&path, limiter).await {
                 Ok(false) => Ok(RolloutMigrationStatus::Eligible),
                 Ok(true) => Err(RolloutMigrationFailure::new(
-                    RolloutMigrationFailureReason::OversizedRolloutRecord,
+                    RolloutMigrationFailureReason::RolloutReadFailed,
                     migration_error(OVERSIZED_ROLLOUT_RECORD_MESSAGE),
                 )),
                 Err(error) => Err(RolloutMigrationFailure::new(
@@ -546,7 +547,7 @@ impl LocalThreadStore {
                 thread_id,
                 path,
                 result,
-                /*bytes_processed*/ 0,
+                limiter.bytes_processed.saturating_sub(bytes_before),
             )));
         }
 
@@ -1245,10 +1246,18 @@ async fn read_rollout_record(
     }))
 }
 
-async fn has_oversized_rollout_record(rollout_path: &Path) -> ThreadStoreResult<bool> {
+async fn has_oversized_rollout_record(
+    rollout_path: &Path,
+    limiter: &mut RolloutMigrationRateLimiter,
+) -> ThreadStoreResult<bool> {
     let rollout_path = rollout_path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> io::Result<bool> {
+    let (bytes_tx, mut bytes_rx) = mpsc::channel(1);
+    let scan = tokio::task::spawn_blocking(move || -> io::Result<bool> {
         let file = std::fs::File::open(&rollout_path)?;
+        let file = RateLimitedRead {
+            reader: file,
+            bytes_tx,
+        };
         let reader: Box<dyn std::io::Read> = if rollout_path_is_compressed(&rollout_path) {
             Box::new(zstd::stream::read::Decoder::new(file)?)
         } else {
@@ -1270,10 +1279,32 @@ async fn has_oversized_rollout_record(rollout_path: &Path) -> ThreadStoreResult<
                 return Ok(true);
             }
         }
-    })
-    .await
-    .map_err(migration_error)?
-    .map_err(migration_error)
+    });
+    while let Some(bytes) = bytes_rx.recv().await {
+        limiter.account(bytes).await;
+    }
+    scan.await
+        .map_err(migration_error)?
+        .map_err(migration_error)
+}
+
+struct RateLimitedRead {
+    reader: std::fs::File,
+    bytes_tx: mpsc::Sender<u64>,
+}
+
+impl std::io::Read for RateLimitedRead {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.reader.read(buffer)?;
+        if bytes_read > 0 {
+            self.bytes_tx
+                .blocking_send(bytes_read as u64)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "preflight receiver closed")
+                })?;
+        }
+        Ok(bytes_read)
+    }
 }
 
 fn rollout_record_payload_byte_count(bytes: &[u8]) -> usize {
