@@ -61,7 +61,8 @@ where
         })
     }
 
-    /// Skips records larger than the configured limit without buffering or parsing them.
+    /// Skips records whose JSON payload exceeds the configured byte limit without buffering or
+    /// parsing them. A trailing newline terminator is excluded from the byte count.
     pub fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = Some(max_record_bytes);
         self

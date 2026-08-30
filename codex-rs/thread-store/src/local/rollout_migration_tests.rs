@@ -56,6 +56,7 @@ use super::RolloutMigrationStatus;
 #[cfg(unix)]
 use super::decompress_rollout_to_path;
 use super::migration_journal_path;
+use super::decompressed_staged_rollout_path;
 use super::staged_rollout_path;
 use super::telemetry::RolloutMigrationTrigger;
 use super::thread_history;
@@ -346,7 +347,7 @@ async fn migration_record_limit_accepts_exactly_16_mib_and_rejects_16_mib_plus_o
     let home = TempDir::new().expect("create Codex home");
     let exact_path = home.path().join("exact.jsonl");
     let mut exact_record = b"{}".to_vec();
-    exact_record.resize(super::MAX_ROLLOUT_LINE_BYTES - 1, b' ');
+    exact_record.resize(super::MAX_ROLLOUT_LINE_BYTES, b' ');
     exact_record.push(b'\n');
     fs::write(&exact_path, &exact_record).expect("write exact-limit record");
 
@@ -356,12 +357,15 @@ async fn migration_record_limit_accepts_exactly_16_mib_and_rejects_16_mib_plus_o
         .await
         .expect("read exact-limit record")
         .expect("exact-limit record is present");
-    assert_eq!(record.byte_count, super::MAX_ROLLOUT_LINE_BYTES as u64);
+    assert_eq!(
+        record.byte_count,
+        (super::MAX_ROLLOUT_LINE_BYTES + 1) as u64
+    );
     assert!(record.line.is_none());
 
     let oversized_path = home.path().join("oversized.jsonl");
     exact_record.insert(super::MAX_ROLLOUT_LINE_BYTES - 1, b' ');
-    fs::write(&oversized_path, exact_record).expect("write oversized record");
+    fs::write(&oversized_path, &exact_record).expect("write oversized record");
     let mut oversized_reader = BufReader::new(
         File::open(&oversized_path)
             .await
@@ -378,6 +382,141 @@ async fn migration_record_limit_accepts_exactly_16_mib_and_rejects_16_mib_plus_o
             super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
         )
     );
+
+    exact_record.pop();
+    exact_record.pop();
+    let exact_eof_path = home.path().join("exact-eof.jsonl");
+    fs::write(&exact_eof_path, &exact_record).expect("write exact-limit EOF record");
+    let mut exact_eof_reader =
+        BufReader::new(File::open(&exact_eof_path).await.expect("open EOF record"));
+    let record = super::read_rollout_record(&mut exact_eof_reader, &mut bytes)
+        .await
+        .expect("read exact-limit EOF record")
+        .expect("exact-limit EOF record is present");
+    assert_eq!(record.byte_count, super::MAX_ROLLOUT_LINE_BYTES as u64);
+    assert!(record.line.is_none());
+
+    exact_record.push(b' ');
+    let oversized_eof_path = home.path().join("oversized-eof.jsonl");
+    fs::write(&oversized_eof_path, exact_record).expect("write oversized EOF record");
+    let mut oversized_eof_reader =
+        BufReader::new(File::open(&oversized_eof_path).await.expect("open oversized EOF record"));
+    let error = match super::read_rollout_record(&mut oversized_eof_reader, &mut bytes).await {
+        Ok(_) => panic!("reject 16 MiB plus one EOF record"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "thread-store internal error: rollout migration failed: {}",
+            super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
+        )
+    );
+}
+
+async fn assert_dry_run_rejects_oversized_rollout(
+    store: &LocalThreadStore,
+    home: &Path,
+    thread_id: ThreadId,
+    path: &Path,
+    original: &[u8],
+) {
+    let report = store
+        .migrate_rollouts(RolloutMigrationOptions::default())
+        .await
+        .expect("preflight legacy rollout");
+
+    assert_eq!(
+        report.outcomes,
+        vec![super::RolloutMigrationOutcome {
+            thread_id: Some(thread_id),
+            rollout_path: path.to_path_buf(),
+            status: RolloutMigrationStatus::Failed,
+            failure_reason: Some(RolloutMigrationFailureReason::OversizedRolloutRecord),
+            bytes_processed: 0,
+            message: Some(format!(
+                "thread-store internal error: rollout migration failed: {}",
+                super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
+            )),
+        }]
+    );
+    assert_eq!(fs::read(path).expect("read source after dry run"), original);
+    assert!(
+        !staged_rollout_path(path)
+            .expect("build staged rollout path")
+            .exists()
+    );
+    assert!(
+        !decompressed_staged_rollout_path(path)
+            .expect("build decompressed staged rollout path")
+            .exists()
+    );
+    assert!(!migration_journal_path(home, thread_id).exists());
+    assert!(
+        thread_history::projection_state(store, thread_id)
+            .await
+            .expect("read SQLite projection")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn dry_run_rejects_oversized_plain_rollout_without_mutating_storage() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("kept question")],
+    );
+    let oversized_output = "x".repeat(super::MAX_ROLLOUT_LINE_BYTES);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open legacy rollout"),
+        "{{\"timestamp\":\"{TIMESTAMP}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"{oversized_output}\"}}}}"
+    )
+    .expect("write oversized rollout record");
+    let original = fs::read(&path).expect("read source rollout");
+    let store = indexed_store(home.path()).await;
+
+    assert_dry_run_rejects_oversized_rollout(&store, home.path(), thread_id, &path, &original)
+        .await;
+}
+
+#[tokio::test]
+async fn dry_run_rejects_oversized_compressed_rollout_without_mutating_storage() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("kept question")],
+    );
+    let oversized_output = "x".repeat(super::MAX_ROLLOUT_LINE_BYTES);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open legacy rollout"),
+        "{{\"timestamp\":\"{TIMESTAMP}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"{oversized_output}\"}}}}"
+    )
+    .expect("write oversized rollout record");
+    let compressed_path = compress_rollout(&path);
+    let original = fs::read(&compressed_path).expect("read compressed source rollout");
+    let store = indexed_store(home.path()).await;
+
+    assert_dry_run_rejects_oversized_rollout(
+        &store,
+        home.path(),
+        thread_id,
+        &compressed_path,
+        &original,
+    )
+    .await;
 }
 
 async fn indexed_store(home: &Path) -> LocalThreadStore {

@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::BufRead as _;
+use std::io::Read as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -71,6 +73,7 @@ use telemetry::RolloutMigrationTelemetry;
 use telemetry::RolloutMigrationTrigger;
 
 const PROJECTION_BATCH_BYTES: u64 = 256 * 1024;
+/// Maximum JSON payload bytes in a JSONL record, excluding a trailing newline terminator.
 const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
 const OVERSIZED_ROLLOUT_RECORD_MESSAGE: &str = "rollout contains an oversized JSONL record";
 
@@ -145,6 +148,7 @@ pub enum RolloutMigrationFailureReason {
     MissingSqliteMetadata,
     InvalidSessionMetadata,
     RolloutReadFailed,
+    OversizedRolloutRecord,
     LegacyRolloutConversionFailed,
     SqliteMaterializationFailed,
     RolloutPublishFailed,
@@ -527,10 +531,21 @@ impl LocalThreadStore {
         }
 
         if options.mode == RolloutMigrationMode::DryRun {
+            let result = match has_oversized_rollout_record(&path).await {
+                Ok(false) => Ok(RolloutMigrationStatus::Eligible),
+                Ok(true) => Err(RolloutMigrationFailure::new(
+                    RolloutMigrationFailureReason::OversizedRolloutRecord,
+                    migration_error(OVERSIZED_ROLLOUT_RECORD_MESSAGE),
+                )),
+                Err(error) => Err(RolloutMigrationFailure::new(
+                    RolloutMigrationFailureReason::RolloutReadFailed,
+                    error,
+                )),
+            };
             return Ok(Some(migration_outcome(
                 thread_id,
                 path,
-                Ok(RolloutMigrationStatus::Eligible),
+                result,
                 /*bytes_processed*/ 0,
             )));
         }
@@ -1218,7 +1233,7 @@ async fn read_rollout_record(
     if byte_count == 0 {
         return Ok(None);
     }
-    if byte_count > MAX_ROLLOUT_LINE_BYTES {
+    if rollout_record_payload_byte_count(bytes) > MAX_ROLLOUT_LINE_BYTES {
         return Err(migration_error(OVERSIZED_ROLLOUT_RECORD_MESSAGE));
     }
     // Legacy records do not have ordinals, so malformed complete records cannot be repaired.
@@ -1228,6 +1243,41 @@ async fn read_rollout_record(
         line,
         byte_count: byte_count as u64,
     }))
+}
+
+async fn has_oversized_rollout_record(rollout_path: &Path) -> ThreadStoreResult<bool> {
+    let rollout_path = rollout_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> io::Result<bool> {
+        let file = std::fs::File::open(&rollout_path)?;
+        let reader: Box<dyn std::io::Read> = if rollout_path_is_compressed(&rollout_path) {
+            Box::new(zstd::stream::read::Decoder::new(file)?)
+        } else {
+            Box::new(file)
+        };
+        let mut reader = std::io::BufReader::with_capacity(PROJECTION_BATCH_BYTES as usize, reader);
+        let mut bytes = Vec::new();
+
+        loop {
+            bytes.clear();
+            let byte_count = reader
+                .by_ref()
+                .take((MAX_ROLLOUT_LINE_BYTES + 1) as u64)
+                .read_until(b'\n', &mut bytes)?;
+            if byte_count == 0 {
+                return Ok(false);
+            }
+            if rollout_record_payload_byte_count(&bytes) > MAX_ROLLOUT_LINE_BYTES {
+                return Ok(true);
+            }
+        }
+    })
+    .await
+    .map_err(migration_error)?
+    .map_err(migration_error)
+}
+
+fn rollout_record_payload_byte_count(bytes: &[u8]) -> usize {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes).len()
 }
 
 async fn find_rollout_paths(root: &Path) -> ThreadStoreResult<Vec<PathBuf>> {

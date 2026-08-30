@@ -142,6 +142,7 @@ impl RolloutMigrationFailureReason {
             Self::MissingSqliteMetadata => "missing_sqlite_metadata",
             Self::InvalidSessionMetadata => "invalid_session_metadata",
             Self::RolloutReadFailed => "rollout_read_failed",
+            Self::OversizedRolloutRecord => "oversized_rollout_record",
             Self::LegacyRolloutConversionFailed => "legacy_rollout_conversion_failed",
             Self::SqliteMaterializationFailed => "sqlite_materialization_failed",
             Self::RolloutPublishFailed => "rollout_publish_failed",

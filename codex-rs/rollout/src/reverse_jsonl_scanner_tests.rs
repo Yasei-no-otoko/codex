@@ -86,6 +86,38 @@ fn skips_records_over_the_configured_limit() -> std::io::Result<()> {
 }
 
 #[test]
+fn applies_the_record_limit_to_payload_bytes_without_counting_newlines() -> std::io::Result<()> {
+    let max_record_bytes = super::READ_CHUNK_SIZE;
+    let mut exact = serde_json::to_vec(&record(""))?;
+    exact.resize(max_record_bytes, b' ');
+    let mut oversized = exact.clone();
+    oversized.push(b' ');
+
+    let mut newline_terminated = exact.clone();
+    newline_terminated.push(b'\n');
+    newline_terminated.extend_from_slice(&oversized);
+    newline_terminated.push(b'\n');
+    newline_terminated.extend_from_slice(
+        serde_json::to_string(&record("first"))?.as_bytes(),
+    );
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(newline_terminated))?
+        .with_max_record_bytes(/*max_record_bytes*/ max_record_bytes);
+
+    assert_records(&mut scanner, &["first", ""])?;
+    assert!(scanner.skipped_oversized_record());
+
+    let mut eof_terminated = exact;
+    eof_terminated.push(b'\n');
+    eof_terminated.extend_from_slice(&oversized);
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(eof_terminated))?
+        .with_max_record_bytes(/*max_record_bytes*/ max_record_bytes);
+
+    assert_records(&mut scanner, &[""])?;
+    assert!(scanner.skipped_oversized_record());
+    Ok(())
+}
+
+#[test]
 fn accepts_valid_json_at_eof() -> std::io::Result<()> {
     let input = b"{\"value\":\"first\"}\n{\"value\":\"second\"}";
 
