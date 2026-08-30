@@ -97,9 +97,7 @@ fn applies_the_record_limit_to_payload_bytes_without_counting_newlines() -> std:
     newline_terminated.push(b'\n');
     newline_terminated.extend_from_slice(&oversized);
     newline_terminated.push(b'\n');
-    newline_terminated.extend_from_slice(
-        serde_json::to_string(&record("first"))?.as_bytes(),
-    );
+    newline_terminated.extend_from_slice(serde_json::to_string(&record("first"))?.as_bytes());
     let mut scanner = ReverseJsonlScanner::new(Cursor::new(newline_terminated))?
         .with_max_record_bytes(/*max_record_bytes*/ max_record_bytes);
 
