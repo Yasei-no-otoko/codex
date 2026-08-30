@@ -2,6 +2,8 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -19,6 +21,7 @@ use super::helpers::rollout_path_is_archived;
 use super::helpers::set_thread_name;
 use super::helpers::sqlite_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
+use super::rollout_lineage::RolloutLineage;
 use super::thread_rollout_resolver;
 use crate::ReadThreadParams;
 use crate::StoredThread;
@@ -26,6 +29,9 @@ use crate::StoredThreadHistory;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::error::reject_paginated_history_mode;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::BufReader;
 
 pub(super) async fn read_thread(
     store: &LocalThreadStore,
@@ -234,7 +240,7 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
-    let items = load_history_items(&path).await?;
+    let items = load_history_items_for_thread(store, thread_id, &path).await?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())
 }
@@ -286,6 +292,149 @@ pub(super) async fn load_history_items(
             message: format!("failed to load thread history {}: {err}", path.display()),
         })?;
     Ok(items)
+}
+
+/// Load a child's complete logical legacy replay. Roots preserve their physical compatibility
+/// path; reference children follow validated lineage and retain each parent only through its
+/// frozen byte cutoff before adding the child's own delta.
+async fn load_history_items_for_thread(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    path: &std::path::Path,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    let path = codex_rollout::existing_rollout_path(path)
+        .await
+        .unwrap_or_else(|| path.to_path_buf());
+    let requested_meta = read_session_meta_line(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {err}", path.display()),
+        })?;
+    if requested_meta.meta.history_mode != ThreadHistoryMode::Legacy
+        || requested_meta.meta.history_base.is_none()
+    {
+        return load_history_items(path.as_path()).await;
+    }
+
+    let lineage = store
+        .resolve_rollout_lineage_for_reference(thread_id)
+        .await?;
+    load_legacy_lineage_history(lineage, requested_meta).await
+}
+
+async fn load_legacy_lineage_history(
+    lineage: RolloutLineage,
+    requested_meta: SessionMetaLine,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    if lineage.history_mode() != ThreadHistoryMode::Legacy {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "invalid rollout history lineage for {}: source rollout is not legacy",
+                requested_meta.meta.id
+            ),
+        });
+    }
+    let last_segment_index = lineage.segments().len().saturating_sub(1);
+    let mut items = vec![RolloutItem::SessionMeta(requested_meta)];
+    let mut child_head_seen = false;
+    for (segment_index, segment) in lineage.segments().iter().enumerate() {
+        read_legacy_segment_prefix(
+            segment.rollout_path.as_path(),
+            segment.end.map(|end| end.end_byte_offset),
+            segment_index,
+            last_segment_index,
+            &mut child_head_seen,
+            &mut |item| {
+                items.push(item);
+                true
+            },
+        )
+        .await?;
+    }
+    Ok(items)
+}
+
+/// Decode only complete newline-delimited records from a lineage segment. The lineage resolver
+/// validates every requested parent cutoff first; the child's unfinished append tail remains
+/// excluded. Ancestor SessionMeta records are not replayed because the child header is canonical.
+async fn read_legacy_segment_prefix(
+    path: &std::path::Path,
+    end_byte_offset: Option<u64>,
+    segment_index: usize,
+    last_segment_index: usize,
+    child_head_seen: &mut bool,
+    on_item: &mut impl FnMut(RolloutItem) -> bool,
+) -> ThreadStoreResult<bool> {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "legacy reference rollout must be plain JSONL: {}",
+                path.display()
+            ),
+        });
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to open rollout {}: {err}", path.display()),
+        })?;
+    let file_len = file
+        .metadata()
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to stat rollout {}: {err}", path.display()),
+        })?
+        .len();
+    let end = end_byte_offset.unwrap_or(file_len);
+    if end > file_len {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "legacy history cutoff {end} exceeds rollout {} length {file_len}",
+                path.display()
+            ),
+        });
+    }
+    let mut reader = BufReader::new(file.take(end));
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut raw_line)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to read rollout {}: {err}", path.display()),
+            })?;
+        if bytes_read == 0 || !raw_line.ends_with(b"\n") {
+            break;
+        }
+        let mut value = match serde_json::from_slice::<serde_json::Value>(&raw_line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if codex_rollout::strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        let Ok(line) = serde_json::from_value::<RolloutLine>(value) else {
+            continue;
+        };
+        if matches!(&line.item, RolloutItem::SessionMeta(_)) {
+            if segment_index != last_segment_index {
+                continue;
+            }
+            if !*child_head_seen {
+                *child_head_seen = true;
+                continue;
+            }
+        }
+        if !on_item(line.item) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn read_sqlite_metadata(
