@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io;
+use std::io::BufRead;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
@@ -9,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+use tokio::io::AsyncBufRead;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -62,6 +65,20 @@ pub async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineRead
         }
     }
     reader::open_once(path).await
+}
+
+/// Opens a newline-preserving reader for plain or compressed rollout files.
+pub async fn open_rollout_raw_line_reader(path: &Path) -> io::Result<RawRolloutLineReader> {
+    for _ in 0..MAX_NOT_FOUND_RETRIES {
+        match reader::open_raw_once(path).await {
+            Ok(reader) => return Ok(reader),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                tokio::time::sleep(OPEN_ROLLOUT_LINE_READER_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    reader::open_raw_once(path).await
 }
 
 /// Returns the compressed `.jsonl.zst` path for a rollout path.
@@ -206,6 +223,27 @@ pub struct RolloutLineReader {
     inner: RolloutLineReaderInner,
 }
 
+/// Newline-preserving reader for callers that need physical JSONL byte boundaries.
+pub struct RawRolloutLineReader {
+    inner: RawRolloutLineReaderInner,
+}
+
+/// Result of a bounded raw-line read. Oversized records are drained through their newline without
+/// allocating the complete record, allowing capped consumers to continue with the tail.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RawRolloutLine {
+    Complete(Vec<u8>),
+    Oversized {
+        byte_count: usize,
+        terminated: bool,
+    },
+}
+
+enum RawRolloutLineReaderInner {
+    Plain(tokio::io::BufReader<tokio::fs::File>),
+    Blocking(Option<BlockingRawLineReader>),
+}
+
 enum RolloutLineReaderInner {
     Plain(tokio::io::Lines<tokio::io::BufReader<tokio::fs::File>>),
     Blocking(Option<BlockingLineReader>),
@@ -231,7 +269,146 @@ impl RolloutLineReader {
     }
 }
 
+impl RawRolloutLineReader {
+    /// Reads one newline-preserving line while limiting allocation to `max_bytes`.
+    pub async fn next_raw_line_limited(
+        &mut self,
+        max_bytes: usize,
+    ) -> io::Result<Option<RawRolloutLine>> {
+        if max_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_bytes must be positive",
+            ));
+        }
+        match &mut self.inner {
+            RawRolloutLineReaderInner::Plain(reader) => {
+                let mut line = Vec::new();
+                loop {
+                    let buffer = tokio::io::AsyncBufReadExt::fill_buf(reader).await?;
+                    if buffer.is_empty() {
+                        return Ok((!line.is_empty()).then_some(RawRolloutLine::Complete(line)));
+                    }
+                    let take = buffer
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(buffer.len(), |index| index + 1);
+                    if line.len().saturating_add(take) > max_bytes {
+                        let terminated = buffer[..take].contains(&b'\n');
+                        let byte_count = line.len().saturating_add(take);
+                        reader.consume(take);
+                        if terminated {
+                            return Ok(Some(RawRolloutLine::Oversized {
+                                byte_count,
+                                terminated,
+                            }));
+                        }
+                        let (drained, terminated) = discard_async_line(reader).await?;
+                        return Ok(Some(RawRolloutLine::Oversized {
+                            byte_count: byte_count.saturating_add(drained),
+                            terminated,
+                        }));
+                    }
+                    line.extend_from_slice(&buffer[..take]);
+                    reader.consume(take);
+                    if line.ends_with(b"\n") {
+                        return Ok(Some(RawRolloutLine::Complete(line)));
+                    }
+                }
+            }
+            RawRolloutLineReaderInner::Blocking(slot) => {
+                let Some(reader) = slot.take() else {
+                    return Err(io::Error::other("compressed rollout reader is busy"));
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut reader = reader;
+                    let result = read_limited_blocking(&mut reader, max_bytes);
+                    (result, reader)
+                })
+                .await
+                .map_err(io::Error::other)?;
+                let (result, reader) = result;
+                *slot = Some(reader);
+                result
+            }
+        }
+    }
+}
+
+async fn discard_async_line(
+    reader: &mut tokio::io::BufReader<tokio::fs::File>,
+) -> io::Result<(usize, bool)> {
+    let mut byte_count = 0;
+    loop {
+        let buffer = tokio::io::AsyncBufReadExt::fill_buf(reader).await?;
+        if buffer.is_empty() {
+            return Ok((byte_count, false));
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        let terminated = buffer[..take].contains(&b'\n');
+        reader.consume(take);
+        byte_count = byte_count.saturating_add(take);
+        if terminated {
+            return Ok((byte_count, true));
+        }
+    }
+}
+
+fn read_limited_blocking(
+    reader: &mut BlockingRawLineReader,
+    max_bytes: usize,
+) -> io::Result<Option<RawRolloutLine>> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((!line.is_empty()).then_some(RawRolloutLine::Complete(line)));
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if line.len().saturating_add(take) > max_bytes {
+            let mut terminated = buffer[..take].contains(&b'\n');
+            let mut byte_count = line.len().saturating_add(take);
+            reader.consume(take);
+            if !terminated {
+                loop {
+                    let buffer = reader.fill_buf()?;
+                    if buffer.is_empty() {
+                        break;
+                    }
+                    let take = buffer
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(buffer.len(), |index| index + 1);
+                    let chunk_terminated = buffer[..take].contains(&b'\n');
+                    reader.consume(take);
+                    byte_count = byte_count.saturating_add(take);
+                    if chunk_terminated {
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+            return Ok(Some(RawRolloutLine::Oversized {
+                byte_count,
+                terminated,
+            }));
+        }
+        line.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if line.ends_with(b"\n") {
+            return Ok(Some(RawRolloutLine::Complete(line)));
+        }
+    }
+}
+
 type BlockingLineReader = std::io::Lines<std::io::BufReader<Box<dyn Read + Send>>>;
+type BlockingRawLineReader = std::io::BufReader<Box<dyn Read + Send>>;
 
 pub(super) mod worker {
     use std::ffi::OsStr;
@@ -1099,6 +1276,8 @@ mod reader {
 
     use super::RolloutLineReader;
     use super::RolloutLineReaderInner;
+    use super::RawRolloutLineReader;
+    use super::RawRolloutLineReaderInner;
     use super::path;
     use tokio::io::AsyncBufReadExt;
 
@@ -1123,6 +1302,30 @@ mod reader {
         let file = tokio::fs::File::open(path).await?;
         Ok(RolloutLineReader {
             inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file).lines()),
+        })
+    }
+
+    pub(super) async fn open_raw_once(path: &Path) -> io::Result<RawRolloutLineReader> {
+        let path = path::existing_rollout_path(path)
+            .await
+            .unwrap_or_else(|| path.to_path_buf());
+        if path::is_compressed_rollout_path(path.as_path()) {
+            let reader = tokio::task::spawn_blocking(move || {
+                let input = File::open(path.as_path())?;
+                let decoder = zstd::stream::read::Decoder::new(input)?;
+                Ok::<_, io::Error>(io::BufReader::new(
+                    Box::new(decoder) as Box<dyn Read + Send>
+                ))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            return Ok(RawRolloutLineReader {
+                inner: RawRolloutLineReaderInner::Blocking(Some(reader)),
+            });
+        }
+        let file = tokio::fs::File::open(path).await?;
+        Ok(RawRolloutLineReader {
+            inner: RawRolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
         })
     }
 }

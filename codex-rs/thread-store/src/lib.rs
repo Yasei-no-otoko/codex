@@ -103,3 +103,5 @@ pub use types::ThreadSortKey;
 pub use types::TimelinePage;
 pub use types::TurnPage;
 pub use types::UpdateThreadMetadataParams;
+pub use types::WriteReferenceLogicalAttachmentOutcome;
+pub use types::WriteReferenceLogicalAttachmentParams;

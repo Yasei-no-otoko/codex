@@ -50,6 +50,8 @@ use crate::ThreadStoreResult;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
+use crate::WriteReferenceLogicalAttachmentOutcome;
+use crate::WriteReferenceLogicalAttachmentParams;
 use crate::UpdatedProject;
 
 /// Future returned by [`ThreadStore`] operations.
@@ -143,6 +145,14 @@ pub trait ThreadStore: Any + Send + Sync {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory>;
+
+    /// Streams a bounded logical replay for a reference-backed rollout without materializing it.
+    fn write_reference_logical_attachment(
+        &self,
+        _params: WriteReferenceLogicalAttachmentParams,
+    ) -> ThreadStoreFuture<'_, WriteReferenceLogicalAttachmentOutcome> {
+        Box::pin(async { Ok(WriteReferenceLogicalAttachmentOutcome::NotReference) })
+    }
 
     /// Loads the persisted rollout items needed to reconstruct the latest model-visible context.
     ///

@@ -12,6 +12,7 @@ mod paginated_fork;
 mod pending_thread_metadata;
 mod projects;
 mod read_thread;
+mod reference_attachment;
 mod revert_thread;
 mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
@@ -29,6 +30,9 @@ mod writer_lock;
 #[cfg(test)]
 #[path = "pending_thread_metadata_tests.rs"]
 mod pending_thread_metadata_tests;
+#[cfg(test)]
+#[path = "reference_attachment_tests.rs"]
+mod reference_attachment_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -99,6 +103,8 @@ use crate::TimelinePage;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
+use crate::WriteReferenceLogicalAttachmentOutcome;
+use crate::WriteReferenceLogicalAttachmentParams;
 use crate::UpdatedProject;
 use crate::local::writer_lock::WriterLockCoordinator;
 use crate::local::writer_lock::WriterLockGuard;
@@ -524,6 +530,15 @@ impl ThreadStore for LocalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
         Box::pin(LocalThreadStore::load_history(self, params))
+    }
+
+    fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> ThreadStoreFuture<'_, WriteReferenceLogicalAttachmentOutcome> {
+        Box::pin(async move {
+            reference_attachment::write_reference_logical_attachment(self, params).await
+        })
     }
 
     fn load_latest_model_context(

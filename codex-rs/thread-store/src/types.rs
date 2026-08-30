@@ -158,6 +158,22 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+/// Parameters for writing a bounded, read-only logical history attachment.
+#[derive(Clone, Debug)]
+pub struct WriteReferenceLogicalAttachmentParams {
+    pub thread_id: ThreadId,
+    pub include_archived: bool,
+    pub output_path: PathBuf,
+    pub max_bytes: usize,
+}
+
+/// Result of attempting to write a logical reference attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteReferenceLogicalAttachmentOutcome {
+    NotReference,
+    Written { truncated: bool },
+}
+
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {

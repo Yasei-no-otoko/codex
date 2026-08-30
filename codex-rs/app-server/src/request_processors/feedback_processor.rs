@@ -4,14 +4,12 @@ use codex_connectors::ConnectorDirectoryCacheKey;
 use codex_connectors::connector_runtime_cache_path;
 use codex_feedback::CODEX_APP_DIRECTORY_CACHE_ATTACHMENT_FILENAME;
 use codex_feedback::CODEX_APPS_TOOLS_CACHE_ATTACHMENT_FILENAME;
-use codex_feedback::FeedbackAttachment;
 #[cfg(target_os = "windows")]
 use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
-use codex_rollout::RolloutLine;
 use codex_rollout::RolloutRecorder;
 use sha2::Digest;
 use sha2::Sha256;
-use std::collections::VecDeque;
+use tempfile::NamedTempFile;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
 // Keep generated logical history in line with the feedback log ring's 4 MiB default.
@@ -22,7 +20,7 @@ enum LogicalRolloutFeedbackAttachment {
     Physical,
     /// A bounded logical replay was generated from the frozen lineage and child delta.
     Generated {
-        attachment: FeedbackAttachment,
+        temp_file: NamedTempFile,
         truncated: bool,
     },
     /// A reference-backed rollout could not be reconstructed without risking a partial suffix.
@@ -200,6 +198,7 @@ impl FeedbackRequestProcessor {
             (Vec::new(), None, None)
         };
 
+        let mut logical_attachment_temps = Vec::new();
         let mut extra_attachments = Vec::new();
         let mut attachment_paths = Vec::new();
         let mut seen_attachment_paths = HashSet::new();
@@ -220,16 +219,24 @@ impl FeedbackRequestProcessor {
                         .await
                     {
                         LogicalRolloutFeedbackAttachment::Generated {
-                            attachment,
+                            temp_file,
                             truncated,
                         } => {
-                            if truncated {
+                            let path = temp_file.path().to_path_buf();
+                            let filename = if truncated {
                                 upload_tags.insert(
                                     "feedback_rollout_truncated".to_string(),
                                     "true".to_string(),
                                 );
-                            }
-                            extra_attachments.push(attachment);
+                                format!("rollout-history-{feedback_thread_id}-head-tail.jsonl")
+                            } else {
+                                format!("rollout-history-{feedback_thread_id}.jsonl")
+                            };
+                            logical_attachment_temps.push(temp_file);
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path,
+                                attachment_filename_override: Some(filename),
+                            });
                         }
                         LogicalRolloutFeedbackAttachment::Physical => {
                             attachment_paths.push(FeedbackAttachmentPath {
@@ -305,6 +312,9 @@ impl FeedbackRequestProcessor {
         let runtime_handle = tokio::runtime::Handle::current();
 
         let upload_result = tokio::task::spawn_blocking(move || {
+            // Keep generated temporary files alive until the upload has read all path-backed
+            // attachments. NamedTempFile removes them when this closure returns.
+            let _logical_attachment_temps = logical_attachment_temps;
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
             runtime_handle.block_on(snapshot.upload_feedback(
                 FeedbackUploadOptions {
@@ -368,29 +378,40 @@ impl FeedbackRequestProcessor {
             return LogicalRolloutFeedbackAttachment::Physical;
         }
 
-        let items = match self
-            .thread_manager
-            .read_stored_thread_history(thread_id, /*include_archived*/ true)
-            .await
-        {
-            Ok(items) => items,
+        let temp_file = match NamedTempFile::new() {
+            Ok(temp_file) => temp_file,
             Err(err) => {
                 warn!(
                     thread_id = %thread_id,
-                    "skipping reference-backed rollout in feedback upload because logical history could not be reconstructed: {err}"
+                    "failed to create temporary logical rollout attachment: {err}"
                 );
                 return LogicalRolloutFeedbackAttachment::Skip;
             }
         };
-        match bounded_logical_rollout_attachment(thread_id, items) {
-            Ok((attachment, truncated)) => LogicalRolloutFeedbackAttachment::Generated {
-                attachment,
-                truncated,
-            },
+        let params = WriteReferenceLogicalAttachmentParams {
+            thread_id,
+            include_archived: true,
+            output_path: temp_file.path().to_path_buf(),
+            max_bytes: MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES,
+        };
+        match self
+            .thread_manager
+            .write_reference_logical_attachment(params)
+            .await
+        {
+            Ok(WriteReferenceLogicalAttachmentOutcome::Written { truncated }) => {
+                LogicalRolloutFeedbackAttachment::Generated {
+                    temp_file,
+                    truncated,
+                }
+            }
+            Ok(WriteReferenceLogicalAttachmentOutcome::NotReference) => {
+                LogicalRolloutFeedbackAttachment::Physical
+            }
             Err(err) => {
                 warn!(
                     thread_id = %thread_id,
-                    "skipping reference-backed rollout in feedback upload because logical history was invalid: {err}"
+                    "skipping reference-backed rollout in feedback upload: {err}"
                 );
                 LogicalRolloutFeedbackAttachment::Skip
             }
@@ -416,122 +437,6 @@ impl FeedbackRequestProcessor {
                 warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
                 None
             })
-    }
-}
-
-/// Serialize a logical history as complete JSONL records, retaining bounded head and tail spans.
-/// The child SessionMeta is rewritten without `history_base`, so the attachment is self-contained.
-fn bounded_logical_rollout_attachment(
-    thread_id: ThreadId,
-    items: Vec<codex_rollout::RolloutItem>,
-) -> anyhow::Result<(FeedbackAttachment, bool)> {
-    let mut items = items.into_iter();
-    let Some(codex_rollout::RolloutItem::SessionMeta(mut session_meta)) = items.next() else {
-        anyhow::bail!("logical history must begin with SessionMeta");
-    };
-    if session_meta.meta.id != thread_id {
-        anyhow::bail!(
-            "logical history SessionMeta belongs to {}, not requested thread {thread_id}",
-            session_meta.meta.id
-        );
-    }
-    session_meta.meta.history_base = None;
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let header = serde_json::to_vec(&RolloutLine {
-        timestamp: timestamp.clone(),
-        ordinal: None,
-        item: codex_rollout::RolloutItem::SessionMeta(session_meta),
-    })?;
-    let mut writer = BoundedLogicalAttachmentWriter::new(MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES);
-    writer.push_header(header)?;
-    for item in items {
-        if matches!(item, codex_rollout::RolloutItem::SessionMeta(_)) {
-            continue;
-        }
-        writer.push(serde_json::to_vec(&RolloutLine {
-            timestamp: timestamp.clone(),
-            ordinal: None,
-            item,
-        })?);
-    }
-    let (buffer, truncated) = writer.finish();
-    let filename = if truncated {
-        format!("rollout-history-{thread_id}-head-tail.jsonl")
-    } else {
-        format!("rollout-history-{thread_id}.jsonl")
-    };
-    Ok((
-        FeedbackAttachment {
-            filename,
-            content_type: Some("text/plain".to_string()),
-            buffer,
-        },
-        truncated,
-    ))
-}
-
-struct BoundedLogicalAttachmentWriter {
-    max_bytes: usize,
-    head_budget: usize,
-    head: Vec<u8>,
-    head_full: bool,
-    tail_budget: usize,
-    tail_bytes: usize,
-    tail_lines: VecDeque<Vec<u8>>,
-    truncated: bool,
-}
-
-impl BoundedLogicalAttachmentWriter {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            max_bytes,
-            head_budget: max_bytes / 2,
-            head: Vec::new(),
-            head_full: false,
-            tail_budget: max_bytes - max_bytes / 2,
-            tail_bytes: 0,
-            tail_lines: VecDeque::new(),
-            truncated: false,
-        }
-    }
-
-    fn push_header(&mut self, line: Vec<u8>) -> anyhow::Result<()> {
-        if line.len().saturating_add(1) > self.head_budget {
-            anyhow::bail!("logical history SessionMeta exceeds attachment head budget");
-        }
-        self.push(line);
-        Ok(())
-    }
-
-    fn push(&mut self, mut line: Vec<u8>) {
-        if !line.ends_with(b"\n") {
-            line.push(b'\n');
-        }
-        if line.len() > self.max_bytes {
-            self.truncated = true;
-            return;
-        }
-        if !self.head_full && self.head.len().saturating_add(line.len()) <= self.head_budget {
-            self.head.extend_from_slice(&line);
-            return;
-        }
-        self.head_full = true;
-        self.tail_bytes = self.tail_bytes.saturating_add(line.len());
-        self.tail_lines.push_back(line);
-        while self.tail_bytes > self.tail_budget {
-            let Some(removed) = self.tail_lines.pop_front() else {
-                break;
-            };
-            self.tail_bytes = self.tail_bytes.saturating_sub(removed.len());
-            self.truncated = true;
-        }
-    }
-
-    fn finish(mut self) -> (Vec<u8>, bool) {
-        for line in self.tail_lines {
-            self.head.extend_from_slice(&line);
-        }
-        (self.head, self.truncated)
     }
 }
 
@@ -890,21 +795,6 @@ mod tests {
             normalized_prompt_hash("actual  developer\r\nprompt\t"),
             "9ae77301cc2a30e729c28661b7a0f9490c80a72e7d23277e7e74f0ac81779541"
         );
-    }
-
-    #[test]
-    fn logical_feedback_writer_keeps_complete_head_and_tail_records() {
-        let mut writer = BoundedLogicalAttachmentWriter::new(26);
-        writer.push_header(b"header".to_vec()).unwrap();
-        writer.push(b"head".to_vec());
-        writer.push(b"discard-me".to_vec());
-        writer.push(b"tail".to_vec());
-
-        let (attachment, truncated) = writer.finish();
-
-        assert!(truncated);
-        assert_eq!(attachment, b"header\nhead\ntail\n");
-        assert!(attachment.ends_with(b"\n"));
     }
 
     fn feedback_rollout(

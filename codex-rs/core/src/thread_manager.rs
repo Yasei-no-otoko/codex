@@ -84,6 +84,8 @@ use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
+use codex_thread_store::WriteReferenceLogicalAttachmentOutcome;
+use codex_thread_store::WriteReferenceLogicalAttachmentParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -839,6 +841,14 @@ impl ThreadManager {
             .await
     }
 
+    /// Writes a bounded, read-only logical history attachment for feedback upload.
+    pub async fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> CodexResult<WriteReferenceLogicalAttachmentOutcome> {
+        self.state.write_reference_logical_attachment(params).await
+    }
+
     /// Updates metadata for loaded and cold threads through one entrypoint.
     ///
     /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered
@@ -1560,7 +1570,7 @@ impl ThreadManagerState {
                     include_archived,
                 })
                 .await
-                .map(|context| Self::expand_paginated_model_context(context.items))
+                .map(|context| context.items)
                 .map_err(|err| match err {
                     ThreadStoreError::ThreadNotFound { thread_id } => {
                         CodexErr::ThreadNotFound(thread_id)
@@ -1584,29 +1594,19 @@ impl ThreadManagerState {
         }
     }
 
-    /// Expands only the latest Paginated compaction checkpoint for logical memory consumers.
-    fn expand_paginated_model_context(items: Vec<RolloutItem>) -> Vec<RolloutItem> {
-        let latest = items
-            .iter()
-            .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
-        let mut expanded = Vec::with_capacity(items.len());
-        for (index, item) in items.into_iter().enumerate() {
-            if Some(index) != latest {
-                expanded.push(item);
-                continue;
-            }
-            match item {
-                RolloutItem::Compacted(mut compacted) => {
-                    if let Some(history) = compacted.replacement_history.take() {
-                        expanded.extend(history.into_iter().map(RolloutItem::ResponseItem));
-                    } else {
-                        expanded.push(RolloutItem::Compacted(compacted));
-                    }
-                }
-                item => expanded.push(item),
-            }
-        }
-        expanded
+    pub(crate) async fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> CodexResult<WriteReferenceLogicalAttachmentOutcome> {
+        let thread_id = params.thread_id;
+        self.thread_store
+            .write_reference_logical_attachment(params)
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "failed to write logical feedback history for {thread_id}: {err}"
+                ))
+            })
     }
 
     pub(crate) async fn load_latest_model_context(
