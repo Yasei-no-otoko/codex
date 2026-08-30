@@ -45,22 +45,21 @@ pub(super) async fn prepare(
             operation: "compressed legacy reference fork",
         });
     }
+    let reference_child = source_meta_placeholder_is_reference(store, thread_id).await?;
     let source_path = match scoped_rollout_path(
         store.config.codex_home.clone(),
         source.path.as_path(),
         "Codex home",
     ) {
         Ok(path) => path,
-        Err(_) => return Err(ThreadStoreError::Unsupported { operation: "external legacy reference fork" }),
+        Err(_) => return Err(unsafe_source_error(reference_child, "external legacy reference fork")),
     };
     let source_meta = codex_rollout::read_session_meta_line(source_path.as_path()).await.map_err(|err| ThreadStoreError::Internal { message: format!("failed to read legacy source metadata {}: {err}", source_path.display()) })?;
     if source_meta.meta.id != thread_id {
-        return Err(ThreadStoreError::Unsupported { operation: "mismatched legacy reference fork" });
+        return Err(unsafe_source_error(reference_child, "mismatched legacy reference fork"));
     }
     if codex_rollout::rollout_id_from_path(source_path.as_path()) != Some(thread_id) {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "legacy reference source rollout id",
-        });
+        return Err(unsafe_source_error(reference_child, "legacy reference source rollout id"));
     }
     let end_byte_offset = last_complete_rollout_envelope_offset(source_path.as_path()).await?;
     if end_byte_offset == 0 {
@@ -82,6 +81,27 @@ pub(super) async fn prepare(
         model_context,
         source_reservation,
     ))
+}
+
+async fn source_meta_placeholder_is_reference(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<bool> {
+    let Some(source) = thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await? else {
+        return Ok(false);
+    };
+    Ok(codex_rollout::read_session_meta_line(source.path.as_path())
+        .await
+        .map(|meta| meta.meta.history_base.is_some())
+        .unwrap_or(true))
+}
+
+fn unsafe_source_error(reference_child: bool, operation: &'static str) -> ThreadStoreError {
+    if reference_child {
+        ThreadStoreError::InvalidRequest { message: format!("invalid reference-backed legacy source: {operation}") }
+    } else {
+        ThreadStoreError::Unsupported { operation }
+    }
 }
 
 async fn last_complete_rollout_envelope_offset(path: &Path) -> ThreadStoreResult<u64> {
