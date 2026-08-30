@@ -2,6 +2,7 @@ mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
+mod legacy_fork;
 mod list_threads;
 mod live_writer;
 mod model_context;
@@ -501,7 +502,28 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
-        Box::pin(async move { paginated_fork::prepare(self, params).await })
+        Box::pin(async move {
+            let source = thread_rollout_resolver::resolve_current_including_archived(
+                self,
+                params.thread_id,
+            )
+            .await?
+            .ok_or(ThreadStoreError::ThreadNotFound {
+                thread_id: params.thread_id,
+            })?;
+            let session_meta = codex_rollout::read_session_meta_line(source.path.as_path())
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to read fork source metadata {}: {err}",
+                        source.path.display()
+                    ),
+                })?;
+            match session_meta.meta.history_mode {
+                ThreadHistoryMode::Legacy => legacy_fork::prepare(self, params).await,
+                ThreadHistoryMode::Paginated => paginated_fork::prepare(self, params).await,
+            }
+        })
     }
 
     fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
