@@ -122,9 +122,7 @@ impl LocalThreadStore {
                     "source rollout path or metadata belongs to another thread",
                 ));
             }
-            if history_mode
-                .is_some_and(|expected| expected != meta.meta.history_mode)
-            {
+            if history_mode.is_some_and(|expected| expected != meta.meta.history_mode) {
                 return Err(malformed_lineage(
                     requested_thread_id,
                     "source rollout mixes history modes",
@@ -186,9 +184,8 @@ impl LocalThreadStore {
         segments.reverse();
         Ok(RolloutLineage {
             segments,
-            history_mode: history_mode.ok_or_else(|| {
-                malformed_lineage(requested_thread_id, "source lineage is empty")
-            })?,
+            history_mode: history_mode
+                .ok_or_else(|| malformed_lineage(requested_thread_id, "source lineage is empty"))?,
         })
     }
 }
@@ -293,7 +290,10 @@ async fn validate_cutoff_bounds(
             message: format!("failed to join legacy cutoff validation: {err}"),
         })?
         .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to validate legacy cutoff {}: {err}", rollout_path.display()),
+            message: format!(
+                "failed to validate legacy cutoff {}: {err}",
+                rollout_path.display()
+            ),
         })?;
         if !complete_envelope {
             return Err(malformed_lineage(

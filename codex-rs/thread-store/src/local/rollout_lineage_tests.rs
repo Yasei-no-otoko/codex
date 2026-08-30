@@ -225,7 +225,11 @@ async fn reference_lineage_rejects_mismatched_leaf_and_ancestor_metadata() {
     write_rollout(
         home.path(),
         child,
-        Some(history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 1)),
+        Some(history_position(
+            root_path.as_path(),
+            root,
+            /*end_ordinal_exclusive*/ 1,
+        )),
         /*next_ordinal*/ 2,
     );
     assert_invalid_reference_lineage(&store, child, "belongs to another thread").await;
@@ -312,7 +316,9 @@ fn write_rollout_with_meta_id(
 ) -> std::path::PathBuf {
     let directory = home.join("sessions/2026/07/16");
     fs::create_dir_all(directory.as_path()).expect("create rollout directory");
-    let path = directory.join(format!("rollout-2026-07-16T00-00-00-{path_thread_id}.jsonl"));
+    let path = directory.join(format!(
+        "rollout-2026-07-16T00-00-00-{path_thread_id}.jsonl"
+    ));
     let initial_ordinal = history_base.map_or(0, |base| base.end_ordinal_exclusive);
     let line = rollout_line(
         initial_ordinal,

@@ -24,6 +24,7 @@ mod seekable_reader;
 pub(crate) mod session_index;
 mod sqlite_metrics;
 pub mod state_db;
+mod thread_writer_lock;
 
 pub use codex_history::CompactedItem;
 pub use codex_history::InitialHistory;
@@ -145,6 +146,12 @@ pub use session_index::find_thread_names_by_ids;
 pub use session_index::remove_thread_name_entries;
 pub use state_db::StateDbHandle;
 pub use state_db::sqlite_telemetry_recorder;
+pub use thread_writer_lock::THREAD_WRITER_COORDINATION_LOCK_FILE;
+pub use thread_writer_lock::THREAD_WRITER_LOCK_DIR;
+pub use thread_writer_lock::THREAD_WRITER_TOPOLOGY_LOCK_FILE;
+pub use thread_writer_lock::ThreadWriterLockCoordinator;
+pub use thread_writer_lock::ThreadWriterLockGuard;
+pub use thread_writer_lock::ThreadWriterTopologyLockGuard;
 
 #[cfg(test)]
 mod tests;

@@ -4750,10 +4750,8 @@ impl ThreadRequestProcessor {
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
-        let legacy_latest_reference = !paginated_source
-            && !ephemeral
-            && last_turn_id.is_none()
-            && before_turn_id.is_none();
+        let legacy_latest_reference =
+            !paginated_source && !ephemeral && last_turn_id.is_none() && before_turn_id.is_none();
         let prepared_fork = if paginated_source || legacy_latest_reference {
             let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
                 (Some(turn_id), None) => {

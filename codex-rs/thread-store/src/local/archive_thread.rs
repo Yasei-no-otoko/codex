@@ -39,6 +39,7 @@ pub(super) async fn archive_threads(
         }
     }
     let _writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
+    let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
     let reference_index = RolloutReferenceIndex::scan(store.config.codex_home.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {

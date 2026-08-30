@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use codex_protocol::protocol::HistoryPosition;
 
+use super::LocalThreadStore;
 use super::helpers::managed_rollout_path;
 use super::legacy_envelope;
 use super::live_writer;
 use super::model_context;
 use super::thread_rollout_resolver;
-use super::LocalThreadStore;
 use crate::ForkBoundary;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
@@ -18,17 +18,25 @@ use crate::ThreadStoreResult;
 pub(super) async fn prepare(
     store: &LocalThreadStore,
     params: PrepareForkParams,
+    source_guards: super::ForkSourceGuards,
 ) -> ThreadStoreResult<PreparedFork> {
-    let PrepareForkParams { thread_id, boundary } = params;
+    let PrepareForkParams {
+        thread_id,
+        boundary,
+    } = params;
     if !matches!(boundary, ForkBoundary::Latest) {
         return Err(ThreadStoreError::Unsupported {
             operation: "legacy fork boundary",
         });
     }
 
-    // The lifecycle lease prevents destructive local operations until the child metadata has been
-    // persisted. The byte cutoff remains authoritative for cross-process parent appends.
-    let source_reservation = store.live_writer_locks.reserve_lifecycle(thread_id).await;
+    // Retain both barriers through child durability. The byte cutoff remains authoritative for
+    // external parent appends, while the filesystem guard blocks archive/delete/compression.
+    let super::ForkSourceGuards {
+        lifecycle: source_reservation,
+        filesystem: source_filesystem_guard,
+        topology: source_topology_guard,
+    } = source_guards;
     match live_writer::persist_thread(store, thread_id).await {
         Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
         Err(err) => return Err(err),
@@ -47,10 +55,19 @@ pub(super) async fn prepare(
         Ok(meta) => meta,
         // Without the header we cannot prove this is a standalone root. Fail closed rather than
         // allow the app-server's physical-copy fallback to discard a possible inherited prefix.
-        Err(_) => return Err(unsafe_source_error(true, "unreadable legacy reference source")),
+        Err(_) => {
+            return Err(unsafe_source_error(
+                true,
+                "unreadable legacy reference source",
+            ));
+        }
     };
     let reference_child = source_meta.meta.history_base.is_some();
-    if source.path.extension().is_some_and(|extension| extension == "zst") {
+    if source
+        .path
+        .extension()
+        .is_some_and(|extension| extension == "zst")
+    {
         return Err(unsafe_source_error(
             reference_child,
             "compressed legacy reference fork",
@@ -70,13 +87,17 @@ pub(super) async fn prepare(
         }
     };
     if source_meta.meta.id != thread_id {
-        return Err(unsafe_source_error(reference_child, "mismatched legacy reference fork"));
+        return Err(unsafe_source_error(
+            reference_child,
+            "mismatched legacy reference fork",
+        ));
     }
     let end_byte_offset = last_complete_rollout_envelope_offset(source_path.as_path()).await?;
     if end_byte_offset == 0 {
-        return Err(ThreadStoreError::Unsupported {
-            operation: "legacy reference fork without complete rollout envelope",
-        });
+        return Err(unsafe_source_error(
+            reference_child,
+            "legacy reference fork without complete rollout envelope",
+        ));
     }
     let history_base = HistoryPosition {
         thread_id,
@@ -87,7 +108,10 @@ pub(super) async fn prepare(
         // A legacy child carries an immutable prefix. Resolve every ancestor under the same
         // managed-path rules before creating another reference; accepting only the leaf would
         // make a later copy fallback drop that prefix.
-        let lineage = store.resolve_rollout_lineage_for_reference(thread_id).await?;
+        let lineage = store
+            .resolve_rollout_lineage_for_reference(thread_id)
+            .await?;
+        let _ancestor_guards = store.acquire_lineage_ancestor_locks(&lineage).await?;
         Arc::new(model_context::load_for_fork(lineage, Some(history_base)).await?)
     } else {
         Arc::new(model_context::load_legacy_fork_context(source_path, end_byte_offset).await?)
@@ -96,13 +120,19 @@ pub(super) async fn prepare(
         thread_id,
         Some(history_base),
         model_context,
-        source_reservation,
+        (
+            source_reservation,
+            source_filesystem_guard,
+            source_topology_guard,
+        ),
     ))
 }
 
 fn unsafe_source_error(reference_child: bool, operation: &'static str) -> ThreadStoreError {
     if reference_child {
-        ThreadStoreError::InvalidRequest { message: format!("invalid reference-backed legacy source: {operation}") }
+        ThreadStoreError::InvalidRequest {
+            message: format!("invalid reference-backed legacy source: {operation}"),
+        }
     } else {
         ThreadStoreError::Unsupported { operation }
     }

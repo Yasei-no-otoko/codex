@@ -3,6 +3,7 @@ use std::fs;
 use std::fs::FileTimes;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -27,6 +28,30 @@ use crate::RolloutRecorderParams;
 use crate::append_rollout_item_to_path;
 use crate::read_session_meta_line;
 use crate::search_rollout_matches;
+
+#[test]
+fn compression_and_reference_writer_use_the_same_thread_lock() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(42);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&path, thread_id, "lock race")?;
+    set_old_mtime(&path)?;
+
+    let held = Arc::new(ThreadWriterLockCoordinator::new(home.path())).acquire(thread_id)?;
+    let measurement = super::worker::compress_rollout_if_cold_blocking(
+        path.as_path(),
+        thread_id,
+        Arc::new(ThreadWriterLockCoordinator::new(home.path())),
+    )?;
+    assert_eq!(
+        measurement.outcome,
+        super::worker::CompressionOutcome::SkippedWriterBusy
+    );
+    assert!(path.exists());
+    drop(held);
+    Ok(())
+}
 
 #[tokio::test]
 async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {

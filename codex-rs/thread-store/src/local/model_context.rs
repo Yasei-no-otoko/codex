@@ -76,7 +76,9 @@ pub(super) async fn load_latest_model_context(
         ThreadHistoryMode::Legacy if is_compressed => {
             read_thread::load_history_items(path.as_path()).await?
         }
-        ThreadHistoryMode::Legacy => scan_model_context_from_rollout(path, session_meta, None).await?,
+        ThreadHistoryMode::Legacy => {
+            scan_model_context_from_rollout(path, session_meta, None).await?
+        }
         ThreadHistoryMode::Paginated => {
             let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
             scan_model_context_from_lineage(lineage, session_meta).await?
@@ -95,7 +97,11 @@ async fn scan_model_context_from_rollout(
     end_byte_offset: Option<u64>,
 ) -> ThreadStoreResult<Vec<RolloutItem>> {
     let scan = tokio::task::spawn_blocking(move || {
-        scan_model_context_from_rollout_blocking(rollout_path.as_path(), session_meta, end_byte_offset)
+        scan_model_context_from_rollout_blocking(
+            rollout_path.as_path(),
+            session_meta,
+            end_byte_offset,
+        )
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -117,7 +123,10 @@ pub(super) async fn load_legacy_fork_context(
     let session_meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to read session metadata {}: {err}", rollout_path.display()),
+            message: format!(
+                "failed to read session metadata {}: {err}",
+                rollout_path.display()
+            ),
         })?;
     scan_model_context_from_rollout(rollout_path, session_meta, Some(end_byte_offset)).await
 }

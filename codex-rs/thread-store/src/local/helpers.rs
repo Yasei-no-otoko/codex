@@ -20,8 +20,8 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
-use codex_rollout::SESSIONS_SUBDIR;
 use codex_rollout::RolloutReferenceIndex;
+use codex_rollout::SESSIONS_SUBDIR;
 use codex_rollout::ThreadItem;
 use codex_rollout::find_thread_names_by_ids;
 use codex_state::ThreadMetadata;
@@ -73,14 +73,13 @@ pub(super) fn managed_rollout_path(
     rollout_path: &Path,
     expected_rollout_id: ThreadId,
 ) -> ThreadStoreResult<PathBuf> {
-    let canonical_rollout_path = std::fs::canonicalize(rollout_path).map_err(|_| {
-        ThreadStoreError::InvalidRequest {
+    let canonical_rollout_path =
+        std::fs::canonicalize(rollout_path).map_err(|_| ThreadStoreError::InvalidRequest {
             message: format!(
                 "rollout path `{}` must be in a managed Codex sessions directory",
                 rollout_path.display()
             ),
-        }
-    })?;
+        })?;
     let is_managed = [SESSIONS_SUBDIR, ARCHIVED_SESSIONS_SUBDIR]
         .into_iter()
         .filter_map(|subdir| std::fs::canonicalize(codex_home.join(subdir)).ok())

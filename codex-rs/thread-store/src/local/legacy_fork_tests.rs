@@ -4,9 +4,9 @@ use codex_protocol::ThreadId;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
+use super::super::helpers::managed_rollout_path;
 use super::last_complete_rollout_envelope_offset;
 use super::unsafe_source_error;
-use super::super::helpers::managed_rollout_path;
 use crate::ThreadStoreError;
 
 #[tokio::test]
@@ -28,7 +28,8 @@ async fn cutoff_accepts_schema_evolved_payload_envelope() {
 async fn cutoff_excludes_incomplete_tail() {
     let directory = tempdir().expect("temporary directory");
     let path = directory.path().join("legacy.jsonl");
-    let complete = b"{\"timestamp\":\"2026-08-30T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{}}\n";
+    let complete =
+        b"{\"timestamp\":\"2026-08-30T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{}}\n";
     let partial = b"{\"timestamp\":\"2026-08-30T00:00:01Z\",\"type\":\"event_msg\"";
     let mut contents = complete.to_vec();
     contents.extend_from_slice(partial);
@@ -62,6 +63,24 @@ fn compressed_reference_child_cannot_fall_back_to_a_physical_suffix_copy() {
     ));
     assert!(matches!(
         unsafe_source_error(true, "compressed legacy reference fork"),
+        ThreadStoreError::InvalidRequest { .. }
+    ));
+}
+
+#[test]
+fn invalid_reference_child_cutoff_cannot_fall_back_to_a_physical_suffix_copy() {
+    assert!(matches!(
+        unsafe_source_error(
+            false,
+            "legacy reference fork without complete rollout envelope"
+        ),
+        ThreadStoreError::Unsupported { .. }
+    ));
+    assert!(matches!(
+        unsafe_source_error(
+            true,
+            "legacy reference fork without complete rollout envelope"
+        ),
         ThreadStoreError::InvalidRequest { .. }
     ));
 }

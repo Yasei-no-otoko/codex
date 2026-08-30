@@ -165,6 +165,15 @@ struct ThreadCoordination {
     lifecycle: Arc<RwLock<()>>,
 }
 
+/// Source barriers acquired before fork mode selection and retained until child metadata is
+/// durable. The lifecycle lease blocks local destructive operations; the filesystem lock closes
+/// the corresponding cross-process archive/delete window.
+pub(super) struct ForkSourceGuards {
+    pub(super) lifecycle: OwnedRwLockReadGuard<()>,
+    pub(super) filesystem: WriterLockGuard,
+    pub(super) topology: writer_lock::TopologyLockGuard,
+}
+
 impl LiveWriterLocks {
     async fn coordination(&self, thread_id: ThreadId) -> Arc<ThreadCoordination> {
         self.by_thread
@@ -315,6 +324,53 @@ impl LocalThreadStore {
             writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
         }
         Ok(writer_locks)
+    }
+
+    async fn existing_writer_lock(&self, thread_id: ThreadId) -> Option<WriterLockGuard> {
+        self.live_recorders
+            .lock()
+            .await
+            .get(&thread_id)
+            .map(|entry| entry.writer_lock.clone())
+    }
+
+    async fn acquire_fork_source_guards(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<ForkSourceGuards> {
+        let lifecycle = self.live_writer_locks.reserve_lifecycle(thread_id).await;
+        let filesystem = match self.existing_writer_lock(thread_id).await {
+            Some(guard) => guard,
+            None => self.writer_lock_coordinator.acquire(thread_id)?,
+        };
+        let topology = self.writer_lock_coordinator.acquire_topology()?;
+        Ok(ForkSourceGuards {
+            lifecycle,
+            filesystem,
+            topology,
+        })
+    }
+
+    /// Retain cross-process locks for inherited physical segments while a fork materializes or
+    /// scans them. The immediate source is already protected by `ForkSourceGuards`.
+    async fn acquire_lineage_ancestor_locks(
+        &self,
+        lineage: &rollout_lineage::RolloutLineage,
+    ) -> ThreadStoreResult<Vec<WriterLockGuard>> {
+        let mut guards = Vec::new();
+        for segment in lineage
+            .segments()
+            .iter()
+            .take(lineage.segments().len().saturating_sub(1))
+        {
+            let rollout_id = segment.rollout_id();
+            let guard = match self.existing_writer_lock(rollout_id).await {
+                Some(guard) => guard,
+                None => self.writer_lock_coordinator.acquire(rollout_id)?,
+            };
+            guards.push(guard);
+        }
+        Ok(guards)
     }
 
     async fn insert_live_recorder(
@@ -504,17 +560,13 @@ impl ThreadStore for LocalThreadStore {
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move {
-            // Mode selection and source metadata must observe the same lifecycle generation as
-            // fork preparation. The prepared fork retains its own lease through child durability.
-            let _source_lifecycle = self.live_writer_locks.reserve_lifecycle(params.thread_id).await;
-            let source = thread_rollout_resolver::resolve_current_including_archived(
-                self,
-                params.thread_id,
-            )
-            .await?
-            .ok_or(ThreadStoreError::ThreadNotFound {
-                thread_id: params.thread_id,
-            })?;
+            let source_guards = self.acquire_fork_source_guards(params.thread_id).await?;
+            let source =
+                thread_rollout_resolver::resolve_current_including_archived(self, params.thread_id)
+                    .await?
+                    .ok_or(ThreadStoreError::ThreadNotFound {
+                        thread_id: params.thread_id,
+                    })?;
             let session_meta = codex_rollout::read_session_meta_line(source.path.as_path())
                 .await
                 .map_err(|err| ThreadStoreError::Internal {
@@ -524,8 +576,12 @@ impl ThreadStore for LocalThreadStore {
                     ),
                 })?;
             match session_meta.meta.history_mode {
-                ThreadHistoryMode::Legacy => legacy_fork::prepare(self, params).await,
-                ThreadHistoryMode::Paginated => paginated_fork::prepare(self, params).await,
+                ThreadHistoryMode::Legacy => {
+                    legacy_fork::prepare(self, params, source_guards).await
+                }
+                ThreadHistoryMode::Paginated => {
+                    paginated_fork::prepare(self, params, source_guards).await
+                }
             }
         })
     }

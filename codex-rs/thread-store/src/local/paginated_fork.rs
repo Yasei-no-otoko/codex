@@ -15,12 +15,17 @@ use crate::ThreadStoreResult;
 pub(super) async fn prepare(
     store: &LocalThreadStore,
     params: PrepareForkParams,
+    source_guards: super::ForkSourceGuards,
 ) -> ThreadStoreResult<PreparedFork> {
     let PrepareForkParams {
         thread_id,
         boundary,
     } = params;
-    let source_reservation = store.live_writer_locks.reserve_lifecycle(thread_id).await;
+    let super::ForkSourceGuards {
+        lifecycle: source_reservation,
+        filesystem: source_filesystem_guard,
+        topology: source_topology_guard,
+    } = source_guards;
     // Keep the source reserved until persistence and lineage materialization finish, even if the
     // caller cancels fork preparation.
     let lineage_store = store.clone();
@@ -44,6 +49,7 @@ pub(super) async fn prepare(
         .ok_or_else(|| ThreadStoreError::Internal {
             message: "fork lineage has no source segment".to_string(),
         })?;
+    let _ancestor_guards = store.acquire_lineage_ancestor_locks(&lineage).await?;
     if store.state_db.is_none() {
         return Err(ThreadStoreError::Unsupported {
             operation: "prepare_fork",
@@ -80,7 +86,11 @@ pub(super) async fn prepare(
         thread_id,
         history_base,
         model_context,
-        source_reservation,
+        (
+            source_reservation,
+            source_filesystem_guard,
+            source_topology_guard,
+        ),
     ))
 }
 
