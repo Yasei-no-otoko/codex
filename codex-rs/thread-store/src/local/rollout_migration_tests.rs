@@ -43,6 +43,8 @@ use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::fs::File;
+use tokio::io::BufReader;
 
 use super::LocalThreadStore;
 use super::RolloutMigrationFailureReason;
@@ -53,7 +55,9 @@ use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
 #[cfg(unix)]
 use super::decompress_rollout_to_path;
+use super::decompressed_staged_rollout_path;
 use super::migration_journal_path;
+use super::staged_rollout_path;
 use super::telemetry::RolloutMigrationTrigger;
 use super::thread_history;
 use super::write_migration_journal;
@@ -250,6 +254,68 @@ fn completed(turn_id: &str) -> RolloutItem {
     }))
 }
 
+fn bounded_subagent_items(home: &Path) -> Vec<RolloutItem> {
+    vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "superseded checkpoint".repeat(1024),
+            replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: "latest checkpoint".to_string(),
+            replacement_history: Some(vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "latest compacted context".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ]),
+            mcp_resource_origins: None,
+            window_number: Some(2),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        started("child-turn"),
+        RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some("child-turn".to_string()),
+            cwd: serde_json::from_value(json!(home)).expect("absolute cwd"),
+            workspace_roots: None,
+            current_date: None,
+            timezone: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            active_permission_profile: None,
+            network: None,
+            file_system_sandbox_policy: None,
+            model: "test-model".to_string(),
+            comp_hash: None,
+            personality: None,
+            collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
+            realtime_active: None,
+            cyber_access_program: None,
+            effort: None,
+            summary: ReasoningSummary::Auto,
+        }),
+        user_message("child question"),
+        agent_message("child answer"),
+        completed("child-turn"),
+    ]
+}
+
 fn read_rollout(path: &Path) -> Vec<RolloutLine> {
     fs::read_to_string(path)
         .expect("read migrated rollout")
@@ -274,6 +340,198 @@ fn assert_failed_with_reason(
         (outcome.status, outcome.failure_reason),
         (RolloutMigrationStatus::Failed, Some(failure_reason))
     );
+}
+
+#[tokio::test]
+async fn migration_record_limit_accepts_exactly_16_mib_and_rejects_16_mib_plus_one() {
+    let home = TempDir::new().expect("create Codex home");
+    let exact_path = home.path().join("exact.jsonl");
+    let mut exact_record = b"{}".to_vec();
+    exact_record.resize(super::MAX_ROLLOUT_LINE_BYTES, b' ');
+    exact_record.push(b'\n');
+    fs::write(&exact_path, &exact_record).expect("write exact-limit record");
+
+    let mut exact_reader = BufReader::new(File::open(&exact_path).await.expect("open record"));
+    let mut bytes = Vec::new();
+    let record = super::read_rollout_record(&mut exact_reader, &mut bytes)
+        .await
+        .expect("read exact-limit record")
+        .expect("exact-limit record is present");
+    assert_eq!(
+        record.byte_count,
+        (super::MAX_ROLLOUT_LINE_BYTES + 1) as u64
+    );
+    assert!(record.line.is_none());
+
+    let oversized_path = home.path().join("oversized.jsonl");
+    exact_record.insert(super::MAX_ROLLOUT_LINE_BYTES - 1, b' ');
+    fs::write(&oversized_path, &exact_record).expect("write oversized record");
+    let mut oversized_reader = BufReader::new(
+        File::open(&oversized_path)
+            .await
+            .expect("open oversized record"),
+    );
+    let error = match super::read_rollout_record(&mut oversized_reader, &mut bytes).await {
+        Ok(_) => panic!("reject 16 MiB plus one record"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "thread-store internal error: rollout migration failed: {}",
+            super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
+        )
+    );
+
+    exact_record.pop();
+    exact_record.pop();
+    let exact_eof_path = home.path().join("exact-eof.jsonl");
+    fs::write(&exact_eof_path, &exact_record).expect("write exact-limit EOF record");
+    let mut exact_eof_reader =
+        BufReader::new(File::open(&exact_eof_path).await.expect("open EOF record"));
+    let record = super::read_rollout_record(&mut exact_eof_reader, &mut bytes)
+        .await
+        .expect("read exact-limit EOF record")
+        .expect("exact-limit EOF record is present");
+    assert_eq!(record.byte_count, super::MAX_ROLLOUT_LINE_BYTES as u64);
+    assert!(record.line.is_none());
+
+    exact_record.push(b' ');
+    let oversized_eof_path = home.path().join("oversized-eof.jsonl");
+    fs::write(&oversized_eof_path, exact_record).expect("write oversized EOF record");
+    let mut oversized_eof_reader = BufReader::new(
+        File::open(&oversized_eof_path)
+            .await
+            .expect("open oversized EOF record"),
+    );
+    let error = match super::read_rollout_record(&mut oversized_eof_reader, &mut bytes).await {
+        Ok(_) => panic!("reject 16 MiB plus one EOF record"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "thread-store internal error: rollout migration failed: {}",
+            super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
+        )
+    );
+}
+
+async fn assert_dry_run_rejects_oversized_rollout(
+    store: &LocalThreadStore,
+    home: &Path,
+    thread_id: ThreadId,
+    path: &Path,
+    original: &[u8],
+) {
+    let report = store
+        .migrate_rollouts(RolloutMigrationOptions {
+            // Keep the limiter enabled while avoiding a long test sleep for the ~16 MiB fixture.
+            max_mib_per_second: Some(1024),
+            ..RolloutMigrationOptions::default()
+        })
+        .await
+        .expect("preflight legacy rollout");
+
+    let outcome = report.outcomes.first().expect("preflight outcome");
+    let expected_message = format!(
+        "thread-store internal error: rollout migration failed: {}",
+        super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
+    );
+    assert_eq!(
+        (
+            outcome.thread_id,
+            outcome.rollout_path.as_path(),
+            outcome.status,
+            outcome.failure_reason,
+            outcome.message.as_deref(),
+        ),
+        (
+            Some(thread_id),
+            path,
+            RolloutMigrationStatus::Failed,
+            Some(RolloutMigrationFailureReason::RolloutReadFailed),
+            Some(expected_message.as_str()),
+        )
+    );
+    assert!(outcome.bytes_processed > 0);
+    assert_eq!(fs::read(path).expect("read source after dry run"), original);
+    assert!(
+        !staged_rollout_path(path)
+            .expect("build staged rollout path")
+            .exists()
+    );
+    assert!(
+        !decompressed_staged_rollout_path(path)
+            .expect("build decompressed staged rollout path")
+            .exists()
+    );
+    assert!(!migration_journal_path(home, thread_id).exists());
+    assert!(
+        thread_history::projection_state(store, thread_id)
+            .await
+            .expect("read SQLite projection")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn dry_run_rejects_oversized_plain_rollout_without_mutating_storage() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("kept question")],
+    );
+    let oversized_output = "x".repeat(super::MAX_ROLLOUT_LINE_BYTES);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open legacy rollout"),
+        "{{\"timestamp\":\"{TIMESTAMP}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"{oversized_output}\"}}}}"
+    )
+    .expect("write oversized rollout record");
+    let original = fs::read(&path).expect("read source rollout");
+    let store = indexed_store(home.path()).await;
+
+    assert_dry_run_rejects_oversized_rollout(&store, home.path(), thread_id, &path, &original)
+        .await;
+}
+
+#[tokio::test]
+async fn dry_run_rejects_oversized_compressed_rollout_without_mutating_storage() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("kept question")],
+    );
+    let oversized_output = "x".repeat(super::MAX_ROLLOUT_LINE_BYTES);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open legacy rollout"),
+        "{{\"timestamp\":\"{TIMESTAMP}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"{oversized_output}\"}}}}"
+    )
+    .expect("write oversized rollout record");
+    let compressed_path = compress_rollout(&path);
+    let original = fs::read(&compressed_path).expect("read compressed source rollout");
+    let store = indexed_store(home.path()).await;
+
+    assert_dry_run_rejects_oversized_rollout(
+        &store,
+        home.path(),
+        thread_id,
+        &compressed_path,
+        &original,
+    )
+    .await;
 }
 
 async fn indexed_store(home: &Path) -> LocalThreadStore {
@@ -1402,65 +1660,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
         home.path(),
         thread_id,
         SessionSource::SubAgent(SubAgentSource::Other("test".to_string())),
-        vec![
-            RolloutItem::Compacted(CompactedItem {
-                message: "superseded checkpoint".repeat(1024),
-                replacement_history: Some(Vec::new()),
-                mcp_resource_origins: None,
-                window_number: Some(1),
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
-            }),
-            RolloutItem::Compacted(CompactedItem {
-                message: "latest checkpoint".to_string(),
-                replacement_history: Some(vec![
-                    ResponseItem::Message {
-                        id: None,
-                        role: "user".to_string(),
-                        content: vec![ContentItem::InputText {
-                            text: "latest compacted context".to_string(),
-                        }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    }
-                    .into(),
-                ]),
-                mcp_resource_origins: None,
-                window_number: Some(2),
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
-            }),
-            started("child-turn"),
-            RolloutItem::TurnContext(TurnContextItem {
-                turn_id: Some("child-turn".to_string()),
-                cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
-                approval_policy: AskForApproval::Never,
-                approvals_reviewer: None,
-                sandbox_policy: SandboxPolicy::new_read_only_policy(),
-                permission_profile: None,
-                active_permission_profile: None,
-                network: None,
-                file_system_sandbox_policy: None,
-                model: "test-model".to_string(),
-                comp_hash: None,
-                personality: None,
-                collaboration_mode: None,
-                multi_agent_version: None,
-                multi_agent_mode: None,
-                realtime_active: None,
-                cyber_access_program: None,
-                effort: None,
-                summary: ReasoningSummary::Auto,
-            }),
-            user_message("child question"),
-            agent_message("child answer"),
-            completed("child-turn"),
-        ],
+        bounded_subagent_items(home.path()),
     );
     writeln!(
         fs::OpenOptions::new()
@@ -1505,6 +1705,67 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             .await
             .turns
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn migration_fails_without_replacing_oversized_bounded_subagent_record() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let mut items = bounded_subagent_items(home.path());
+    items.push(compacted(vec![input_response_message(
+        "user",
+        &"x".repeat(super::MAX_ROLLOUT_LINE_BYTES),
+    )]));
+    items.push(agent_message("valid record after oversized checkpoint"));
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::SubAgent(SubAgentSource::Other("test".to_string())),
+        items,
+    );
+    let original = fs::read(&path).expect("read original rollout");
+    let store = indexed_store(home.path()).await;
+
+    let report = store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("migrate oversized subagent rollout record");
+
+    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Failed);
+    assert!(
+        report.outcomes[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(super::OVERSIZED_ROLLOUT_RECORD_MESSAGE))
+    );
+    assert_eq!(
+        fs::read(&path).expect("read rollout after failure"),
+        original
+    );
+    assert!(!migration_journal_path(home.path(), thread_id).exists());
+    assert!(
+        !staged_rollout_path(&path)
+            .expect("build staged rollout path")
+            .exists()
+    );
+    assert!(
+        thread_history::projection_state(&store, thread_id)
+            .await
+            .expect("read SQLite projection")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .get_thread(thread_id)
+            .await
+            .expect("read thread metadata")
+            .expect("thread metadata")
+            .history_mode,
+        ThreadHistoryMode::Legacy
     );
 }
 
@@ -1663,6 +1924,12 @@ async fn dry_run_reports_migration_order() {
             .collect::<Vec<_>>(),
         expected,
     );
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.bytes_processed > 0)
+    );
     assert_eq!(
         progress.last(),
         Some(&RolloutMigrationProgress {
@@ -1686,6 +1953,7 @@ async fn dry_run_reports_migration_order() {
         selected.outcomes[0].status,
         RolloutMigrationStatus::Eligible
     );
+    assert!(selected.outcomes[0].bytes_processed > 0);
 }
 
 #[tokio::test]
@@ -2227,7 +2495,7 @@ async fn migration_recovers_a_compressed_published_rollout() {
 }
 
 #[tokio::test]
-async fn migration_skips_oversized_jsonl_records() {
+async fn migration_fails_without_replacing_oversized_jsonl_records() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
     let path = write_rollout(
@@ -2246,7 +2514,19 @@ async fn migration_skips_oversized_jsonl_records() {
         "{{\"timestamp\":\"{TIMESTAMP}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"{oversized_output}\"}}}}"
     )
     .expect("write oversized rollout record");
+    let later_valid_line = RolloutLine {
+        timestamp: TIMESTAMP.to_string(),
+        ordinal: None,
+        item: agent_message("kept answer"),
+    };
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&later_valid_line).expect("serialize later valid record")
+    )
+    .expect("append later valid record");
     drop(file);
+    let original = fs::read(&path).expect("read original rollout");
     let store = indexed_store(home.path()).await;
 
     let report = store
@@ -2254,16 +2534,46 @@ async fn migration_skips_oversized_jsonl_records() {
         .await
         .expect("migrate oversized rollout record");
 
-    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
-    assert!(
-        fs::metadata(&path)
-            .expect("read migrated rollout metadata")
-            .len()
-            < super::MAX_ROLLOUT_LINE_BYTES as u64
+    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Failed);
+    assert_eq!(
+        report.outcomes[0].failure_reason,
+        Some(RolloutMigrationFailureReason::LegacyRolloutConversionFailed)
     );
-    let turns = list_active_summary_turns(&store, thread_id).await;
-    assert_eq!(turns.turns.len(), 1);
-    assert_eq!(turns.turns[0].items.len(), 1);
+    assert!(
+        report.outcomes[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(super::OVERSIZED_ROLLOUT_RECORD_MESSAGE))
+    );
+    assert!(
+        !report.outcomes[0]
+            .message
+            .as_deref()
+            .expect("failure message")
+            .contains(&oversized_output)
+    );
+    assert_eq!(
+        fs::read(&path).expect("read rollout after failure"),
+        original
+    );
+    assert!(!migration_journal_path(home.path(), thread_id).exists());
+    assert!(
+        !staged_rollout_path(&path)
+            .expect("build staged rollout path")
+            .exists()
+    );
+    assert_eq!(
+        store
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .get_thread(thread_id)
+            .await
+            .expect("read thread metadata")
+            .expect("thread metadata")
+            .history_mode,
+        ThreadHistoryMode::Legacy
+    );
 }
 
 #[tokio::test]

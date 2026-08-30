@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::io::BufRead as _;
+use std::io::Read as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +33,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::BufWriter;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::LocalThreadStore;
@@ -71,7 +74,9 @@ use telemetry::RolloutMigrationTelemetry;
 use telemetry::RolloutMigrationTrigger;
 
 const PROJECTION_BATCH_BYTES: u64 = 256 * 1024;
+/// Maximum JSON payload bytes in a JSONL record, excluding a trailing newline terminator.
 const MAX_ROLLOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
+const OVERSIZED_ROLLOUT_RECORD_MESSAGE: &str = "rollout contains an oversized JSONL record";
 
 enum CanonicalizationAttempt {
     Complete {
@@ -526,11 +531,23 @@ impl LocalThreadStore {
         }
 
         if options.mode == RolloutMigrationMode::DryRun {
+            let bytes_before = limiter.bytes_processed;
+            let result = match has_oversized_rollout_record(&path, limiter).await {
+                Ok(false) => Ok(RolloutMigrationStatus::Eligible),
+                Ok(true) => Err(RolloutMigrationFailure::new(
+                    RolloutMigrationFailureReason::RolloutReadFailed,
+                    migration_error(OVERSIZED_ROLLOUT_RECORD_MESSAGE),
+                )),
+                Err(error) => Err(RolloutMigrationFailure::new(
+                    RolloutMigrationFailureReason::RolloutReadFailed,
+                    error,
+                )),
+            };
             return Ok(Some(migration_outcome(
                 thread_id,
                 path,
-                Ok(RolloutMigrationStatus::Eligible),
-                /*bytes_processed*/ 0,
+                result,
+                limiter.bytes_processed.saturating_sub(bytes_before),
             )));
         }
 
@@ -1209,7 +1226,7 @@ async fn read_rollout_record(
     bytes: &mut Vec<u8>,
 ) -> ThreadStoreResult<Option<RolloutRecord>> {
     bytes.clear();
-    let mut byte_count = reader
+    let byte_count = reader
         .take((MAX_ROLLOUT_LINE_BYTES + 1) as u64)
         .read_until(b'\n', bytes)
         .await
@@ -1217,27 +1234,8 @@ async fn read_rollout_record(
     if byte_count == 0 {
         return Ok(None);
     }
-    if byte_count > MAX_ROLLOUT_LINE_BYTES {
-        // Some historical tool outputs are too large to migrate safely in memory. Discard the
-        // whole record, including any unread suffix.
-        while bytes.last() != Some(&b'\n') {
-            bytes.clear();
-            let chunk_bytes = reader
-                .take((MAX_ROLLOUT_LINE_BYTES + 1) as u64)
-                .read_until(b'\n', bytes)
-                .await
-                .map_err(migration_error)?;
-            if chunk_bytes == 0 {
-                break;
-            }
-            byte_count = byte_count
-                .checked_add(chunk_bytes)
-                .ok_or_else(|| migration_error("rollout record byte count overflow"))?;
-        }
-        return Ok(Some(RolloutRecord {
-            line: None,
-            byte_count: byte_count as u64,
-        }));
+    if rollout_record_payload_byte_count(bytes) > MAX_ROLLOUT_LINE_BYTES {
+        return Err(migration_error(OVERSIZED_ROLLOUT_RECORD_MESSAGE));
     }
     // Legacy records do not have ordinals, so malformed complete records cannot be repaired.
     // Skip them and let the next newline-delimited record resynchronize the stream.
@@ -1246,6 +1244,71 @@ async fn read_rollout_record(
         line,
         byte_count: byte_count as u64,
     }))
+}
+
+async fn has_oversized_rollout_record(
+    rollout_path: &Path,
+    limiter: &mut RolloutMigrationRateLimiter,
+) -> ThreadStoreResult<bool> {
+    let rollout_path = rollout_path.to_path_buf();
+    let (bytes_tx, mut bytes_rx) = mpsc::channel(1);
+    let scan = tokio::task::spawn_blocking(move || -> io::Result<bool> {
+        let file = std::fs::File::open(&rollout_path)?;
+        let file = RateLimitedRead {
+            reader: file,
+            bytes_tx,
+        };
+        let reader: Box<dyn std::io::Read> = if rollout_path_is_compressed(&rollout_path) {
+            Box::new(zstd::stream::read::Decoder::new(file)?)
+        } else {
+            Box::new(file)
+        };
+        let mut reader = std::io::BufReader::with_capacity(PROJECTION_BATCH_BYTES as usize, reader);
+        let mut bytes = Vec::new();
+
+        loop {
+            bytes.clear();
+            let byte_count = reader
+                .by_ref()
+                .take((MAX_ROLLOUT_LINE_BYTES + 1) as u64)
+                .read_until(b'\n', &mut bytes)?;
+            if byte_count == 0 {
+                return Ok(false);
+            }
+            if rollout_record_payload_byte_count(&bytes) > MAX_ROLLOUT_LINE_BYTES {
+                return Ok(true);
+            }
+        }
+    });
+    while let Some(bytes) = bytes_rx.recv().await {
+        limiter.account(bytes).await;
+    }
+    scan.await
+        .map_err(migration_error)?
+        .map_err(migration_error)
+}
+
+struct RateLimitedRead {
+    reader: std::fs::File,
+    bytes_tx: mpsc::Sender<u64>,
+}
+
+impl std::io::Read for RateLimitedRead {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.reader.read(buffer)?;
+        if bytes_read > 0 {
+            self.bytes_tx
+                .blocking_send(bytes_read as u64)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "preflight receiver closed")
+                })?;
+        }
+        Ok(bytes_read)
+    }
+}
+
+fn rollout_record_payload_byte_count(bytes: &[u8]) -> usize {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes).len()
 }
 
 async fn find_rollout_paths(root: &Path) -> ThreadStoreResult<Vec<PathBuf>> {
