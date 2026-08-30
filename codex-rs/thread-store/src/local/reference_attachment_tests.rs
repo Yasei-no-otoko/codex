@@ -122,10 +122,79 @@ async fn oversized_record_at_ancestor_cutoff_cannot_leak_post_cutoff_secret() {
     )
     .await
     .expect("stream bounded ancestor");
-    writer.finish().await.expect("finish");
+    assert!(writer.finish().await.expect("finish"));
     let text = fs::read_to_string(output.path()).expect("read output");
     assert!(text.contains("small-prefix"));
     assert!(!text.contains("post-cutoff-secret"));
+}
+
+#[tokio::test]
+async fn oversized_record_after_cutoff_does_not_mark_attachment_truncated() {
+    let source = NamedTempFile::new().expect("create source");
+    let prefix = envelope("event_msg", serde_json::json!({"message": "before-cutoff"}));
+    let oversized = format!("{}\n", "x".repeat(4 * 1024 * 1024));
+    let secret = envelope("event_msg", serde_json::json!({"message": "after-cutoff"}));
+    let mut bytes = prefix.clone();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(oversized.as_bytes());
+    bytes.extend_from_slice(secret.as_slice());
+    bytes.push(b'\n');
+    fs::write(source.path(), bytes).expect("write source");
+    let output = NamedTempFile::new().expect("create output");
+    let mut writer = AsyncAttachmentWriter::new(output.path().to_path_buf(), 4 * 1024 * 1024)
+        .await
+        .expect("create writer");
+    stream_segment(
+        &RolloutLineageSegment {
+            rollout_id: ThreadId::default(),
+            rollout_path: source.path().to_path_buf(),
+            start_ordinal: 0,
+            end: Some(HistoryPosition {
+                thread_id: ThreadId::default(),
+                end_ordinal_exclusive: 1,
+                end_byte_offset: prefix.len() as u64 + 1,
+            }),
+        },
+        &mut writer,
+    )
+    .await
+    .expect("stream before cutoff");
+    assert!(!writer.finish().await.expect("finish"));
+    let text = fs::read_to_string(output.path()).expect("read output");
+    assert!(text.contains("before-cutoff"));
+    assert!(!text.contains("after-cutoff"));
+}
+
+#[tokio::test]
+async fn zstd_rollout_streams_logical_lines_without_plain_materialization() {
+    let source = NamedTempFile::new().expect("create source");
+    let compressed_path = source.path().with_extension("jsonl.zst");
+    let lines = join_lines([
+        envelope("session_meta", serde_json::json!({})),
+        envelope("event_msg", serde_json::json!({"message": "compressed-marker"})),
+    ]);
+    let compressed = zstd::stream::encode_all(lines.as_slice(), 3).expect("compress rollout");
+    fs::write(&compressed_path, compressed).expect("write compressed rollout");
+    let output = NamedTempFile::new().expect("create output");
+    let mut writer = AsyncAttachmentWriter::new(output.path().to_path_buf(), 4096)
+        .await
+        .expect("create writer");
+    stream_segment(
+        &RolloutLineageSegment {
+            rollout_id: ThreadId::default(),
+            rollout_path: compressed_path.clone(),
+            start_ordinal: 0,
+            end: None,
+        },
+        &mut writer,
+    )
+    .await
+    .expect("stream compressed rollout");
+    assert!(!writer.finish().await.expect("finish"));
+    let text = fs::read_to_string(output.path()).expect("read output");
+    assert!(text.contains("compressed-marker"));
+    assert!(compressed_path.exists());
+    assert!(!compressed_path.with_extension("jsonl").exists());
 }
 
 #[tokio::test]

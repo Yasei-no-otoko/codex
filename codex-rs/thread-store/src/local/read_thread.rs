@@ -29,9 +29,6 @@ use crate::StoredThreadHistory;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::error::reject_paginated_history_mode;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncReadExt;
-use tokio::io::BufReader;
 
 pub(super) async fn read_thread(
     store: &LocalThreadStore,
@@ -366,52 +363,71 @@ async fn read_legacy_segment_prefix(
     child_head_seen: &mut bool,
     on_item: &mut impl FnMut(RolloutItem) -> bool,
 ) -> ThreadStoreResult<bool> {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl.zst"))
-    {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "legacy reference rollout must be plain JSONL: {}",
-                path.display()
-            ),
-        });
-    }
-    let file = tokio::fs::File::open(path)
+    // Keep legacy logical replay bounded for both plain and zstd rollouts. The limit matches the
+    // migration reader's established record bound; oversized records fail closed instead of
+    // allocating an unbounded Vec or silently dropping a valid record.
+    const LEGACY_READ_LINE_LIMIT: usize = 16 * 1024 * 1024;
+    let mut reader = codex_rollout::open_rollout_raw_line_reader(path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to open rollout {}: {err}", path.display()),
         })?;
-    let file_len = file
-        .metadata()
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to stat rollout {}: {err}", path.display()),
-        })?
-        .len();
-    let end = end_byte_offset.unwrap_or(file_len);
-    if end > file_len {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "legacy history cutoff {end} exceeds rollout {} length {file_len}",
-                path.display()
-            ),
-        });
-    }
-    let mut reader = BufReader::new(file.take(end));
-    let mut raw_line = Vec::new();
+    let mut offset = 0_u64;
     loop {
-        raw_line.clear();
-        let bytes_read = reader
-            .read_until(b'\n', &mut raw_line)
+        let Some(record) = reader
+            .next_raw_line_limited(LEGACY_READ_LINE_LIMIT)
             .await
             .map_err(|err| ThreadStoreError::Internal {
                 message: format!("failed to read rollout {}: {err}", path.display()),
             })?;
-        if bytes_read == 0 || !raw_line.ends_with(b"\n") {
+        let (raw_line, byte_count, terminated) = match record {
+            codex_rollout::RawRolloutLine::Complete(line) => {
+                let byte_count = line.len() as u64;
+                let terminated = line.ends_with(b"\n");
+                (Some(line), byte_count, terminated)
+            }
+            codex_rollout::RawRolloutLine::Oversized {
+                byte_count,
+                terminated,
+            } => {
+                let next_offset = offset.saturating_add(byte_count as u64);
+                if end_byte_offset.is_some_and(|end| next_offset > end) {
+                    return Err(ThreadStoreError::InvalidRequest {
+                        message: format!(
+                            "legacy history cutoff exceeds rollout {} at byte {next_offset}",
+                            path.display()
+                        ),
+                    });
+                }
+                if !terminated {
+                    // A physical EOF partial record is not part of the logical replay. It is
+                    // deliberately excluded without allocating the remainder of the line.
+                    return Ok(true);
+                }
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "legacy rollout record exceeds {LEGACY_READ_LINE_LIMIT} bytes: {}",
+                        path.display()
+                    ),
+                });
+            }
+        };
+        let next_offset = offset.saturating_add(byte_count);
+        if end_byte_offset.is_some_and(|end| next_offset > end) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "legacy history cutoff exceeds rollout {} at byte {next_offset}",
+                    path.display()
+                ),
+            });
+        }
+        offset = next_offset;
+        if !terminated {
             break;
         }
+        let Some(raw_line) = raw_line else {
+            break;
+        };
         let mut value = match serde_json::from_slice::<serde_json::Value>(&raw_line) {
             Ok(value) => value,
             Err(_) => continue,
@@ -928,6 +944,70 @@ mod tests {
             .expect("read thread");
 
         assert_eq!(thread.forked_from_id, Some(parent_thread_id));
+    }
+
+    #[tokio::test]
+    async fn read_thread_replays_compressed_legacy_reference_child_and_ancestor() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let parent_uuid = Uuid::from_u128(213);
+        let child_uuid = Uuid::from_u128(214);
+        let parent_path = write_session_file(
+            home.path(),
+            "2025-01-03T12-00-00",
+            parent_uuid,
+        )
+        .expect("parent session file");
+        let parent_bytes = std::fs::read(&parent_path).expect("read parent");
+        let parent_compressed = parent_path.with_extension("jsonl.zst");
+        std::fs::write(
+            &parent_compressed,
+            zstd::stream::encode_all(parent_bytes.as_slice(), 3).expect("compress parent"),
+        )
+        .expect("write compressed parent");
+        std::fs::remove_file(&parent_path).expect("remove plain parent");
+
+        let child_path = write_session_file(
+            home.path(),
+            "2025-01-03T12-01-00",
+            child_uuid,
+        )
+        .expect("child session file");
+        let child_text = std::fs::read_to_string(&child_path).expect("read child");
+        let (child_meta, child_delta) = child_text
+            .split_once('\n')
+            .expect("child metadata line");
+        let mut child_meta: serde_json::Value =
+            serde_json::from_str(child_meta).expect("parse child metadata");
+        child_meta["payload"]["history_base"] = serde_json::json!({
+            "thread_id": parent_uuid,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": parent_bytes.len(),
+        });
+        let child_bytes = format!("{}\n{}", child_meta, child_delta)
+            .replace("Hello from user", "child compressed delta");
+        std::fs::write(&child_path, child_bytes.as_bytes()).expect("rewrite child metadata");
+        let child_compressed = child_path.with_extension("jsonl.zst");
+        std::fs::write(
+            &child_compressed,
+            zstd::stream::encode_all(child_bytes.as_bytes(), 3).expect("compress child"),
+        )
+        .expect("write compressed child");
+        std::fs::remove_file(&child_path).expect("remove plain child");
+
+        let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id: child_id,
+                include_archived: true,
+                include_history: true,
+            })
+            .await
+            .expect("read compressed reference child");
+        let history = thread.history.expect("logical history");
+        let serialized = serde_json::to_string(&history.items).expect("serialize history");
+        assert!(serialized.contains("Hello from user"));
+        assert!(serialized.contains("child"));
     }
 
     #[tokio::test]

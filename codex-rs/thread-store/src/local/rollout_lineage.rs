@@ -404,6 +404,21 @@ async fn validate_cutoff_bounds(
     let end_byte_offset = end.end_byte_offset;
     let path = rollout_path.to_path_buf();
     if history_mode == ThreadHistoryMode::Legacy {
+        // A shared legacy ancestor may already be compressed. Validate its decoded byte cutoff
+        // through the raw reader; the plain-file reverse scanner cannot interpret zstd bytes.
+        if rollout_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".jsonl.zst"))
+        {
+            return validate_raw_rollout_cutoff(
+                requested_thread_id,
+                rollout_path,
+                end_byte_offset,
+                history_mode,
+            )
+            .await;
+        }
         let validation_path = path.clone();
         let complete_envelope = tokio::task::spawn_blocking(move || {
             legacy_envelope::validate_rollout_envelope_cutoff(

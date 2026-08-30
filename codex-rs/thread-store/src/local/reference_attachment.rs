@@ -134,18 +134,17 @@ pub(super) async fn stream_segment(
             }
         }
         )? {
-        let (line, byte_count, terminated) = match record {
+        let (line, byte_count, terminated, oversized) = match record {
             codex_rollout::RawRolloutLine::Complete(line) => {
                 let byte_count = line.len();
                 let terminated = line.ends_with(b"\n");
-                (Some(line), byte_count, terminated)
+                (Some(line), byte_count, terminated, false)
             }
             codex_rollout::RawRolloutLine::Oversized {
                 byte_count,
                 terminated,
             } => {
-                writer.mark_truncated();
-                (None, byte_count, terminated)
+                (None, byte_count, terminated, true)
             }
         };
         let next_offset = offset.saturating_add(byte_count as u64);
@@ -156,6 +155,9 @@ pub(super) async fn stream_segment(
             break;
         }
         offset = next_offset;
+        if oversized {
+            writer.mark_truncated();
+        }
         if !terminated {
             break;
         }
