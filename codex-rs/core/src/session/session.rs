@@ -1605,6 +1605,7 @@ impl Session {
                 // A reference child has no copied prefix to force a write. Flush its canonical
                 // SessionMeta now so list/read callers can discover the new child immediately.
                 sess.flush_rollout().await?;
+                sess.reconcile_materialized_rollout_metadata().await?;
             }
             {
                 let mut state = sess.state.lock().await;
