@@ -103,16 +103,18 @@ pub(super) async fn prepare(
         end_ordinal_exclusive: 0,
         end_byte_offset,
     };
+    let mut ancestor_guards = Vec::new();
     let model_context = if reference_child {
         // A legacy child carries an immutable prefix. Resolve every ancestor under the same
         // managed-path rules before creating another reference; accepting only the leaf would
         // make a later copy fallback drop that prefix.
-        let (lineage, _ancestor_guards) = store
+        let (lineage, guards) = store
             .resolve_rollout_lineage_for_reference_locked_with_source_guard(
                 thread_id,
                 source_filesystem_guard.clone(),
             )
             .await?;
+        ancestor_guards = guards;
         Arc::new(model_context::load_for_fork(lineage, Some(history_base)).await?)
     } else {
         Arc::new(model_context::load_legacy_fork_context(source_path, end_byte_offset).await?)
@@ -121,7 +123,7 @@ pub(super) async fn prepare(
         thread_id,
         Some(history_base),
         model_context,
-        (source_reservation, source_filesystem_guard),
+        (source_reservation, source_filesystem_guard, ancestor_guards),
     ))
 }
 

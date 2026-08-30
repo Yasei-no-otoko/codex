@@ -1062,6 +1062,18 @@ async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() 
             .expect("read compressed source timestamp"),
         source_modified
     );
+    // PreparedFork retains guards for its complete immutable ancestry until the child reference
+    // is durable. A maintenance process must therefore be unable to move/delete the ancestor
+    // after preparation has returned but before either prepared child is consumed.
+    let maintenance_store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let ancestor_lock_error = maintenance_store
+        .writer_lock_coordinator
+        .acquire(ancestor_thread_id)
+        .expect_err("prepared reference must retain its ancestor writer guard");
+    assert!(matches!(
+        ancestor_lock_error,
+        crate::ThreadStoreError::Conflict { .. }
+    ));
     for prepared in [first, second] {
         assert!(matches!(
             prepared.model_context.first(),

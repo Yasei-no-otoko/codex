@@ -14,6 +14,9 @@ use tempfile::TempDir;
 use super::super::LocalThreadStore;
 use super::super::test_support::test_config;
 use super::RolloutLineageSegment;
+use crate::ArchiveThreadParams;
+use crate::DeleteThreadParams;
+use crate::ThreadStore;
 
 #[tokio::test]
 async fn resolves_nested_lineage_with_empty_intermediate_segments() {
@@ -245,15 +248,22 @@ async fn locked_reference_lineage_retains_ancestor_guard_across_stores() {
     let config = test_config(home.path());
     let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
     let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
-    let root = ThreadId::default();
+    let root_logical_thread_id = ThreadId::default();
+    let root_rollout_id = ThreadId::default();
     let child = ThreadId::default();
-    let root_path = write_rollout(home.path(), root, None, /*next_ordinal*/ 2);
+    let root_path = write_reverted_rollout(
+        home.path(),
+        root_logical_thread_id,
+        root_rollout_id,
+        None,
+        /*next_ordinal*/ 2,
+    );
     write_rollout(
         home.path(),
         child,
         Some(history_position(
             root_path.as_path(),
-            root,
+            root_rollout_id,
             /*end_ordinal_exclusive*/ 2,
         )),
         /*next_ordinal*/ 2,
@@ -271,16 +281,93 @@ async fn locked_reference_lineage_retains_ancestor_guard_across_stores() {
     assert_eq!(ancestor_guards.len(), 1);
     let err = maintenance_store
         .writer_lock_coordinator
-        .acquire(root)
+        .acquire(root_logical_thread_id)
         .expect_err("ancestor guard must block another store's maintenance");
     assert!(matches!(err, crate::ThreadStoreError::Conflict { .. }));
+    // The immutable rollout ID intentionally remains unlocked: it is a lineage address, not the
+    // mutation identity. Archive/delete/revert/compression all use the stable logical ID.
+    assert!(
+        maintenance_store
+            .writer_lock_coordinator
+            .acquire(root_rollout_id)
+            .is_ok()
+    );
+    let archive_err = maintenance_store
+        .archive_thread(ArchiveThreadParams {
+            thread_id: root_logical_thread_id,
+        })
+        .await
+        .expect_err("ancestor guard must prevent an archive move");
+    assert!(matches!(
+        archive_err,
+        crate::ThreadStoreError::Conflict { .. }
+    ));
+    let delete_err = maintenance_store
+        .delete_thread(DeleteThreadParams {
+            thread_id: root_logical_thread_id,
+        })
+        .await
+        .expect_err("ancestor guard must prevent deletion");
+    assert!(matches!(
+        delete_err,
+        crate::ThreadStoreError::Conflict { .. }
+    ));
     drop(ancestor_guards);
     assert!(
         maintenance_store
             .writer_lock_coordinator
-            .acquire(root)
+            .acquire(root_logical_thread_id)
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn locked_reference_ancestor_guard_blocks_unarchive_of_reverted_rollout() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+    let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
+    let ancestor_thread_id = ThreadId::default();
+    let ancestor_rollout_id = ThreadId::default();
+    let child = ThreadId::default();
+    let active_path = write_reverted_rollout(
+        home.path(),
+        ancestor_thread_id,
+        ancestor_rollout_id,
+        None,
+        /*next_ordinal*/ 2,
+    );
+    let archived_dir = home.path().join("archived_sessions");
+    fs::create_dir_all(&archived_dir).expect("create archived directory");
+    let archived_path = archived_dir.join(active_path.file_name().expect("rollout file name"));
+    fs::rename(&active_path, &archived_path).expect("archive ancestor fixture");
+    write_rollout(
+        home.path(),
+        child,
+        Some(history_position(
+            archived_path.as_path(),
+            ancestor_rollout_id,
+            /*end_ordinal_exclusive*/ 2,
+        )),
+        /*next_ordinal*/ 2,
+    );
+
+    let source_guard = store
+        .writer_lock_coordinator
+        .acquire(child)
+        .expect("hold child source guard");
+    let (_lineage, ancestor_guards) = store
+        .resolve_rollout_lineage_for_reference_locked_with_source_guard(child, source_guard)
+        .await
+        .expect("resolve locked archived lineage");
+    let err = maintenance_store
+        .unarchive_thread(ArchiveThreadParams {
+            thread_id: ancestor_thread_id,
+        })
+        .await
+        .expect_err("ancestor guard must prevent unarchive move");
+    assert!(matches!(err, crate::ThreadStoreError::Conflict { .. }));
+    drop(ancestor_guards);
 }
 
 #[tokio::test]

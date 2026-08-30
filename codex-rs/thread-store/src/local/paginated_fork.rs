@@ -29,7 +29,7 @@ pub(super) async fn prepare(
     // caller cancels fork preparation.
     let lineage_store = store.clone();
     let source_guard_for_lineage = source_filesystem_guard.clone();
-    let (lineage, _ancestor_guards, source_reservation) = tokio::spawn(async move {
+    let (lineage, ancestor_guards, source_reservation) = tokio::spawn(async move {
         match live_writer::persist_thread(&lineage_store, thread_id).await {
             Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
             Err(err) => return Err(err),
@@ -88,7 +88,7 @@ pub(super) async fn prepare(
         thread_id,
         history_base,
         model_context,
-        (source_reservation, source_filesystem_guard),
+        (source_reservation, source_filesystem_guard, ancestor_guards),
     ))
 }
 

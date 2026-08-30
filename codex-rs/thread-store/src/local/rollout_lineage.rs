@@ -103,12 +103,28 @@ impl LocalThreadStore {
         let mut ancestor_guards = Vec::new();
 
         loop {
-            let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
+            // A history base names an immutable rollout ID, while every mutator/compressor uses
+            // the stable logical ID encoded before `_` in the canonical filename. Discover only
+            // that filename first, take the stable-ID guard, then resolve the immutable ID again
+            // under the guard before reading any rollout content.
+            let ancestor_logical_thread_id = match (representation, next_rollout_id) {
+                (LineageRepresentation::PlainForReference, Some(rollout_id)) => {
+                    let path = resolve_rollout_path_by_id(self, rollout_id)
+                        .await?
+                        .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
+                    codex_rollout::rollout_thread_id_from_path(path.as_path()).ok_or_else(|| {
+                        malformed_lineage(rollout_id, "source rollout has invalid filename")
+                    })?
+                }
+                _ => requested_thread_id,
+            };
             let _writer_guard = match representation {
                 LineageRepresentation::Existing => None,
-                LineageRepresentation::PlainForReference => {
-                    Some(self.live_writer_locks.lock(coordination_id).await)
-                }
+                LineageRepresentation::PlainForReference => Some(
+                    self.live_writer_locks
+                        .lock(ancestor_logical_thread_id)
+                        .await,
+                ),
             };
             let _filesystem_guard = match representation {
                 LineageRepresentation::Existing => None,
@@ -117,14 +133,18 @@ impl LocalThreadStore {
                         Some(guard) => guard.clone(),
                         // This branch has no external caller retaining a source guard; acquire
                         // one for the resolver itself and retain it through its path reads.
-                        None => self.writer_lock_coordinator.acquire(coordination_id)?,
+                        None => self
+                            .writer_lock_coordinator
+                            .acquire(ancestor_logical_thread_id)?,
                     };
                     Some(guard)
                 }
                 LineageRepresentation::PlainForReference => {
-                    let guard = match self.existing_writer_lock(coordination_id).await {
+                    let guard = match self.existing_writer_lock(ancestor_logical_thread_id).await {
                         Some(guard) => guard,
-                        None => self.writer_lock_coordinator.acquire(coordination_id)?,
+                        None => self
+                            .writer_lock_coordinator
+                            .acquire(ancestor_logical_thread_id)?,
                     };
                     ancestor_guards.push(guard.clone());
                     Some(guard)
@@ -152,17 +172,14 @@ impl LocalThreadStore {
             if !seen.insert(rollout_id) {
                 return Err(malformed_lineage(requested_thread_id, "cycle detected"));
             }
-            let rollout_path = match representation {
-                LineageRepresentation::Existing => rollout_path,
-                // Every reference segment, including its leaf, must retain a canonical managed
-                // pathname. Otherwise a later copy fallback could preserve only the child's
-                // physical suffix and silently discard an inherited ancestor.
-                LineageRepresentation::PlainForReference => super::helpers::managed_rollout_path(
-                    self.config.codex_home.as_path(),
-                    rollout_path.as_path(),
-                    rollout_id,
-                )?,
-            };
+            // Both logical readers and reference preparation traverse immutable ancestry. Do not
+            // let either path follow an external, traversal, or symlinked file: an Existing
+            // lineage is just as security-sensitive as one we are about to share.
+            let rollout_path = super::helpers::managed_rollout_path(
+                self.config.codex_home.as_path(),
+                rollout_path.as_path(),
+                rollout_id,
+            )?;
             let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
                 .await
                 .map_err(|err| ThreadStoreError::Internal {
@@ -171,9 +188,10 @@ impl LocalThreadStore {
                         rollout_path.display()
                     ),
                 })?;
-            if codex_rollout::rollout_thread_id_from_path(rollout_path.as_path())
-                != Some(meta.meta.id)
+            let path_thread_id = codex_rollout::rollout_thread_id_from_path(rollout_path.as_path());
+            if path_thread_id != Some(meta.meta.id)
                 || codex_rollout::rollout_id_from_path(rollout_path.as_path()) != Some(rollout_id)
+                || (next_rollout_id.is_none() && path_thread_id != Some(requested_thread_id))
             {
                 return Err(malformed_lineage(
                     requested_thread_id,

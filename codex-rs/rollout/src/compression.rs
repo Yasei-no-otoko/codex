@@ -519,11 +519,22 @@ pub(super) mod worker {
                     metrics::file("skipped_unreadable_meta");
                     continue;
                 };
+                let Some(logical_thread_id) = crate::rollout_thread_id_from_path(path.as_path())
+                else {
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    metrics::file("skipped_unreadable_meta");
+                    continue;
+                };
                 let Ok(meta) = crate::read_session_meta_line(path.as_path()).await else {
                     stats.skipped = stats.skipped.saturating_add(1);
                     metrics::file("skipped_unreadable_meta");
                     continue;
                 };
+                if meta.meta.id != logical_thread_id {
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    metrics::file("skipped_unreadable_meta");
+                    continue;
+                }
                 if mode == RolloutCompressionMode::Standalone
                     && reference_index.reference_count(rollout_id) > 0
                 {
@@ -544,8 +555,11 @@ pub(super) mod worker {
                 let writer_locks = Arc::clone(writer_locks);
                 jobs.spawn_blocking(move || {
                     let started_at = Instant::now();
-                    let result =
-                        compress_rollout_if_cold_blocking(path.as_path(), rollout_id, writer_locks);
+                    let result = compress_rollout_if_cold_blocking(
+                        path.as_path(),
+                        logical_thread_id,
+                        writer_locks,
+                    );
                     let duration = started_at.elapsed();
                     (path, duration, result)
                 });
@@ -661,10 +675,13 @@ pub(super) mod worker {
 
     pub(super) fn compress_rollout_if_cold_blocking(
         path: &Path,
-        thread_id: ThreadId,
+        logical_thread_id: ThreadId,
         writer_locks: Arc<ThreadWriterLockCoordinator>,
     ) -> io::Result<CompressionMeasurement> {
-        let _writer_lock = match writer_locks.acquire(thread_id) {
+        // Every live writer and lifecycle operation uses the stable logical thread ID encoded
+        // before `_` in a reverted rollout filename. Keep compression on that same lock rather
+        // than the immutable rollout ID carried by HistoryPosition.
+        let _writer_lock = match writer_locks.acquire(logical_thread_id) {
             Ok(lock) => lock,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 return Ok(CompressionMeasurement::new(

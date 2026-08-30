@@ -54,6 +54,37 @@ fn compression_and_reference_writer_use_the_same_thread_lock() -> anyhow::Result
     Ok(())
 }
 
+#[test]
+fn compression_of_reverted_rollout_uses_the_logical_thread_lock() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let logical_uuid = Uuid::from_u128(43);
+    let immutable_uuid = Uuid::from_u128(44);
+    let logical_thread_id = ThreadId::from_string(&logical_uuid.to_string())?;
+    let immutable_rollout_id = ThreadId::from_string(&immutable_uuid.to_string())?;
+    let original_path = rollout_path(home.path(), "2025-01-03T12-00-00", logical_uuid);
+    write_rollout(&original_path, logical_thread_id, "reverted lock race")?;
+    let path = original_path.with_file_name(format!(
+        "rollout-2025-01-03T12-00-00-{logical_thread_id}_{immutable_rollout_id}.jsonl"
+    ));
+    fs::rename(&original_path, &path)?;
+    set_old_mtime(&path)?;
+
+    let held =
+        Arc::new(ThreadWriterLockCoordinator::new(home.path())).acquire(logical_thread_id)?;
+    let measurement = super::worker::compress_rollout_if_cold_blocking(
+        path.as_path(),
+        logical_thread_id,
+        Arc::new(ThreadWriterLockCoordinator::new(home.path())),
+    )?;
+    assert_eq!(
+        measurement.outcome,
+        super::worker::CompressionOutcome::SkippedWriterBusy
+    );
+    assert!(path.exists());
+    drop(held);
+    Ok(())
+}
+
 #[tokio::test]
 async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
     let home = TempDir::new()?;
