@@ -481,20 +481,29 @@ impl LocalThreadStore {
         if metadata.meta.history_mode == ThreadHistoryMode::Paginated {
             let bytes_before = limiter.bytes_processed;
             let result = if pending_published_migration {
-                let _live_writer_guard = self.live_writer_locks.lock(thread_id).await;
-                match self
-                    .recover_published_migration(
-                        thread_id,
-                        &path,
-                        &journal_path,
-                        legacy_names,
-                        limiter,
-                    )
-                    .await
-                {
+                let recovery_result = async {
+                    let _live_writer_guard = self.live_writer_locks.lock(thread_id).await;
+                    let _writer_guard = self.writer_lock_coordinator.acquire(thread_id)?;
+                    let recovered_path = self
+                        .recover_published_migration(thread_id, &path, limiter)
+                        .await?;
+                    self.clear_published_migration_journal(&journal_path)
+                        .await?;
+                    Ok::<_, ThreadStoreError>(recovered_path)
+                }
+                .await;
+                match recovery_result {
                     Ok(recovered_path) => {
                         path = recovered_path;
-                        Ok(RolloutMigrationStatus::Migrated)
+                        self.promote_legacy_name(thread_id, legacy_names)
+                            .await
+                            .map(|()| RolloutMigrationStatus::Migrated)
+                            .map_err(|error| {
+                                RolloutMigrationFailure::new(
+                                    RolloutMigrationFailureReason::InterruptedMigrationRecoveryFailed,
+                                    error,
+                                )
+                            })
                     }
                     Err(ThreadStoreError::Conflict { message }) => {
                         let bytes_processed = limiter.bytes_processed.saturating_sub(bytes_before);
@@ -534,42 +543,69 @@ impl LocalThreadStore {
             )));
         }
 
-        let _live_writer_guard = self.live_writer_locks.lock(thread_id).await;
-        let _writer_guard = match self.writer_lock_coordinator.acquire(thread_id) {
-            Ok(guard) => guard,
-            Err(ThreadStoreError::Conflict { message }) => {
-                return Ok(Some(skipped_busy_outcome(
-                    thread_id, path, message, /*bytes_processed*/ 0,
-                )));
+        let bytes_before = limiter.bytes_processed;
+        let migration_result = {
+            let _live_writer_guard = self.live_writer_locks.lock(thread_id).await;
+            let _writer_guard = match self.writer_lock_coordinator.acquire(thread_id) {
+                Ok(guard) => guard,
+                Err(ThreadStoreError::Conflict { message }) => {
+                    return Ok(Some(skipped_busy_outcome(
+                        thread_id, path, message, /*bytes_processed*/ 0,
+                    )));
+                }
+                Err(error) => {
+                    return Ok(Some(migration_outcome(
+                        thread_id,
+                        path,
+                        Err(RolloutMigrationFailure::new(
+                            RolloutMigrationFailureReason::Unknown,
+                            error,
+                        )),
+                        /*bytes_processed*/ 0,
+                    )));
+                }
+            };
+            // SessionMeta gives us the writer-lock id, so archiving can win between that read and
+            // lock acquisition. Once the lock is ours, follow the same rollout to its current
+            // path.
+            if !tokio::fs::try_exists(&path)
+                .await
+                .map_err(migration_error)?
+                && let Some(current_path) =
+                    find_current_rollout_path(&self.config.codex_home, &path).await?
+            {
+                path = current_path;
             }
-            Err(error) => {
-                return Ok(Some(migration_outcome(
-                    thread_id,
-                    path,
-                    Err(RolloutMigrationFailure::new(
-                        RolloutMigrationFailureReason::Unknown,
-                        error,
-                    )),
-                    /*bytes_processed*/ 0,
-                )));
+            match self
+                .migrate_one_rollout(thread_id, &path, &journal_path, kind, limiter)
+                .await
+            {
+                Ok(()) => self
+                    .clear_published_migration_journal(&journal_path)
+                    .await
+                    .map_err(|error| {
+                        RolloutMigrationFailure::new(
+                            RolloutMigrationFailureReason::RolloutPublishFailed,
+                            error,
+                        )
+                    }),
+                Err(failure) => Err(failure),
             }
         };
-        // SessionMeta gives us the writer-lock id, so archiving can win between that read and
-        // lock acquisition. Once the lock is ours, follow the same rollout to its current path.
-        if !tokio::fs::try_exists(&path)
-            .await
-            .map_err(migration_error)?
-            && let Some(current_path) =
-                find_current_rollout_path(&self.config.codex_home, &path).await?
-        {
-            path = current_path;
-        }
-        let bytes_before = limiter.bytes_processed;
-        let result = match self
-            .migrate_one_rollout(thread_id, &path, &journal_path, kind, legacy_names, limiter)
-            .await
-        {
-            Ok(()) => Ok(RolloutMigrationStatus::Migrated),
+        // Keep the journal visible until the replacement is durable under this migration's writer
+        // guards. `thread/read` takes the SQLite state as the public resume contract, so expose it
+        // only after those guards are released.
+        let result = match migration_result {
+            Ok(()) => self
+                .promote_legacy_name(thread_id, legacy_names)
+                .await
+                .map(|()| RolloutMigrationStatus::Migrated)
+                .map_err(|error| {
+                    RolloutMigrationFailure::new(
+                        RolloutMigrationFailureReason::RolloutPublishFailed,
+                        error,
+                    )
+                }),
             Err(failure) => {
                 if let Err(cleanup_error) = self
                     .cleanup_failed_unpublished_migration(thread_id, &path, &journal_path)
@@ -603,7 +639,6 @@ impl LocalThreadStore {
         rollout_path: &Path,
         journal_path: &Path,
         kind: RolloutMigrationKind,
-        legacy_names: &HashMap<ThreadId, String>,
         limiter: &mut RolloutMigrationRateLimiter,
     ) -> ClassifiedMigrationResult<()> {
         if let Some(state_db) = &self.state_db
@@ -784,8 +819,8 @@ impl LocalThreadStore {
             RolloutMigrationFailureReason::SqliteMaterializationFailed,
         )?;
 
-        // Once projection is verified, the remaining work publishes the replacement and clears
-        // the durable pending journal.
+        // Once projection is verified, publish the replacement. The caller clears the durable
+        // pending journal before it releases this migration's writer guards.
         let publish_result = async {
             let compressed_staged_path = if compressed {
                 let path = compressed_staged_rollout_path(rollout_path)?;
@@ -823,8 +858,7 @@ impl LocalThreadStore {
                     .map_err(migration_error)?;
             }
             sync_parent_directory(rollout_path).await?;
-            self.finish_published_migration(thread_id, journal_path, legacy_names)
-                .await
+            Ok(())
         }
         .await;
         with_failure_reason(
@@ -999,11 +1033,8 @@ impl LocalThreadStore {
         &self,
         thread_id: ThreadId,
         rollout_path: &Path,
-        journal_path: &Path,
-        legacy_names: &HashMap<ThreadId, String>,
         limiter: &mut RolloutMigrationRateLimiter,
     ) -> ThreadStoreResult<PathBuf> {
-        let _writer_guard = self.writer_lock_coordinator.acquire(thread_id)?;
         let decompressed_path = rollout_path_is_compressed(rollout_path)
             .then(|| decompressed_staged_rollout_path(rollout_path))
             .transpose()?;
@@ -1041,8 +1072,6 @@ impl LocalThreadStore {
         if let Some(decompressed_path) = decompressed_path.as_ref() {
             remove_file_if_present(decompressed_path).await?;
         }
-        self.finish_published_migration(thread_id, journal_path, legacy_names)
-            .await?;
         Ok(rollout_path.to_path_buf())
     }
 
@@ -1069,16 +1098,11 @@ impl LocalThreadStore {
         sync_parent_directory(journal_path).await
     }
 
-    async fn finish_published_migration(
+    async fn clear_published_migration_journal(
         &self,
-        thread_id: ThreadId,
         journal_path: &Path,
-        legacy_names: &HashMap<ThreadId, String>,
     ) -> ThreadStoreResult<()> {
-        self.promote_legacy_name(thread_id, legacy_names).await?;
-        tokio::fs::remove_file(journal_path)
-            .await
-            .map_err(migration_error)?;
+        remove_file_if_present(journal_path).await?;
         sync_parent_directory(journal_path).await
     }
 

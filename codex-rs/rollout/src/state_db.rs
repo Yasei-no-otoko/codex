@@ -515,6 +515,58 @@ pub async fn mark_thread_memory_mode_polluted(
     }
 }
 
+/// Project a materialized rollout's metadata into SQLite and wait for visibility.
+///
+/// This is the explicit metadata projection barrier for callers that have already made the
+/// rollout durable and must publish it to StateDB-backed discovery before returning.
+pub async fn reconcile_rollout_metadata(
+    context: Option<&codex_state::StateRuntime>,
+    rollout_path: &Path,
+    default_provider: &str,
+    archived_only: Option<bool>,
+) -> anyhow::Result<()> {
+    let Some(ctx) = context else {
+        return Ok(());
+    };
+    let outcome = metadata::extract_metadata_from_rollout(rollout_path, default_provider).await?;
+    let mut metadata = outcome.metadata;
+    let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
+    metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
+    let existing_metadata = ctx.get_thread(metadata.id).await?;
+    // Filesystem repair may seed a missing row, but it must not change an existing row's
+    // selected rollout path. After `thread/revert`, a scan can find multiple immutable
+    // rollouts for one thread and cannot know which one SQLite selected.
+    if existing_metadata
+        .as_ref()
+        .is_some_and(|existing| existing.rollout_path.as_path() != rollout_path)
+    {
+        return Ok(());
+    }
+    // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
+    // missing row, then keep the value from SQLite.
+    let restore_memory_mode_from_rollout =
+        existing_metadata.is_none() || matches!(metadata.history_mode, ThreadHistoryMode::Legacy);
+    if let Some(existing_metadata) = existing_metadata.as_ref() {
+        metadata.prefer_existing_git_info(existing_metadata);
+        metadata.prefer_existing_explicit_title(existing_metadata);
+    }
+    match archived_only {
+        Some(true) if metadata.archived_at.is_none() => {
+            metadata.archived_at = Some(metadata.updated_at);
+        }
+        Some(false) => {
+            metadata.archived_at = None;
+        }
+        Some(true) | None => {}
+    }
+    ctx.upsert_thread(&metadata).await?;
+    if restore_memory_mode_from_rollout {
+        ctx.set_thread_memory_mode(metadata.id, memory_mode.as_str())
+            .await?;
+    }
+    Ok(())
+}
+
 /// Reconcile rollout items into SQLite, falling back to scanning the rollout file.
 pub async fn reconcile_rollout(
     context: Option<&codex_state::StateRuntime>,
@@ -542,61 +594,11 @@ pub async fn reconcile_rollout(
         .await;
         return;
     }
-    let outcome =
-        match metadata::extract_metadata_from_rollout(rollout_path, default_provider).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                warn!(
-                    "state db reconcile_rollout extraction failed {}: {err}",
-                    rollout_path.display()
-                );
-                return;
-            }
-        };
-    let mut metadata = outcome.metadata;
-    let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
-    metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
-    let existing_metadata = ctx.get_thread(metadata.id).await.ok().flatten();
-    // Filesystem repair may seed a missing row, but it must not change an existing row's
-    // selected rollout path. After `thread/revert`, a scan can find multiple immutable
-    // rollouts for one thread and cannot know which one SQLite selected.
-    if existing_metadata
-        .as_ref()
-        .is_some_and(|existing| existing.rollout_path.as_path() != rollout_path)
-    {
-        return;
-    }
-    // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
-    // missing row, then keep the value from SQLite.
-    let restore_memory_mode_from_rollout =
-        existing_metadata.is_none() || matches!(metadata.history_mode, ThreadHistoryMode::Legacy);
-    if let Some(existing_metadata) = existing_metadata.as_ref() {
-        metadata.prefer_existing_git_info(existing_metadata);
-        metadata.prefer_existing_explicit_title(existing_metadata);
-    }
-    match archived_only {
-        Some(true) if metadata.archived_at.is_none() => {
-            metadata.archived_at = Some(metadata.updated_at);
-        }
-        Some(false) => {
-            metadata.archived_at = None;
-        }
-        Some(true) | None => {}
-    }
-    if let Err(err) = ctx.upsert_thread(&metadata).await {
-        warn!(
-            "state db reconcile_rollout upsert failed {}: {err}",
-            rollout_path.display()
-        );
-        return;
-    }
-    if restore_memory_mode_from_rollout
-        && let Err(err) = ctx
-            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
-            .await
+    if let Err(err) =
+        reconcile_rollout_metadata(Some(ctx), rollout_path, default_provider, archived_only).await
     {
         warn!(
-            "state db reconcile_rollout memory_mode update failed {}: {err}",
+            "state db reconcile_rollout failed {}: {err}",
             rollout_path.display()
         );
     }

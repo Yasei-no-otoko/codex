@@ -24,6 +24,7 @@ mod seekable_reader;
 pub(crate) mod session_index;
 mod sqlite_metrics;
 pub mod state_db;
+mod thread_writer_lock;
 
 pub use codex_history::CompactedItem;
 pub use codex_history::InitialHistory;
@@ -77,10 +78,13 @@ pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock:
 });
 
 pub use codex_protocol::protocol::SessionMeta;
+pub use compression::RawRolloutLine;
+pub use compression::RawRolloutLineReader;
 pub use compression::RolloutCompressionMode;
 pub use compression::RolloutLineReader;
 pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
+pub use compression::open_rollout_raw_line_reader;
 pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
 pub use seekable_reader::open_rollout_seekable_reader;
@@ -119,6 +123,7 @@ pub use maintenance::try_acquire_rollout_maintenance_lock;
 pub use metadata::builder_from_items;
 pub use metadata::forked_from_ordinal_exclusive;
 pub use metadata::rollout_id_from_path;
+pub use metadata::rollout_thread_id_from_path;
 pub use model_context::ModelContextScan;
 pub use model_context::ModelContextScanProgress;
 pub use persistence_metrics::RolloutPersistenceBatchMeasurement;
@@ -130,6 +135,8 @@ pub use policy::should_persist_response_item_for_memories;
 pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
 pub use recorder::append_rollout_item_to_path;
+pub use recorder::strip_legacy_ghost_snapshot_rollout_line;
+pub use reverse_jsonl_scanner::MAX_ROLLOUT_RECORD_PAYLOAD_BYTES;
 pub use reverse_jsonl_scanner::ReverseJsonlScanner;
 pub use reverse_jsonl_scanner::ScanOutcome;
 pub use rollout_reference_index::RolloutReferenceIndex;
@@ -144,6 +151,13 @@ pub use session_index::find_thread_names_by_ids;
 pub use session_index::remove_thread_name_entries;
 pub use state_db::StateDbHandle;
 pub use state_db::sqlite_telemetry_recorder;
+pub use thread_writer_lock::THREAD_WRITER_COORDINATION_LOCK_FILE;
+pub use thread_writer_lock::THREAD_WRITER_LOCK_DIR;
+pub use thread_writer_lock::THREAD_WRITER_TOPOLOGY_LOCK_FILE;
+pub use thread_writer_lock::ThreadWriterLockCoordinator;
+pub use thread_writer_lock::ThreadWriterLockGuard;
+pub use thread_writer_lock::ThreadWriterLockWeakGuard;
+pub use thread_writer_lock::ThreadWriterTopologyLockGuard;
 
 #[cfg(test)]
 mod tests;

@@ -2,6 +2,8 @@ mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
+mod legacy_envelope;
+mod legacy_fork;
 mod list_threads;
 mod live_writer;
 mod model_context;
@@ -10,6 +12,7 @@ mod paginated_fork;
 mod pending_thread_metadata;
 mod projects;
 mod read_thread;
+mod reference_attachment;
 mod revert_thread;
 mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
@@ -27,6 +30,9 @@ mod writer_lock;
 #[cfg(test)]
 #[path = "pending_thread_metadata_tests.rs"]
 mod pending_thread_metadata_tests;
+#[cfg(test)]
+#[path = "reference_attachment_tests.rs"]
+mod reference_attachment_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -98,6 +104,8 @@ use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
 use crate::UpdatedProject;
+use crate::WriteReferenceLogicalAttachmentOutcome;
+use crate::WriteReferenceLogicalAttachmentParams;
 use crate::local::writer_lock::WriterLockCoordinator;
 use crate::local::writer_lock::WriterLockGuard;
 
@@ -161,6 +169,14 @@ struct ThreadCoordination {
     // accept writes during child initialization, including MCP startup that can take 30 seconds.
     // Operations that need both locks must acquire `lifecycle` before `writer`.
     lifecycle: Arc<RwLock<()>>,
+}
+
+/// Source barriers acquired before fork mode selection and retained until child metadata is
+/// durable. The lifecycle lease blocks local destructive operations; the filesystem lock closes
+/// the corresponding cross-process archive/delete window.
+pub(super) struct ForkSourceGuards {
+    pub(super) lifecycle: OwnedRwLockReadGuard<()>,
+    pub(super) filesystem: WriterLockGuard,
 }
 
 impl LiveWriterLocks {
@@ -313,6 +329,29 @@ impl LocalThreadStore {
             writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
         }
         Ok(writer_locks)
+    }
+
+    async fn existing_writer_lock(&self, thread_id: ThreadId) -> Option<WriterLockGuard> {
+        self.live_recorders
+            .lock()
+            .await
+            .get(&thread_id)
+            .map(|entry| entry.writer_lock.clone())
+    }
+
+    async fn acquire_fork_source_guards(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<ForkSourceGuards> {
+        let lifecycle = self.live_writer_locks.reserve_lifecycle(thread_id).await;
+        let filesystem = match self.existing_writer_lock(thread_id).await {
+            Some(guard) => guard,
+            None => self.writer_lock_coordinator.acquire_source(thread_id)?,
+        };
+        Ok(ForkSourceGuards {
+            lifecycle,
+            filesystem,
+        })
     }
 
     async fn insert_live_recorder(
@@ -493,6 +532,15 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(LocalThreadStore::load_history(self, params))
     }
 
+    fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> ThreadStoreFuture<'_, WriteReferenceLogicalAttachmentOutcome> {
+        Box::pin(async move {
+            reference_attachment::write_reference_logical_attachment(self, params).await
+        })
+    }
+
     fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
@@ -501,7 +549,59 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
-        Box::pin(async move { paginated_fork::prepare(self, params).await })
+        Box::pin(async move {
+            let source_guards = self.acquire_fork_source_guards(params.thread_id).await?;
+            if params.legacy_source_rollout_path.is_none() {
+                match live_writer::persist_thread(self, params.thread_id).await {
+                    Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            // A different LocalThreadStore can share this source lease, but it cannot flush that
+            // store's unpersisted recorder. Resolution below therefore remains fail-closed when
+            // no durable rollout exists; only an owning store can persist an empty live source.
+            let source = match params.legacy_source_rollout_path.as_ref() {
+                Some(path) => {
+                    thread_rollout_resolver::resolve_path_including_archived(
+                        self,
+                        params.thread_id,
+                        path.clone(),
+                    )
+                    .await?
+                }
+                None => thread_rollout_resolver::resolve_current_including_archived(
+                    self,
+                    params.thread_id,
+                )
+                .await?
+                .ok_or(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                })?,
+            };
+            let session_meta = codex_rollout::read_session_meta_line(source.path.as_path())
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to read fork source metadata {}: {err}",
+                        source.path.display()
+                    ),
+                })?;
+            let path_pinned_legacy_source = params.legacy_source_rollout_path.is_some();
+            match session_meta.meta.history_mode {
+                ThreadHistoryMode::Legacy => {
+                    legacy_fork::prepare(self, params, source, source_guards).await
+                }
+                ThreadHistoryMode::Paginated if path_pinned_legacy_source => {
+                    Err(ThreadStoreError::InvalidRequest {
+                        message: "path-pinned legacy fork source must use legacy history"
+                            .to_string(),
+                    })
+                }
+                ThreadHistoryMode::Paginated => {
+                    paginated_fork::prepare(self, params, source_guards).await
+                }
+            }
+        })
     }
 
     fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
@@ -1688,10 +1788,16 @@ mod tests {
             .prepare_fork(PrepareForkParams {
                 thread_id,
                 boundary: crate::ForkBoundary::Latest,
+                legacy_source_rollout_path: None,
             })
             .await
             .expect_err("external rollouts cannot be referenced by thread id");
-        assert!(error.to_string().contains("must be in Codex home"));
+        assert!(matches!(
+            error,
+            ThreadStoreError::Unsupported {
+                operation: "unmanaged legacy reference source"
+            }
+        ));
     }
 
     #[tokio::test]

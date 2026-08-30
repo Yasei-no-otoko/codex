@@ -68,10 +68,12 @@ pub(super) async fn delete_thread(
     let thread_id = params.thread_id;
     let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    let _writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
+    let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
     let reference_index = scan_reference_index(store).await?;
     let thread_rollouts = ThreadRollouts::from_index(&reference_index, thread_id);
     ensure_no_external_references(&reference_index, std::slice::from_ref(&thread_rollouts))?;
-    let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
+    let mut writer_guards = _writer_guards;
     delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
 }
 
@@ -96,6 +98,9 @@ pub(super) async fn delete_threads(
         _live_writer_guards.push(store.live_writer_locks.lock(thread_id).await);
     }
 
+    let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
+    let _topology_guard = store.writer_lock_coordinator.acquire_topology()?;
+
     let reference_index = scan_reference_index(store).await?;
     let thread_rollouts = thread_ids
         .iter()
@@ -103,7 +108,6 @@ pub(super) async fn delete_threads(
         .collect::<Vec<_>>();
     ensure_no_external_references(&reference_index, thread_rollouts.as_slice())?;
 
-    let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
     for thread_rollouts in thread_rollouts {
         match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
         {

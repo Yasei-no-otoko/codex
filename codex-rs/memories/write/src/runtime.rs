@@ -32,6 +32,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::RolloutItem;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_state::StateRuntime;
 use codex_terminal_detection::user_agent;
@@ -184,6 +185,18 @@ impl MemoryStartupContext {
 
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
+    }
+
+    /// Read the logical persisted replay for a memory job. This follows a frozen reference
+    /// prefix and appends only the child's delta; it must not read the child JSONL in isolation.
+    pub(crate) async fn read_thread_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Vec<RolloutItem>> {
+        Ok(self
+            .thread_manager
+            .read_stored_thread_history(thread_id, /*include_archived*/ true)
+            .await?)
     }
 
     pub(crate) fn state_db(&self) -> Option<Arc<StateRuntime>> {

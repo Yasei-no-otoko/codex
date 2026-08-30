@@ -49,6 +49,30 @@ pub(super) async fn resolve_current_including_archived(
     resolve(store, thread_id, LookupScope::IncludeArchived).await
 }
 
+/// Resolves one caller-selected rollout path without switching to the logical thread's current
+/// rollout. Callers still validate the filename and session metadata ownership before using it as
+/// an immutable reference source.
+pub(super) async fn resolve_path_including_archived(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    path: PathBuf,
+) -> ThreadStoreResult<ResolvedThreadRollout> {
+    let path = codex_rollout::existing_rollout_path(path.as_path())
+        .await
+        .ok_or_else(|| ThreadStoreError::InvalidRequest {
+            message: format!(
+                "requested rollout path no longer exists: {}",
+                path.display()
+            ),
+        })?;
+    resolve_path(
+        thread_id,
+        path.clone(),
+        location_for_path(store, path.as_path()),
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum LookupScope {
     ExcludeArchived,

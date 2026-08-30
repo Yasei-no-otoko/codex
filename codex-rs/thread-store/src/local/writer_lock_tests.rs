@@ -79,3 +79,44 @@ fn first_acquisition_removes_stale_locks_without_removing_active_locks() {
     drop(secondary_owner);
     drop(active_owner);
 }
+
+#[test]
+fn source_leases_are_shared_but_live_writer_owners_remain_exclusive() {
+    let home = TempDir::new().expect("temp dir");
+    let primary = Arc::new(WriterLockCoordinator::new(home.path()));
+    let secondary = Arc::new(WriterLockCoordinator::new(home.path()));
+    let thread_id = ThreadId::default();
+
+    let owner = primary
+        .acquire_registered_source_owner(thread_id)
+        .expect("acquire live writer owner");
+    let reader = secondary
+        .acquire_source(thread_id)
+        .expect("share the active source lease");
+    let err = secondary
+        .acquire_registered_source_owner(thread_id)
+        .expect_err("source reader must block a competing live writer owner");
+    assert!(matches!(err, ThreadStoreError::Conflict { .. }));
+
+    drop(reader);
+    drop(owner);
+    secondary
+        .acquire_registered_source_owner(thread_id)
+        .expect("released source lease should accept a new writer owner");
+}
+
+#[test]
+fn source_leases_are_scoped_to_codex_home() {
+    let first_home = TempDir::new().expect("first temp dir");
+    let second_home = TempDir::new().expect("second temp dir");
+    let thread_id = ThreadId::default();
+
+    let first = Arc::new(WriterLockCoordinator::new(first_home.path()));
+    let second = Arc::new(WriterLockCoordinator::new(second_home.path()));
+    let _first_owner = first
+        .acquire_registered_source_owner(thread_id)
+        .expect("acquire first home writer owner");
+    let _second_owner = second
+        .acquire_registered_source_owner(thread_id)
+        .expect("same thread id in a different Codex home is independent");
+}

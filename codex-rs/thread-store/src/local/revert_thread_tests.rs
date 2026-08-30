@@ -16,7 +16,10 @@ use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
+use crate::ForkBoundary;
 use crate::ListTurnsParams;
+use crate::LoadThreadHistoryParams;
+use crate::PrepareForkParams;
 use crate::RevertThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
@@ -27,6 +30,7 @@ use crate::ThreadStore;
 async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
+    let maintenance_config = config.clone();
     let state_db = codex_state::StateRuntime::init(
         config.sqlite.clone(),
         config.default_model_provider_id.clone(),
@@ -92,7 +96,37 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .meta;
     assert_eq!(replacement_meta.id, thread_id);
     assert_eq!(replacement_meta.memory_mode, None);
+    assert_eq!(
+        store
+            .resolve_rollout_lineage(thread_id)
+            .await
+            .expect("resolve first reverted lineage")
+            .segments()
+            .len(),
+        2
+    );
     assert_eq!(turn_ids(&store, thread_id).await, vec!["turn-1"]);
+
+    // A reverted file has a distinct immutable rollout ID in its filename, but preparing a
+    // child must retain the stable logical-thread writer guard used by the compressor.
+    let prepared = store
+        .prepare_fork(PrepareForkParams {
+            thread_id,
+            boundary: ForkBoundary::Latest,
+            legacy_source_rollout_path: None,
+        })
+        .await
+        .expect("prepare fork from reverted rollout");
+    let compressor_store = LocalThreadStore::new(maintenance_config, /*state_db*/ None);
+    let compression_err = compressor_store
+        .writer_lock_coordinator
+        .acquire(thread_id)
+        .expect_err("prepared reverted source must block compression's logical writer lock");
+    assert!(matches!(
+        compression_err,
+        crate::ThreadStoreError::Conflict { .. }
+    ));
+    drop(prepared);
 
     store
         .revert_thread(RevertThreadParams {
@@ -101,6 +135,24 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         })
         .await
         .expect("revert before first turn");
+    // Reverting into the root-owned prefix deliberately collapses the logical lineage. The
+    // immutable replacement files still remain on disk for older references and maintenance.
+    assert_eq!(
+        store
+            .resolve_rollout_lineage(thread_id)
+            .await
+            .expect("resolve twice-reverted lineage")
+            .segments()
+            .len(),
+        1
+    );
+    store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load context after second revert");
     assert_eq!(turn_ids(&store, thread_id).await, Vec::<String>::new());
 
     store

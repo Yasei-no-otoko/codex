@@ -158,6 +158,24 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+/// Parameters for writing a bounded, read-only logical history attachment.
+#[derive(Clone, Debug)]
+pub struct WriteReferenceLogicalAttachmentParams {
+    pub thread_id: ThreadId,
+    /// Immutable physical rollout selected by the caller for this attachment.
+    pub rollout_path: PathBuf,
+    pub include_archived: bool,
+    pub output_path: PathBuf,
+    pub max_bytes: usize,
+}
+
+/// Result of attempting to write a logical reference attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteReferenceLogicalAttachmentOutcome {
+    NotReference,
+    Written { truncated: bool },
+}
+
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {
@@ -198,6 +216,11 @@ pub struct PrepareForkParams {
     pub thread_id: ThreadId,
     /// Requested inclusive or exclusive fork boundary.
     pub boundary: ForkBoundary,
+    /// Exact immutable legacy source rollout selected by a path-addressed latest-fork caller.
+    ///
+    /// When present, implementations must validate that this rollout belongs to `thread_id`
+    /// and must not re-resolve the logical thread to its current rollout.
+    pub legacy_source_rollout_path: Option<PathBuf>,
 }
 
 /// Parameters for reverting a paginated thread's durable history.

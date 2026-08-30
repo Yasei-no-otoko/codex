@@ -15,24 +15,33 @@ use crate::ThreadStoreResult;
 pub(super) async fn prepare(
     store: &LocalThreadStore,
     params: PrepareForkParams,
+    source_guards: super::ForkSourceGuards,
 ) -> ThreadStoreResult<PreparedFork> {
     let PrepareForkParams {
         thread_id,
         boundary,
+        ..
     } = params;
-    let source_reservation = store.live_writer_locks.reserve_lifecycle(thread_id).await;
+    let super::ForkSourceGuards {
+        lifecycle: source_reservation,
+        filesystem: source_filesystem_guard,
+    } = source_guards;
     // Keep the source reserved until persistence and lineage materialization finish, even if the
     // caller cancels fork preparation.
     let lineage_store = store.clone();
-    let (lineage, source_reservation) = tokio::spawn(async move {
+    let source_guard_for_lineage = source_filesystem_guard.clone();
+    let (lineage, ancestor_guards, source_reservation) = tokio::spawn(async move {
         match live_writer::persist_thread(&lineage_store, thread_id).await {
             Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
             Err(err) => return Err(err),
         }
-        let lineage = lineage_store
-            .resolve_rollout_lineage_for_reference(thread_id)
+        let (lineage, ancestor_guards) = lineage_store
+            .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+                thread_id,
+                source_guard_for_lineage,
+            )
             .await?;
-        Ok::<_, ThreadStoreError>((lineage, source_reservation))
+        Ok::<_, ThreadStoreError>((lineage, ancestor_guards, source_reservation))
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -80,7 +89,7 @@ pub(super) async fn prepare(
         thread_id,
         history_base,
         model_context,
-        source_reservation,
+        (source_reservation, source_filesystem_guard, ancestor_guards),
     ))
 }
 

@@ -4750,7 +4750,9 @@ impl ThreadRequestProcessor {
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
-        let prepared_fork = if paginated_source {
+        let legacy_latest_reference =
+            !paginated_source && !ephemeral && last_turn_id.is_none() && before_turn_id.is_none();
+        let prepared_fork = if paginated_source || legacy_latest_reference {
             let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
                 (Some(turn_id), None) => {
                     codex_thread_store::ForkBoundary::ThroughTurn(turn_id.to_string())
@@ -4761,14 +4763,24 @@ impl ThreadRequestProcessor {
                 (None, None) => codex_thread_store::ForkBoundary::Latest,
                 (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
             };
-            Some(
-                self.thread_store
-                    .prepare_fork(codex_thread_store::PrepareForkParams {
-                        thread_id: source_thread_id,
-                        boundary,
-                    })
-                    .await
-                    .map_err(|err| match err {
+            match self
+                .thread_store
+                .prepare_fork(codex_thread_store::PrepareForkParams {
+                    thread_id: source_thread_id,
+                    boundary,
+                    legacy_source_rollout_path: (legacy_latest_reference
+                        && path
+                            .as_ref()
+                            .is_some_and(|path| !path.as_os_str().is_empty()))
+                    .then(|| source_thread.rollout_path.clone())
+                    .flatten(),
+                })
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(ThreadStoreError::Unsupported { .. }) if legacy_latest_reference => None,
+                Err(err) => {
+                    return Err(match err {
                         ThreadStoreError::InvalidRequest { message } => invalid_request(message),
                         ThreadStoreError::ThreadNotFound { thread_id } => {
                             invalid_request(format!("no rollout found for thread id {thread_id}"))
@@ -4776,9 +4788,10 @@ impl ThreadRequestProcessor {
                         ThreadStoreError::Unsupported { .. } => {
                             method_not_found("paginated_threads is not supported yet")
                         }
-                        err => internal_error(format!("failed to prepare paginated fork: {err}")),
-                    })?,
-            )
+                        err => internal_error(format!("failed to prepare fork: {err}")),
+                    });
+                }
+            }
         } else {
             None
         };
@@ -4804,6 +4817,7 @@ impl ThreadRequestProcessor {
                     })?,
             )
         };
+        let reference_backed_legacy_fork = prepared_fork.is_some() && !paginated_source;
         let history_cwd = Some(source_thread.cwd.clone());
 
         // Persist Windows sandbox mode.
@@ -4984,7 +4998,7 @@ impl ThreadRequestProcessor {
                     config,
                     InitialHistory::Resumed(ResumedHistory {
                         conversation_id: source_thread_id,
-                        history: history_items,
+                        history: Arc::clone(&history_items),
                         rollout_path: source_thread.rollout_path.clone(),
                     }),
                     thread_source,
@@ -5034,6 +5048,34 @@ impl ThreadRequestProcessor {
                 )
                 .await
                 .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
+        }
+        if !paginated_source
+            && let (Some(rollout_path), Some(state_db)) = (
+                session_configured.rollout_path.as_deref(),
+                forked_thread.state_db().or_else(|| self.state_db.clone()),
+            )
+        {
+            // Publish the fork's local rollout before returning so immediate StateDB-only
+            // discovery sees the same thread as the fork response. This never follows the
+            // history reference, so reference-backed forks only inspect their child delta.
+            codex_rollout::state_db::read_repair_rollout_path(
+                Some(state_db.as_ref()),
+                Some(thread_id),
+                /*archived_only*/ None,
+                rollout_path,
+            )
+            .await;
+            let preview = preview_from_rollout_items(&history_items);
+            if !preview.is_empty()
+                && let Err(err) = state_db
+                    .set_thread_preview_if_empty(thread_id, &preview)
+                    .await
+            {
+                warn!(
+                    %thread_id,
+                    "failed to publish fork preview to StateDB before response: {err}"
+                );
+            }
         }
         let inherited_goal = if defer_goal_continuation
             && session_configured.rollout_path.is_some()
@@ -5097,6 +5139,9 @@ impl ThreadRequestProcessor {
                     &history.items,
                     /*active_turn*/ None,
                 );
+            }
+            if reference_backed_legacy_fork {
+                thread.preview = preview_from_rollout_items(&history_items);
             }
             let token_usage_turn_id = include_turns.then(|| {
                 restored_token_usage_turn_id(
@@ -5738,6 +5783,7 @@ fn thread_store_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
 
 fn thread_store_resume_read_error(err: ThreadStoreError) -> JSONRPCErrorError {
     match err {
+        ThreadStoreError::Conflict { message } => invalid_request(message),
         ThreadStoreError::InvalidRequest { message } => invalid_request(message),
         ThreadStoreError::Unsupported { operation } => {
             unsupported_thread_store_operation(operation)

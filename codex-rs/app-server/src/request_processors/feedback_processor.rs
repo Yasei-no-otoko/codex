@@ -9,8 +9,23 @@ use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
 use codex_rollout::RolloutRecorder;
 use sha2::Digest;
 use sha2::Sha256;
+use tempfile::NamedTempFile;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
+// Keep generated logical history in line with the feedback log ring's 4 MiB default.
+const MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
+
+enum LogicalRolloutFeedbackAttachment {
+    /// The rollout is not reference-backed, so its physical JSONL remains the attachment.
+    Physical,
+    /// A bounded logical replay was generated from the frozen lineage and child delta.
+    Generated {
+        temp_file: NamedTempFile,
+        truncated: bool,
+    },
+    /// A reference-backed rollout could not be reconstructed without risking a partial suffix.
+    Skip,
+}
 
 #[derive(Clone)]
 pub(crate) struct FeedbackRequestProcessor {
@@ -183,6 +198,8 @@ impl FeedbackRequestProcessor {
             (Vec::new(), None, None)
         };
 
+        let mut logical_attachment_temps = Vec::new();
+        let mut extra_attachments = Vec::new();
         let mut attachment_paths = Vec::new();
         let mut seen_attachment_paths = HashSet::new();
         // File priority after logs and generated diagnostics: reported thread, subagent
@@ -197,10 +214,38 @@ impl FeedbackRequestProcessor {
                     continue;
                 };
                 if seen_attachment_paths.insert(rollout_path.clone()) {
-                    attachment_paths.push(FeedbackAttachmentPath {
-                        path: rollout_path,
-                        attachment_filename_override: None,
-                    });
+                    match self
+                        .logical_rollout_feedback_attachment(*feedback_thread_id, &rollout_path)
+                        .await
+                    {
+                        LogicalRolloutFeedbackAttachment::Generated {
+                            temp_file,
+                            truncated,
+                        } => {
+                            let path = temp_file.path().to_path_buf();
+                            let filename = if truncated {
+                                upload_tags.insert(
+                                    "feedback_rollout_truncated".to_string(),
+                                    "true".to_string(),
+                                );
+                                format!("rollout-history-{feedback_thread_id}-head-tail.jsonl")
+                            } else {
+                                format!("rollout-history-{feedback_thread_id}.jsonl")
+                            };
+                            logical_attachment_temps.push(temp_file);
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path,
+                                attachment_filename_override: Some(filename),
+                            });
+                        }
+                        LogicalRolloutFeedbackAttachment::Physical => {
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path: rollout_path,
+                                attachment_filename_override: None,
+                            });
+                        }
+                        LogicalRolloutFeedbackAttachment::Skip => {}
+                    }
                 }
             }
             if let Some(conversation_id) = conversation_id
@@ -243,7 +288,6 @@ impl FeedbackRequestProcessor {
             }
         }
 
-        let mut extra_attachments = Vec::new();
         if include_logs {
             let doctor_cwd = feedback_cwd(
                 &self.thread_manager,
@@ -268,6 +312,9 @@ impl FeedbackRequestProcessor {
         let runtime_handle = tokio::runtime::Handle::current();
 
         let upload_result = tokio::task::spawn_blocking(move || {
+            // Keep generated temporary files alive until the upload has read all path-backed
+            // attachments. NamedTempFile removes them when this closure returns.
+            let _logical_attachment_temps = logical_attachment_temps;
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
             runtime_handle.block_on(snapshot.upload_feedback(
                 FeedbackUploadOptions {
@@ -299,26 +346,121 @@ impl FeedbackRequestProcessor {
         Ok(FeedbackUploadResponse { thread_id })
     }
 
+    /// A reference child stores only its local delta. For feedback, attach its complete logical
+    /// replay instead: the frozen parent prefix plus delta, bounded at complete JSONL records.
+    /// Any failure is fail-closed: do not silently attach the misleading physical child suffix.
+    async fn logical_rollout_feedback_attachment(
+        &self,
+        thread_id: ThreadId,
+        rollout_path: &Path,
+    ) -> LogicalRolloutFeedbackAttachment {
+        let session_meta = match codex_rollout::read_session_meta_line(rollout_path).await {
+            Ok(session_meta) => session_meta,
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    path = %rollout_path.display(),
+                    "failed to inspect rollout before feedback upload: {err}"
+                );
+                return LogicalRolloutFeedbackAttachment::Skip;
+            }
+        };
+        if session_meta.meta.id != thread_id {
+            warn!(
+                requested_thread_id = %thread_id,
+                rollout_thread_id = %session_meta.meta.id,
+                path = %rollout_path.display(),
+                "skipping mismatched rollout during feedback upload"
+            );
+            return LogicalRolloutFeedbackAttachment::Skip;
+        }
+        if session_meta.meta.history_base.is_none() {
+            return LogicalRolloutFeedbackAttachment::Physical;
+        }
+
+        let temp_file = match NamedTempFile::new() {
+            Ok(temp_file) => temp_file,
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    "failed to create temporary logical rollout attachment: {err}"
+                );
+                return LogicalRolloutFeedbackAttachment::Skip;
+            }
+        };
+        let params = WriteReferenceLogicalAttachmentParams {
+            thread_id,
+            rollout_path: rollout_path.to_path_buf(),
+            include_archived: true,
+            output_path: temp_file.path().to_path_buf(),
+            max_bytes: MAX_LOGICAL_FEEDBACK_ATTACHMENT_BYTES,
+        };
+        match self
+            .thread_manager
+            .write_reference_logical_attachment(params)
+            .await
+        {
+            Ok(WriteReferenceLogicalAttachmentOutcome::Written { truncated }) => {
+                LogicalRolloutFeedbackAttachment::Generated {
+                    temp_file,
+                    truncated,
+                }
+            }
+            Ok(WriteReferenceLogicalAttachmentOutcome::NotReference) => {
+                LogicalRolloutFeedbackAttachment::Physical
+            }
+            Err(err) => {
+                warn!(
+                    thread_id = %thread_id,
+                    "skipping reference-backed rollout in feedback upload: {err}"
+                );
+                LogicalRolloutFeedbackAttachment::Skip
+            }
+        }
+    }
+
     async fn resolve_rollout_path(
         &self,
         conversation_id: ThreadId,
         state_db_ctx: Option<&StateDbHandle>,
     ) -> Option<PathBuf> {
-        if let Ok(conversation) = self.thread_manager.get_thread(conversation_id).await
+        let candidate = if let Ok(conversation) =
+            self.thread_manager.get_thread(conversation_id).await
             && let Some(rollout_path) = conversation.rollout_path()
         {
-            return Some(rollout_path);
-        }
+            Some(rollout_path)
+        } else {
+            let state_db_ctx = state_db_ctx?;
+            state_db_ctx
+                .find_rollout_path_by_id(conversation_id, /*archived_only*/ None)
+                .await
+                .unwrap_or_else(|err| {
+                    warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
+                    None
+                })
+        }?;
 
-        let state_db_ctx = state_db_ctx?;
-        state_db_ctx
-            .find_rollout_path_by_id(conversation_id, /*archived_only*/ None)
-            .await
-            .unwrap_or_else(|err| {
-                warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
+        // A loaded thread or SQLite row may retain the logical `.jsonl` path after compression.
+        // Resolve the physical representation once so metadata, turn tags, and attachment paths
+        // all observe the same plain/zstd file without materializing it.
+        match existing_physical_rollout_path(candidate.as_path()).await {
+            Some(path) => Some(path),
+            None => {
+                warn!(
+                    thread_id = %conversation_id,
+                    path = %candidate.display(),
+                    "resolved rollout path is missing or unreadable"
+                );
                 None
-            })
+            }
+        }
     }
+}
+
+/// Resolve a logical rollout filename to the physical file that currently exists. Compression
+/// changes the representation in place; this helper never materializes a missing plain sibling.
+async fn existing_physical_rollout_path(candidate: &Path) -> Option<PathBuf> {
+    codex_rollout::existing_rollout_path(candidate).await
 }
 
 async fn feedback_cwd(
@@ -499,6 +641,37 @@ mod tests {
         .await;
 
         assert_eq!(cwd, test.cwd_path());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_rollout_path_resolves_zstd_only_without_materializing_plain()
+    -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let logical = home.path().join("rollout-2026-08-30T00-00-00-test.jsonl");
+        let compressed = logical.with_extension("jsonl.zst");
+        std::fs::write(&compressed, b"compressed bytes")?;
+
+        let resolved = existing_physical_rollout_path(&logical).await;
+
+        assert_eq!(resolved, Some(compressed.clone()));
+        assert!(!logical.exists());
+        assert!(compressed.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn physical_rollout_path_prefers_plain_when_both_representations_exist()
+    -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let logical = home.path().join("rollout-2026-08-30T00-00-00-test.jsonl");
+        let compressed = logical.with_extension("jsonl.zst");
+        std::fs::write(&logical, b"plain bytes")?;
+        std::fs::write(&compressed, b"compressed bytes")?;
+
+        let resolved = existing_physical_rollout_path(&logical).await;
+
+        assert_eq!(resolved, Some(logical));
         Ok(())
     }
 

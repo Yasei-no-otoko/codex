@@ -27,8 +27,12 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use codex_state::Phase2JobClaimOutcome;
@@ -679,6 +683,83 @@ async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_meta
 }
 
 #[tokio::test]
+async fn memories_phase1_samples_reference_child_prefix_and_delta_only() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex(&server, Arc::clone(&home)).await?;
+    let db = test
+        .codex
+        .state_db()
+        .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory sampling test"))?;
+    let parent_id = ThreadId::new();
+    let child_id = ThreadId::new();
+    let updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    let (parent_path, child_path) =
+        write_reference_memory_rollouts(home.path(), parent_id, child_id, updated_at).await?;
+
+    for (thread_id, rollout_path) in [(parent_id, parent_path), (child_id, child_path)] {
+        let mut metadata_builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            updated_at,
+            SessionSource::Cli,
+        );
+        metadata_builder.updated_at = Some(updated_at);
+        metadata_builder.recency_at = Some(updated_at);
+        metadata_builder.cwd = home.path().to_path_buf();
+        metadata_builder.model_provider = Some("test-provider".to_string());
+        let mut metadata = metadata_builder.build("test-provider");
+        metadata.history_mode = ThreadHistoryMode::Legacy;
+        db.upsert_thread(&metadata).await?;
+    }
+    for (thread_id, preview) in [
+        (parent_id, "parent memory source"),
+        (child_id, "child memory source"),
+    ] {
+        db.set_thread_preview_if_empty(thread_id, preview).await?;
+    }
+    db.set_thread_memory_mode(parent_id, "disabled").await?;
+    db.set_thread_memory_mode(child_id, "enabled").await?;
+
+    let response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-reference-memory"),
+            ev_assistant_message(
+                "msg-reference-memory",
+                r#"{"raw_memory":"raw memory","rollout_summary":"reference summary","rollout_slug":"reference-child"}"#,
+            ),
+            ev_completed("resp-reference-memory"),
+        ]),
+    )
+    .await;
+    let provider = Arc::new(MockMemoryModelProvider::new(
+        test.config.model_provider.clone(),
+        Some(test.thread_manager.auth_manager()),
+    ));
+    let (context, config) = memory_startup_context_with_provider(&test, provider).await;
+    phase1::run(context, config).await;
+
+    let request = wait_for_single_request(&response).await;
+    let prompt = request.message_input_texts("user").join("\n");
+    assert!(
+        prompt.contains("parent prefix before fork"),
+        "phase-1 prompt should include the bounded inherited prefix: {prompt}"
+    );
+    assert!(
+        prompt.contains("child delta after fork"),
+        "phase-1 prompt should include the child delta: {prompt}"
+    );
+    assert!(
+        !prompt.contains("parent append after fork"),
+        "phase-1 prompt must exclude parent writes after the fork boundary: {prompt}"
+    );
+
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn memories_startup_phase1_provider_default_drives_request_model() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
@@ -1046,8 +1127,16 @@ async fn seed_stage1_candidate(
             .into(),
         ),
     };
-    let jsonl = serde_json::to_string(&line)?;
-    tokio::fs::write(&rollout_path, format!("{jsonl}\n")).await?;
+    let timestamp = updated_at.to_rfc3339();
+    let session_meta = memory_session_meta_line(
+        codex_home, thread_id, &timestamp, /*forked_from_id*/ None, /*history_base*/ None,
+    );
+    let jsonl = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&session_meta)?,
+        serde_json::to_string(&line)?
+    );
+    tokio::fs::write(&rollout_path, jsonl).await?;
 
     let mut metadata_builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
@@ -1065,6 +1154,107 @@ async fn seed_stage1_candidate(
     db.set_thread_memory_mode(thread_id, "enabled").await?;
 
     Ok(thread_id)
+}
+
+async fn write_reference_memory_rollouts(
+    codex_home: &Path,
+    parent_id: ThreadId,
+    child_id: ThreadId,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let day_dir = codex_home.join("sessions/2025/01/03");
+    tokio::fs::create_dir_all(&day_dir).await?;
+    let timestamp = updated_at.to_rfc3339();
+    let filename_timestamp = "2025-01-03T12-00-00";
+    let parent_path = day_dir.join(format!("rollout-{filename_timestamp}-{parent_id}.jsonl"));
+    let child_path = day_dir.join(format!("rollout-{filename_timestamp}-{child_id}.jsonl"));
+
+    let parent_meta = memory_session_meta_line(
+        codex_home, parent_id, &timestamp, /*forked_from_id*/ None, /*history_base*/ None,
+    );
+    let parent_prefix = memory_response_line(&timestamp, "parent prefix before fork");
+    let parent_append = memory_response_line(&timestamp, "parent append after fork");
+    let parent_head = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&parent_meta)?,
+        serde_json::to_string(&parent_prefix)?
+    );
+    let source_cutoff = parent_head.len() as u64;
+    let parent_contents = format!(
+        "{}{}\n",
+        parent_head,
+        serde_json::to_string(&parent_append)?
+    );
+    tokio::fs::write(&parent_path, parent_contents).await?;
+
+    let history_base = HistoryPosition {
+        thread_id: parent_id,
+        end_ordinal_exclusive: 0,
+        end_byte_offset: source_cutoff,
+    };
+    let child_meta = memory_session_meta_line(
+        codex_home,
+        child_id,
+        &timestamp,
+        Some(parent_id),
+        Some(history_base),
+    );
+    let child_delta = memory_response_line(&timestamp, "child delta after fork");
+    let child_contents = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&child_meta)?,
+        serde_json::to_string(&child_delta)?
+    );
+    tokio::fs::write(&child_path, child_contents).await?;
+
+    Ok((parent_path, child_path))
+}
+
+fn memory_session_meta_line(
+    codex_home: &Path,
+    thread_id: ThreadId,
+    timestamp: &str,
+    forked_from_id: Option<ThreadId>,
+    history_base: Option<HistoryPosition>,
+) -> RolloutLine {
+    let meta = SessionMeta {
+        session_id: thread_id.into(),
+        id: thread_id,
+        forked_from_id,
+        timestamp: timestamp.to_string(),
+        cwd: codex_home.to_path_buf(),
+        originator: "codex".to_string(),
+        cli_version: "test".to_string(),
+        source: SessionSource::Cli,
+        model_provider: Some("test-provider".to_string()),
+        history_mode: ThreadHistoryMode::Legacy,
+        history_base,
+        ..Default::default()
+    };
+    RolloutLine {
+        timestamp: timestamp.to_string(),
+        ordinal: None,
+        item: RolloutItem::SessionMeta(SessionMetaLine { meta, git: None }),
+    }
+}
+
+fn memory_response_line(timestamp: &str, text: &str) -> RolloutLine {
+    RolloutLine {
+        timestamp: timestamp.to_string(),
+        ordinal: None,
+        item: RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: text.to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        ),
+    }
 }
 
 async fn wait_for_single_request(mock: &ResponseMock) -> ResponsesRequest {

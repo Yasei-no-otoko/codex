@@ -1,13 +1,21 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+
+use serde::de::DeserializeSeed;
+use serde::de::IgnoredAny;
+use serde::de::MapAccess;
+use serde::de::Visitor;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 
 use super::LocalThreadStore;
+use super::legacy_envelope;
 use super::thread_rollout_resolver;
+use super::writer_lock::WriterLockGuard;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
@@ -27,6 +35,7 @@ pub(super) struct RolloutLineageSegment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RolloutLineage {
     pub(super) segments: Vec<RolloutLineageSegment>,
+    history_mode: ThreadHistoryMode,
 }
 
 impl LocalThreadStore {
@@ -45,9 +54,75 @@ impl LocalThreadStore {
         &self,
         requested_thread_id: ThreadId,
     ) -> ThreadStoreResult<RolloutLineage> {
-        self.resolve_rollout_lineage_with_representation(
+        let (lineage, _guards) = self
+            .resolve_rollout_lineage_with_representation_and_guards(
+                requested_thread_id,
+                LineageRepresentation::PlainForReference,
+                None,
+                None,
+            )
+            .await?;
+        Ok(lineage)
+    }
+
+    /// Resolve a reference lineage while retaining guards for every ancestor before its path or
+    /// metadata is read. The caller already owns the source guard and keeps it through child
+    /// durability; this method only returns guards acquired for inherited segments.
+    pub(super) async fn resolve_rollout_lineage_for_reference_locked_with_source_guard(
+        &self,
+        requested_thread_id: ThreadId,
+        source_guard: WriterLockGuard,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_guards(
             requested_thread_id,
             LineageRepresentation::PlainForReference,
+            Some(source_guard),
+            None,
+        )
+        .await
+    }
+
+    /// Resolve a reference lineage from an already selected immutable source. Unlike a logical
+    /// thread read, this preserves the caller's exact rollout rather than resolving the thread's
+    /// current selected rollout again (which may have changed after a revert).
+    pub(super) async fn resolve_rollout_lineage_for_reference_from_source_locked_with_source_guard(
+        &self,
+        requested_thread_id: ThreadId,
+        source_rollout_id: ThreadId,
+        source_rollout_path: PathBuf,
+        source_guard: WriterLockGuard,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_guards(
+            requested_thread_id,
+            LineageRepresentation::PlainForReference,
+            Some(source_guard),
+            Some(LineageSource {
+                rollout_id: source_rollout_id,
+                path: source_rollout_path,
+            }),
+        )
+        .await
+    }
+
+    /// Resolve an attachment lineage from a caller-selected immutable source without switching
+    /// back to the logical thread's current rollout after a revert. The caller owns the source
+    /// lifecycle lease and passes the source filesystem guard in; both remain held through
+    /// streaming.
+    pub(super) async fn resolve_rollout_lineage_for_reference_attachment_from_source_locked_with_source_guard(
+        &self,
+        requested_thread_id: ThreadId,
+        source_rollout_id: ThreadId,
+        source_rollout_path: PathBuf,
+        source_guard: WriterLockGuard,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_guards(
+            requested_thread_id,
+            LineageRepresentation::ReadOnlyForAttachment,
+            Some(source_guard),
+            Some(LineageSource {
+                rollout_id: source_rollout_id,
+                path: source_rollout_path,
+            }),
         )
         .await
     }
@@ -57,17 +132,95 @@ impl LocalThreadStore {
         requested_thread_id: ThreadId,
         representation: LineageRepresentation,
     ) -> ThreadStoreResult<RolloutLineage> {
+        let (lineage, _guards) = self
+            .resolve_rollout_lineage_with_representation_and_guards(
+                requested_thread_id,
+                representation,
+                None,
+                None,
+            )
+            .await?;
+        Ok(lineage)
+    }
+
+    async fn resolve_rollout_lineage_with_representation_and_guards(
+        &self,
+        requested_thread_id: ThreadId,
+        representation: LineageRepresentation,
+        preheld_source_guard: Option<WriterLockGuard>,
+        source: Option<LineageSource>,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
         let mut segments = Vec::new();
         let mut seen = HashSet::new();
         let mut next_rollout_id = None;
-        let mut end = None;
+        let mut end: Option<HistoryPosition> = None;
+        let mut history_mode = None;
+        let mut ancestor_guards = Vec::new();
+        let mut held_filesystem_guards = HashMap::new();
+        if let Some(source_guard) = preheld_source_guard.as_ref() {
+            held_filesystem_guards.insert(requested_thread_id, source_guard.clone());
+        }
 
         loop {
-            let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
+            // A history base names an immutable rollout ID, while every mutator/compressor uses
+            // the stable logical ID encoded before `_` in the canonical filename. Discover only
+            // that filename first, take the stable-ID guard, then resolve the immutable ID again
+            // under the guard before reading any rollout content.
+            let ancestor_logical_thread_id = match (representation, next_rollout_id) {
+                (
+                    LineageRepresentation::PlainForReference
+                    | LineageRepresentation::ReadOnlyForAttachment,
+                    Some(rollout_id),
+                ) => {
+                    let path = resolve_rollout_path_by_id(self, rollout_id)
+                        .await?
+                        .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
+                    codex_rollout::rollout_thread_id_from_path(path.as_path()).ok_or_else(|| {
+                        malformed_lineage(rollout_id, "source rollout has invalid filename")
+                    })?
+                }
+                _ => requested_thread_id,
+            };
             let _writer_guard = match representation {
                 LineageRepresentation::Existing => None,
-                LineageRepresentation::PlainForReference => {
-                    Some(self.live_writer_locks.lock(coordination_id).await)
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => Some(
+                    self.live_writer_locks
+                        .lock(ancestor_logical_thread_id)
+                        .await,
+                ),
+            };
+            let _filesystem_guard = match representation {
+                LineageRepresentation::Existing => None,
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => {
+                    let guard = match held_filesystem_guards.get(&ancestor_logical_thread_id) {
+                        Some(guard) => guard.clone(),
+                        None if next_rollout_id.is_none() => {
+                            match preheld_source_guard.as_ref() {
+                                Some(guard) => guard.clone(),
+                                // This branch has no external caller retaining a source guard;
+                                // acquire one for the resolver itself and retain it through its
+                                // path reads.
+                                None => self
+                                    .writer_lock_coordinator
+                                    .acquire_source(ancestor_logical_thread_id)?,
+                            }
+                        }
+                        None => match self.existing_writer_lock(ancestor_logical_thread_id).await {
+                            Some(guard) => guard,
+                            None => self
+                                .writer_lock_coordinator
+                                .acquire_source(ancestor_logical_thread_id)?,
+                        },
+                    };
+                    held_filesystem_guards
+                        .entry(ancestor_logical_thread_id)
+                        .or_insert_with(|| guard.clone());
+                    if next_rollout_id.is_some() {
+                        ancestor_guards.push(guard.clone());
+                    }
+                    Some(guard)
                 }
             };
             let (rollout_id, rollout_path) = match next_rollout_id {
@@ -77,28 +230,46 @@ impl LocalThreadStore {
                         .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
                     (rollout_id, rollout_path)
                 }
-                None => {
-                    let resolved = thread_rollout_resolver::resolve_current_including_archived(
-                        self,
-                        requested_thread_id,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        malformed_lineage(requested_thread_id, "missing source rollout")
-                    })?;
-                    (resolved.rollout_id, resolved.path)
-                }
+                None => match source.as_ref() {
+                    Some(source) => (source.rollout_id, source.path.clone()),
+                    None => {
+                        let resolved = thread_rollout_resolver::resolve_current_including_archived(
+                            self,
+                            requested_thread_id,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            malformed_lineage(requested_thread_id, "missing source rollout")
+                        })?;
+                        (resolved.rollout_id, resolved.path)
+                    }
+                },
             };
             if !seen.insert(rollout_id) {
                 return Err(malformed_lineage(requested_thread_id, "cycle detected"));
             }
+            // Both logical readers and reference preparation traverse immutable ancestry. Do not
+            // let either path follow an external, traversal, or symlinked file: an Existing
+            // lineage is just as security-sensitive as one we are about to share.
             let rollout_path = match representation {
-                LineageRepresentation::Existing => rollout_path,
-                LineageRepresentation::PlainForReference => super::helpers::scoped_rollout_path(
-                    self.config.codex_home.clone(),
-                    rollout_path.as_path(),
-                    "Codex home",
-                )?,
+                LineageRepresentation::ReadOnlyForAttachment => {
+                    let existing_path =
+                        codex_rollout::existing_rollout_path(rollout_path.as_path())
+                            .await
+                            .unwrap_or(rollout_path);
+                    super::helpers::managed_rollout_path(
+                        self.config.codex_home.as_path(),
+                        existing_path.as_path(),
+                        rollout_id,
+                    )?
+                }
+                LineageRepresentation::Existing | LineageRepresentation::PlainForReference => {
+                    super::helpers::managed_rollout_path(
+                        self.config.codex_home.as_path(),
+                        rollout_path.as_path(),
+                        rollout_id,
+                    )?
+                }
             };
             let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
                 .await
@@ -108,18 +279,23 @@ impl LocalThreadStore {
                         rollout_path.display()
                     ),
                 })?;
-            if next_rollout_id.is_none() && meta.meta.id != requested_thread_id {
+            let path_thread_id = codex_rollout::rollout_thread_id_from_path(rollout_path.as_path());
+            if path_thread_id != Some(meta.meta.id)
+                || codex_rollout::rollout_id_from_path(rollout_path.as_path()) != Some(rollout_id)
+                || (next_rollout_id.is_none() && path_thread_id != Some(requested_thread_id))
+            {
                 return Err(malformed_lineage(
                     requested_thread_id,
-                    "source rollout belongs to another thread",
+                    "source rollout filename or metadata belongs to another thread",
                 ));
             }
-            if meta.meta.history_mode != ThreadHistoryMode::Paginated {
+            if history_mode.is_some_and(|expected| expected != meta.meta.history_mode) {
                 return Err(malformed_lineage(
                     requested_thread_id,
-                    "source rollout is not paginated",
+                    "source rollout mixes history modes",
                 ));
             }
+            history_mode = Some(meta.meta.history_mode);
             let rollout_path = match representation {
                 LineageRepresentation::Existing => rollout_path,
                 LineageRepresentation::PlainForReference
@@ -138,16 +314,36 @@ impl LocalThreadStore {
                 // Already-shared compressed history requires a compatible reader regardless of
                 // new forks. Read it without publishing decoded copies into ancestors' folders;
                 // their owners may concurrently archive or unarchive those immutable files.
-                LineageRepresentation::PlainForReference => rollout_path,
+                LineageRepresentation::PlainForReference
+                | LineageRepresentation::ReadOnlyForAttachment => rollout_path,
             };
             if let Some(end) = end {
-                validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
+                if matches!(representation, LineageRepresentation::ReadOnlyForAttachment) {
+                    validate_raw_rollout_cutoff(
+                        requested_thread_id,
+                        rollout_path.as_path(),
+                        end.end_byte_offset,
+                        meta.meta.history_mode,
+                    )
+                    .await?;
+                } else {
+                    validate_cutoff_bounds(
+                        requested_thread_id,
+                        rollout_path.as_path(),
+                        &end,
+                        meta.meta.history_mode,
+                    )
+                    .await?;
+                }
             }
-            let start_ordinal = match meta.meta.history_base {
-                Some(base) => base.end_ordinal_exclusive.checked_add(1).ok_or_else(|| {
-                    malformed_lineage(requested_thread_id, "source ordinal overflow")
-                })?,
-                None => 1,
+            let start_ordinal = match meta.meta.history_mode {
+                ThreadHistoryMode::Legacy => 0,
+                ThreadHistoryMode::Paginated => match meta.meta.history_base {
+                    Some(base) => base.end_ordinal_exclusive.checked_add(1).ok_or_else(|| {
+                        malformed_lineage(requested_thread_id, "source ordinal overflow")
+                    })?,
+                    None => 1,
+                },
             };
             segments.push(RolloutLineageSegment {
                 rollout_id,
@@ -164,8 +360,21 @@ impl LocalThreadStore {
         }
 
         segments.reverse();
-        Ok(RolloutLineage { segments })
+        Ok((
+            RolloutLineage {
+                segments,
+                history_mode: history_mode.ok_or_else(|| {
+                    malformed_lineage(requested_thread_id, "source lineage is empty")
+                })?,
+            },
+            ancestor_guards,
+        ))
     }
+}
+
+struct LineageSource {
+    rollout_id: ThreadId,
+    path: PathBuf,
 }
 
 async fn resolve_rollout_path_by_id(
@@ -183,11 +392,16 @@ async fn resolve_rollout_path_by_id(
 enum LineageRepresentation {
     Existing,
     PlainForReference,
+    ReadOnlyForAttachment,
 }
 
 impl RolloutLineage {
     pub(super) fn segments(&self) -> &[RolloutLineageSegment] {
         self.segments.as_slice()
+    }
+
+    pub(super) fn history_mode(&self) -> ThreadHistoryMode {
+        self.history_mode
     }
 
     pub(super) fn segment_index_for_ordinal(&self, ordinal: u64) -> Option<usize> {
@@ -217,7 +431,13 @@ impl RolloutLineage {
             .ok_or_else(|| ThreadStoreError::Internal {
                 message: "rollout lineage has no segments".to_string(),
             })?;
-        validate_cutoff_bounds(end.thread_id, segment.rollout_path.as_path(), &end).await?;
+        validate_cutoff_bounds(
+            end.thread_id,
+            segment.rollout_path.as_path(),
+            &end,
+            self.history_mode,
+        )
+        .await?;
         segment.end = Some(end);
         Ok(self)
     }
@@ -241,35 +461,228 @@ async fn validate_cutoff_bounds(
     requested_thread_id: ThreadId,
     rollout_path: &Path,
     end: &HistoryPosition,
+    history_mode: ThreadHistoryMode,
 ) -> ThreadStoreResult<()> {
-    if end.end_ordinal_exclusive == 0 {
-        return Err(malformed_lineage(
-            requested_thread_id,
-            "cutoff cannot include source session metadata",
-        ));
-    }
-    let path = rollout_path.to_path_buf();
     let end_byte_offset = end.end_byte_offset;
-    let contains_prefix = tokio::task::spawn_blocking(move || {
-        codex_rollout::rollout_contains_prefix(&path, end_byte_offset)
-    })
+    if history_mode == ThreadHistoryMode::Legacy {
+        // A shared legacy ancestor may already be compressed. Validate its decoded byte cutoff
+        // through the raw reader; the plain-file reverse scanner cannot interpret zstd bytes.
+        if rollout_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".jsonl.zst"))
+        {
+            return validate_raw_rollout_cutoff(
+                requested_thread_id,
+                rollout_path,
+                end_byte_offset,
+                history_mode,
+            )
+            .await;
+        }
+        let validation_path = rollout_path.to_path_buf();
+        let complete_envelope = tokio::task::spawn_blocking(move || {
+            legacy_envelope::validate_rollout_envelope_cutoff(
+                validation_path.as_path(),
+                end_byte_offset,
+            )
+        })
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to join legacy cutoff validation: {err}"),
+        })?
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to validate legacy cutoff {}: {err}",
+                rollout_path.display()
+            ),
+        })?;
+        if !complete_envelope {
+            return Err(malformed_lineage(
+                requested_thread_id,
+                "cutoff byte offset is not at a complete JSONL record",
+            ));
+        }
+        return Ok(());
+    }
+    // Paginated cutoffs are physical decoded JSONL offsets too. Requiring a complete LF record
+    // here keeps plain and zstd lineages equivalent and rejects both mid-line and EOF-partial
+    // positions without materializing the rollout.
+    validate_raw_rollout_cutoff(
+        requested_thread_id,
+        rollout_path,
+        end_byte_offset,
+        history_mode,
+    )
     .await
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to join rollout prefix validation: {err}"),
-    })?
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!(
-            "failed to read lineage metadata {}: {err}",
-            rollout_path.display()
-        ),
-    })?;
-    if !contains_prefix {
+}
+
+/// Validate a raw JSONL cutoff without materializing a compressed rollout into a plain file.
+async fn validate_raw_rollout_cutoff(
+    requested_thread_id: ThreadId,
+    rollout_path: &Path,
+    end_byte_offset: u64,
+    history_mode: ThreadHistoryMode,
+) -> ThreadStoreResult<()> {
+    // Legacy replay uses a 16 MiB payload bound, consistent with the migration record bound. A
+    // cutoff reader must retain that same bounded range to validate an envelope, plus its
+    // terminating LF. Anything larger is drained without allocation and cannot become a Legacy
+    // history boundary.
+    const LEGACY_CUTOFF_PAYLOAD_LIMIT: usize = 16 * 1024 * 1024;
+    const CUTOFF_LINE_LIMIT: usize = LEGACY_CUTOFF_PAYLOAD_LIMIT + 1;
+    let mut reader = codex_rollout::open_rollout_raw_line_reader(rollout_path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read lineage {}: {err}", rollout_path.display()),
+        })?;
+    let mut offset = 0_u64;
+    let mut last_complete = 0_u64;
+    let mut last_valid = 0_u64;
+    loop {
+        let Some(record) = reader
+            .next_raw_line_limited(CUTOFF_LINE_LIMIT)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to scan lineage {}: {err}", rollout_path.display()),
+            })?
+        else {
+            if offset < end_byte_offset {
+                return Err(malformed_lineage(
+                    requested_thread_id,
+                    "cutoff byte offset is past the source rollout",
+                ));
+            }
+            break;
+        };
+        let (line, byte_count, terminated) = match record {
+            codex_rollout::RawRolloutLine::Complete(line) => {
+                let byte_count = line.len();
+                let terminated = line.ends_with(b"\n");
+                (Some(line), byte_count, terminated)
+            }
+            codex_rollout::RawRolloutLine::Oversized {
+                byte_count,
+                terminated,
+            } => (None, byte_count, terminated),
+        };
+        let next = offset.saturating_add(byte_count as u64);
+        if next > end_byte_offset {
+            break;
+        }
+        offset = next;
+        // An EOF-partial record is never a valid cutoff, even when its JSON happens to parse.
+        if !terminated {
+            if offset < end_byte_offset {
+                return Err(malformed_lineage(
+                    requested_thread_id,
+                    "cutoff byte offset is past the source rollout",
+                ));
+            }
+            break;
+        }
+        last_complete = offset;
+        if history_mode == ThreadHistoryMode::Paginated {
+            last_valid = offset;
+        } else if line.as_deref().is_some_and(valid_legacy_envelope) {
+            last_valid = offset;
+        }
+    }
+    let boundary = if history_mode == ThreadHistoryMode::Paginated {
+        last_complete
+    } else {
+        last_valid
+    };
+    if boundary != end_byte_offset {
         return Err(malformed_lineage(
             requested_thread_id,
-            "cutoff byte offset is past the source rollout",
+            "cutoff byte offset is not at a complete JSONL record",
         ));
     }
     Ok(())
+}
+
+fn valid_legacy_envelope(line: &[u8]) -> bool {
+    serde_json::from_slice::<EnvelopeValidity>(line)
+        .map(|valid| valid.0)
+        .unwrap_or(false)
+}
+
+struct EnvelopeValidity(bool);
+struct EnvelopeVisitor;
+struct ObjectSeed;
+struct ObjectVisitor;
+
+impl<'de> serde::Deserialize<'de> for EnvelopeValidity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
+}
+
+impl<'de> Visitor<'de> for EnvelopeVisitor {
+    type Value = EnvelopeValidity;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object rollout envelope")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut timestamp = false;
+        let mut kind = false;
+        let mut payload = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "timestamp" => {
+                    map.next_value::<String>()?;
+                    timestamp = true;
+                }
+                "type" => {
+                    map.next_value::<String>()?;
+                    kind = true;
+                }
+                "payload" => {
+                    map.next_value_seed(ObjectSeed)?;
+                    payload = true;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(EnvelopeValidity(timestamp && kind && payload))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for ObjectSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+
+impl<'de> Visitor<'de> for ObjectVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
 }
 
 fn malformed_lineage(thread_id: ThreadId, detail: &str) -> ThreadStoreError {

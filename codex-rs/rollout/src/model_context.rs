@@ -5,6 +5,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadHistoryMode;
 
 /// Whether a reverse model-context scan needs more rollout items.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,11 +25,17 @@ pub enum ModelContextScanProgress {
 ///
 /// The scan stops once it has both:
 ///
-/// - `saw_compaction`: a `CompactedItem` with `replacement_history` and `window_number`;
+/// - `saw_compaction`: a `CompactedItem` with `replacement_history` and, for paginated
+///   history, `window_number`;
 /// - `saw_completed_turn_context`: a completed user turn with a compatible `TurnContextItem`.
 ///
 /// If the scan reaches the beginning before finding a bounded cutoff, it has already collected
 /// the complete replay and so we can return that directly.
+///
+/// Legacy compactions did not persist a `window_number`. After finding a safe cutoff, the scanner
+/// therefore continues to the beginning without retaining older items, counts the discarded
+/// compactions, and writes that count onto the surviving checkpoint. This preserves the legacy
+/// auto-compaction ordinal without copying superseded replacement histories.
 ///
 /// `TurnContextItem` does not identify whether it came from a user turn, so one only counts after
 /// the same turn also proves a user-turn boundary: a paginated
@@ -39,27 +46,70 @@ pub enum ModelContextScanProgress {
 /// model-visible items; the turn context restores previous settings (`model`, `comp_hash`, and
 /// `realtime_active`) and the reference baseline.
 ///
-/// These paginated shapes disable the bounded cutoff:
+/// These shapes disable the bounded cutoff:
 ///
-/// - compaction without `replacement_history` or `window_number`;
+/// - compaction without `replacement_history`;
+/// - paginated compaction without `window_number`;
 /// - rollback markers;
 ///
 /// When one appears, the scanner continues to the beginning and returns the complete replay.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModelContextScan {
+    history_mode: ThreadHistoryMode,
     items_newest_first: Vec<RolloutItem>,
     saw_compaction: bool,
     saw_completed_turn_context: bool,
     must_scan_to_start: bool,
+    bounded_cutoff_reached: bool,
+    legacy_compaction_count: u64,
+    legacy_checkpoint_needs_count: bool,
     active_segment: ActiveTurnSegment,
 }
 
+impl Default for ModelContextScan {
+    fn default() -> Self {
+        Self::new(ThreadHistoryMode::Paginated)
+    }
+}
+
 impl ModelContextScan {
+    /// Creates a scan using the checkpoint guarantees of the persisted history format.
+    pub fn new(history_mode: ThreadHistoryMode) -> Self {
+        Self {
+            history_mode,
+            items_newest_first: Vec::new(),
+            saw_compaction: false,
+            saw_completed_turn_context: false,
+            must_scan_to_start: false,
+            bounded_cutoff_reached: false,
+            legacy_compaction_count: 0,
+            legacy_checkpoint_needs_count: false,
+            active_segment: ActiveTurnSegment::default(),
+        }
+    }
+
     /// Adds the next newest-to-oldest rollout item and reports whether the reader can stop.
     pub fn push(&mut self, item: RolloutItem) -> ModelContextScanProgress {
+        if self.history_mode == ThreadHistoryMode::Legacy
+            && matches!(&item, RolloutItem::Compacted(_))
+        {
+            self.legacy_compaction_count = self.legacy_compaction_count.saturating_add(1);
+        }
+        if self.bounded_cutoff_reached {
+            return ModelContextScanProgress::Continue;
+        }
+
         let progress = self.observe(&item);
         self.items_newest_first.push(item);
-        progress
+        if progress == ModelContextScanProgress::Complete
+            && self.history_mode == ThreadHistoryMode::Legacy
+            && self.legacy_checkpoint_needs_count
+        {
+            self.bounded_cutoff_reached = true;
+            ModelContextScanProgress::Continue
+        } else {
+            progress
+        }
     }
 
     /// Returns the collected items in chronological order with canonical head metadata.
@@ -67,6 +117,22 @@ impl ModelContextScan {
     /// Call this after the reader reaches the beginning of its source or after [`Self::push`]
     /// returns [`ModelContextScanProgress::Complete`].
     pub fn finish(mut self, session_meta: SessionMetaLine) -> Vec<RolloutItem> {
+        if self.bounded_cutoff_reached
+            && let Some(compacted) =
+                self.items_newest_first
+                    .iter_mut()
+                    .find_map(|item| match item {
+                        RolloutItem::Compacted(compacted)
+                            if compacted.replacement_history.is_some()
+                                && compacted.window_number.is_none() =>
+                        {
+                            Some(compacted)
+                        }
+                        _ => None,
+                    })
+        {
+            compacted.window_number = Some(self.legacy_compaction_count);
+        }
         self.items_newest_first.reverse();
         if self.has_bounded_cutoff() {
             // A bounded scan stops before reaching the head. Prepend the separately loaded head
@@ -85,11 +151,18 @@ impl ModelContextScan {
 
         match item {
             RolloutItem::Compacted(compacted)
-                if compacted.replacement_history.is_none() || compacted.window_number.is_none() =>
+                if compacted.replacement_history.is_none()
+                    || (self.history_mode == ThreadHistoryMode::Paginated
+                        && compacted.window_number.is_none()) =>
             {
                 self.must_scan_to_start = true;
             }
-            RolloutItem::Compacted(_) => {
+            RolloutItem::Compacted(compacted) => {
+                if !self.saw_compaction {
+                    self.legacy_checkpoint_needs_count = self.history_mode
+                        == ThreadHistoryMode::Legacy
+                        && compacted.window_number.is_none();
+                }
                 self.saw_compaction = true;
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {

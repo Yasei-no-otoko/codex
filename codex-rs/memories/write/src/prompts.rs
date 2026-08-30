@@ -1,6 +1,7 @@
 use crate::memory_extensions_root;
 use codex_protocol::openai_models::ModelInfo;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use codex_utils_template::Template;
 use std::path::Path;
@@ -97,33 +98,58 @@ fn render_memory_extensions_block(template: &Template, memory_extensions_root: &
 
 /// Builds the stage-1 user message containing rollout metadata and content.
 ///
-/// Large rollout payloads are truncated to 70% of the active model's effective
-/// input window token budget while keeping both head and tail context.
+/// Large rollout payloads are truncated to the active model's effective input
+/// window while keeping both head and tail context. The complete rendered
+/// message is hard-capped because it is sent as one model-visible item.
 pub fn build_stage_one_input_message(
     model_info: &ModelInfo,
     rollout_path: &Path,
     rollout_cwd: &Path,
     rollout_contents: &str,
 ) -> anyhow::Result<String> {
-    let rollout_token_limit = model_info
+    let model_rollout_token_limit = model_info
         .resolved_context_window()
         .and_then(|limit| (limit > 0).then_some(limit))
         .map(|limit| limit.saturating_mul(model_info.effective_context_window_percent) / 100)
         .map(|limit| (limit.saturating_mul(crate::stage_one::CONTEXT_WINDOW_PERCENT) / 100).max(1))
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(crate::stage_one::DEFAULT_ROLLOUT_TOKEN_LIMIT);
+
+    let rollout_path = rollout_path.display().to_string();
+    let rollout_cwd = rollout_cwd.display().to_string();
+    let template_overhead = approx_token_count(&STAGE_ONE_INPUT_TEMPLATE.render([
+        ("rollout_path", rollout_path.as_str()),
+        ("rollout_cwd", rollout_cwd.as_str()),
+        ("rollout_contents", ""),
+    ])?);
+    let rollout_item_token_limit = crate::stage_one::MAX_INPUT_ITEM_TOKENS
+        .saturating_sub(template_overhead)
+        .saturating_sub(crate::stage_one::TRUNCATION_MARKER_TOKEN_RESERVE)
+        .max(1);
+    let rollout_token_limit = model_rollout_token_limit.min(rollout_item_token_limit);
     let truncated_rollout_contents = truncate_text(
         rollout_contents,
         TruncationPolicy::Tokens(rollout_token_limit),
     );
 
-    let rollout_path = rollout_path.display().to_string();
-    let rollout_cwd = rollout_cwd.display().to_string();
-    Ok(STAGE_ONE_INPUT_TEMPLATE.render([
+    let rendered = STAGE_ONE_INPUT_TEMPLATE.render([
         ("rollout_path", rollout_path.as_str()),
         ("rollout_cwd", rollout_cwd.as_str()),
         ("rollout_contents", truncated_rollout_contents.as_str()),
-    ])?)
+    ])?;
+    if approx_token_count(&rendered) <= crate::stage_one::MAX_INPUT_ITEM_TOKENS {
+        return Ok(rendered);
+    }
+
+    // Fixed framing can grow independently of the rollout, e.g. with an unusually
+    // long path. Keep the invariant fail-closed instead of emitting an oversized item.
+    Ok(truncate_text(
+        &rendered,
+        TruncationPolicy::Tokens(
+            crate::stage_one::MAX_INPUT_ITEM_TOKENS
+                .saturating_sub(crate::stage_one::TRUNCATION_MARKER_TOKEN_RESERVE),
+        ),
+    ))
 }
 
 #[cfg(test)]

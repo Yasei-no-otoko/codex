@@ -1252,6 +1252,38 @@ impl Session {
         Ok(())
     }
 
+    /// Publish a materialized local rollout to StateDB before a caller exposes it through a
+    /// StateDB-only discovery API.
+    pub(crate) async fn reconcile_materialized_rollout_metadata(&self) -> anyhow::Result<()> {
+        let Some(state_db) = self.state_db() else {
+            return Ok(());
+        };
+        let Some(rollout_path) = self.current_rollout_path().await? else {
+            return Ok(());
+        };
+        if codex_rollout::existing_rollout_path(rollout_path.as_path())
+            .await
+            .is_none()
+        {
+            return Ok(());
+        }
+        let default_provider = {
+            let state = self.state.lock().await;
+            state
+                .session_configuration
+                .original_config_do_not_use
+                .model_provider_id
+                .clone()
+        };
+        codex_rollout::state_db::reconcile_rollout_metadata(
+            Some(state_db.as_ref()),
+            rollout_path.as_path(),
+            default_provider.as_str(),
+            /*archived_only*/ Some(false),
+        )
+        .await
+    }
+
     pub(crate) async fn ensure_rollout_materialized(&self, context: PersistContext) {
         if let Err(e) = self.try_ensure_rollout_materialized(context).await {
             warn!("failed to materialize thread persistence: {e}");

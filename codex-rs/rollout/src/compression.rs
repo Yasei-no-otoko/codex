@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io;
+use std::io::BufRead;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
@@ -9,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+use tokio::io::AsyncBufReadExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -62,6 +65,20 @@ pub async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineRead
         }
     }
     reader::open_once(path).await
+}
+
+/// Opens a newline-preserving reader for plain or compressed rollout files.
+pub async fn open_rollout_raw_line_reader(path: &Path) -> io::Result<RawRolloutLineReader> {
+    for _ in 0..MAX_NOT_FOUND_RETRIES {
+        match reader::open_raw_once(path).await {
+            Ok(reader) => return Ok(reader),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                tokio::time::sleep(OPEN_ROLLOUT_LINE_READER_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    reader::open_raw_once(path).await
 }
 
 /// Returns the compressed `.jsonl.zst` path for a rollout path.
@@ -206,6 +223,24 @@ pub struct RolloutLineReader {
     inner: RolloutLineReaderInner,
 }
 
+/// Newline-preserving reader for callers that need physical JSONL byte boundaries.
+pub struct RawRolloutLineReader {
+    inner: RawRolloutLineReaderInner,
+}
+
+/// Result of a bounded raw-line read. Oversized records are drained through their newline without
+/// allocating the complete record, allowing capped consumers to continue with the tail.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RawRolloutLine {
+    Complete(Vec<u8>),
+    Oversized { byte_count: usize, terminated: bool },
+}
+
+enum RawRolloutLineReaderInner {
+    Plain(tokio::io::BufReader<tokio::fs::File>),
+    Blocking(Option<BlockingRawLineReader>),
+}
+
 enum RolloutLineReaderInner {
     Plain(tokio::io::Lines<tokio::io::BufReader<tokio::fs::File>>),
     Blocking(Option<BlockingLineReader>),
@@ -231,9 +266,148 @@ impl RolloutLineReader {
     }
 }
 
-type BlockingLineReader = std::io::Lines<std::io::BufReader<Box<dyn Read + Send>>>;
+impl RawRolloutLineReader {
+    /// Reads one newline-preserving line while limiting allocation to `max_bytes`.
+    pub async fn next_raw_line_limited(
+        &mut self,
+        max_bytes: usize,
+    ) -> io::Result<Option<RawRolloutLine>> {
+        if max_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_bytes must be positive",
+            ));
+        }
+        match &mut self.inner {
+            RawRolloutLineReaderInner::Plain(reader) => {
+                let mut line = Vec::new();
+                loop {
+                    let buffer = tokio::io::AsyncBufReadExt::fill_buf(reader).await?;
+                    if buffer.is_empty() {
+                        return Ok((!line.is_empty()).then_some(RawRolloutLine::Complete(line)));
+                    }
+                    let take = buffer
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(buffer.len(), |index| index + 1);
+                    if line.len().saturating_add(take) > max_bytes {
+                        let terminated = buffer[..take].contains(&b'\n');
+                        let byte_count = line.len().saturating_add(take);
+                        reader.consume(take);
+                        if terminated {
+                            return Ok(Some(RawRolloutLine::Oversized {
+                                byte_count,
+                                terminated,
+                            }));
+                        }
+                        let (drained, terminated) = discard_async_line(reader).await?;
+                        return Ok(Some(RawRolloutLine::Oversized {
+                            byte_count: byte_count.saturating_add(drained),
+                            terminated,
+                        }));
+                    }
+                    line.extend_from_slice(&buffer[..take]);
+                    reader.consume(take);
+                    if line.ends_with(b"\n") {
+                        return Ok(Some(RawRolloutLine::Complete(line)));
+                    }
+                }
+            }
+            RawRolloutLineReaderInner::Blocking(slot) => {
+                let Some(reader) = slot.take() else {
+                    return Err(io::Error::other("compressed rollout reader is busy"));
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut reader = reader;
+                    let result = read_limited_blocking(&mut reader, max_bytes);
+                    (result, reader)
+                })
+                .await
+                .map_err(io::Error::other)?;
+                let (result, reader) = result;
+                *slot = Some(reader);
+                result
+            }
+        }
+    }
+}
 
-mod worker {
+async fn discard_async_line(
+    reader: &mut tokio::io::BufReader<tokio::fs::File>,
+) -> io::Result<(usize, bool)> {
+    let mut byte_count = 0;
+    loop {
+        let buffer = tokio::io::AsyncBufReadExt::fill_buf(reader).await?;
+        if buffer.is_empty() {
+            return Ok((byte_count, false));
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        let terminated = buffer[..take].contains(&b'\n');
+        reader.consume(take);
+        byte_count = byte_count.saturating_add(take);
+        if terminated {
+            return Ok((byte_count, true));
+        }
+    }
+}
+
+fn read_limited_blocking(
+    reader: &mut BlockingRawLineReader,
+    max_bytes: usize,
+) -> io::Result<Option<RawRolloutLine>> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((!line.is_empty()).then_some(RawRolloutLine::Complete(line)));
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if line.len().saturating_add(take) > max_bytes {
+            let mut terminated = buffer[..take].contains(&b'\n');
+            let mut byte_count = line.len().saturating_add(take);
+            reader.consume(take);
+            if !terminated {
+                loop {
+                    let buffer = reader.fill_buf()?;
+                    if buffer.is_empty() {
+                        break;
+                    }
+                    let take = buffer
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(buffer.len(), |index| index + 1);
+                    let chunk_terminated = buffer[..take].contains(&b'\n');
+                    reader.consume(take);
+                    byte_count = byte_count.saturating_add(take);
+                    if chunk_terminated {
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+            return Ok(Some(RawRolloutLine::Oversized {
+                byte_count,
+                terminated,
+            }));
+        }
+        line.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if line.ends_with(b"\n") {
+            return Ok(Some(RawRolloutLine::Complete(line)));
+        }
+    }
+}
+
+type BlockingLineReader = std::io::Lines<std::io::BufReader<Box<dyn Read + Send>>>;
+type BlockingRawLineReader = std::io::BufReader<Box<dyn Read + Send>>;
+
+pub(super) mod worker {
     use std::ffi::OsStr;
     use std::fs::File;
     use std::fs::FileTimes;
@@ -255,6 +429,9 @@ mod worker {
     use crate::ARCHIVED_SESSIONS_SUBDIR;
     use crate::RolloutReferenceIndex;
     use crate::SESSIONS_SUBDIR;
+    use crate::ThreadWriterLockCoordinator;
+    use codex_protocol::ThreadId;
+    use std::sync::Arc;
 
     use super::RolloutCompressionMode;
     use super::RolloutFile;
@@ -364,6 +541,22 @@ mod worker {
             );
             return Ok(());
         };
+        let writer_locks = Arc::new(ThreadWriterLockCoordinator::new(codex_home.as_path()));
+        let topology_guard = match writer_locks.acquire_topology() {
+            Ok(guard) => guard,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                metrics::run("skipped_topology_busy");
+                debug!(
+                    "rollout topology is busy; skipping compression for {}",
+                    codex_home.display()
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                metrics::run("failed");
+                return Err(err);
+            }
+        };
         let marker = match CompressionRunMarker::try_claim(codex_home.as_path()) {
             Ok(Some(marker)) => marker,
             Ok(None) => {
@@ -383,14 +576,15 @@ mod worker {
         metrics::run("started");
         let started_at = Instant::now();
         let result = async {
-            cleanup_stale_temps(codex_home.as_path()).await?;
-            let Some(reference_index) = RolloutReferenceIndex::scan_until(
+            let reference_index = RolloutReferenceIndex::scan_until(
                 codex_home.as_path(),
                 started_at,
                 WORKER_MAX_RUNTIME,
             )
-            .await?
-            else {
+            .await?;
+            drop(topology_guard);
+            cleanup_stale_temps(codex_home.as_path()).await?;
+            let Some(reference_index) = reference_index else {
                 return Ok(CompressionStats::default());
             };
             let mut stats = CompressionStats::default();
@@ -406,6 +600,7 @@ mod worker {
                     started_at,
                     &reference_index,
                     mode,
+                    &writer_locks,
                     &mut stats,
                 )
                 .await?;
@@ -450,6 +645,7 @@ mod worker {
         started_at: Instant,
         reference_index: &RolloutReferenceIndex,
         mode: RolloutCompressionMode,
+        writer_locks: &Arc<ThreadWriterLockCoordinator>,
         stats: &mut CompressionStats,
     ) -> io::Result<()> {
         if !tokio::fs::try_exists(root).await.unwrap_or(false) {
@@ -513,11 +709,22 @@ mod worker {
                     metrics::file("skipped_unreadable_meta");
                     continue;
                 };
+                let Some(logical_thread_id) = crate::rollout_thread_id_from_path(path.as_path())
+                else {
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    metrics::file("skipped_unreadable_meta");
+                    continue;
+                };
                 let Ok(meta) = crate::read_session_meta_line(path.as_path()).await else {
                     stats.skipped = stats.skipped.saturating_add(1);
                     metrics::file("skipped_unreadable_meta");
                     continue;
                 };
+                if meta.meta.id != logical_thread_id {
+                    stats.skipped = stats.skipped.saturating_add(1);
+                    metrics::file("skipped_unreadable_meta");
+                    continue;
+                }
                 if mode == RolloutCompressionMode::Standalone
                     && reference_index.reference_count(rollout_id) > 0
                 {
@@ -535,9 +742,14 @@ mod worker {
                 while jobs.len() >= MAX_CONCURRENT_COMPRESSION_JOBS {
                     collect_next_compression_job(&mut jobs, stats).await;
                 }
+                let writer_locks = Arc::clone(writer_locks);
                 jobs.spawn_blocking(move || {
                     let started_at = Instant::now();
-                    let result = compress_rollout_if_cold_blocking(path.as_path());
+                    let result = compress_rollout_if_cold_blocking(
+                        path.as_path(),
+                        logical_thread_id,
+                        writer_locks,
+                    );
                     let duration = started_at.elapsed();
                     (path, duration, result)
                 });
@@ -550,11 +762,12 @@ mod worker {
     type CompressionJobResult = (PathBuf, Duration, io::Result<CompressionMeasurement>);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum CompressionOutcome {
+    pub(super) enum CompressionOutcome {
         Compressed,
         SkippedNotCold,
         SkippedChanged,
         SkippedAlreadyCompressed,
+        SkippedWriterBusy,
     }
 
     impl CompressionOutcome {
@@ -564,12 +777,13 @@ mod worker {
                 CompressionOutcome::SkippedNotCold => "skipped_not_cold",
                 CompressionOutcome::SkippedChanged => "skipped_changed",
                 CompressionOutcome::SkippedAlreadyCompressed => "skipped_already_compressed",
+                CompressionOutcome::SkippedWriterBusy => "skipped_writer_busy",
             }
         }
     }
 
-    struct CompressionMeasurement {
-        outcome: CompressionOutcome,
+    pub(super) struct CompressionMeasurement {
+        pub(super) outcome: CompressionOutcome,
         source_bytes: Option<u64>,
         compressed_bytes: Option<u64>,
     }
@@ -618,7 +832,8 @@ mod worker {
                     }
                     CompressionOutcome::SkippedNotCold
                     | CompressionOutcome::SkippedChanged
-                    | CompressionOutcome::SkippedAlreadyCompressed => {
+                    | CompressionOutcome::SkippedAlreadyCompressed
+                    | CompressionOutcome::SkippedWriterBusy => {
                         stats.skipped = stats.skipped.saturating_add(1);
                     }
                 }
@@ -648,7 +863,25 @@ mod worker {
         }
     }
 
-    fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement> {
+    pub(super) fn compress_rollout_if_cold_blocking(
+        path: &Path,
+        logical_thread_id: ThreadId,
+        writer_locks: Arc<ThreadWriterLockCoordinator>,
+    ) -> io::Result<CompressionMeasurement> {
+        // Every live writer and lifecycle operation uses the stable logical thread ID encoded
+        // before `_` in a reverted rollout filename. Keep compression on that same lock rather
+        // than the immutable rollout ID carried by HistoryPosition.
+        let _writer_lock = match writer_locks.acquire(logical_thread_id) {
+            Ok(lock) => lock,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(CompressionMeasurement::new(
+                    CompressionOutcome::SkippedWriterBusy,
+                    None,
+                    None,
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         let before = match cold_file_state(path)? {
             ColdFileState::Cold(state) => state,
             ColdFileState::NotCold(state) => {
@@ -1054,6 +1287,8 @@ mod reader {
     use std::io::Read;
     use std::path::Path;
 
+    use super::RawRolloutLineReader;
+    use super::RawRolloutLineReaderInner;
     use super::RolloutLineReader;
     use super::RolloutLineReaderInner;
     use super::path;
@@ -1080,6 +1315,28 @@ mod reader {
         let file = tokio::fs::File::open(path).await?;
         Ok(RolloutLineReader {
             inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file).lines()),
+        })
+    }
+
+    pub(super) async fn open_raw_once(path: &Path) -> io::Result<RawRolloutLineReader> {
+        let path = path::existing_rollout_path(path)
+            .await
+            .unwrap_or_else(|| path.to_path_buf());
+        if path::is_compressed_rollout_path(path.as_path()) {
+            let reader = tokio::task::spawn_blocking(move || {
+                let input = File::open(path.as_path())?;
+                let decoder = zstd::stream::read::Decoder::new(input)?;
+                Ok::<_, io::Error>(io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            return Ok(RawRolloutLineReader {
+                inner: RawRolloutLineReaderInner::Blocking(Some(reader)),
+            });
+        }
+        let file = tokio::fs::File::open(path).await?;
+        Ok(RawRolloutLineReader {
+            inner: RawRolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
         })
     }
 }

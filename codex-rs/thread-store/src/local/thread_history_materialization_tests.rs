@@ -796,6 +796,7 @@ async fn named_fork_boundaries_reject_invisible_and_noncanonical_turns() {
         .prepare_fork(PrepareForkParams {
             thread_id: child_id,
             boundary: ForkBoundary::ThroughTurn("inherited-turn".to_string()),
+            legacy_source_rollout_path: None,
         })
         .await
         .expect_err("cannot fork through an inherited active turn");
@@ -849,6 +850,7 @@ async fn named_fork_boundaries_reject_invisible_and_noncanonical_turns() {
             .prepare_fork(PrepareForkParams {
                 thread_id,
                 boundary,
+                legacy_source_rollout_path: None,
             })
             .await
             .expect_err("reject an invalid fork boundary");
@@ -1062,6 +1064,18 @@ async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() 
             .expect("read compressed source timestamp"),
         source_modified
     );
+    // PreparedFork retains guards for its complete immutable ancestry until the child reference
+    // is durable. A maintenance process must therefore be unable to move/delete the ancestor
+    // after preparation has returned but before either prepared child is consumed.
+    let maintenance_store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let ancestor_lock_error = maintenance_store
+        .writer_lock_coordinator
+        .acquire(ancestor_thread_id)
+        .expect_err("prepared reference must retain its ancestor writer guard");
+    assert!(matches!(
+        ancestor_lock_error,
+        crate::ThreadStoreError::Conflict { .. }
+    ));
     for prepared in [first, second] {
         assert!(matches!(
             prepared.model_context.first(),
@@ -1101,12 +1115,14 @@ async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() 
         .prepare_fork(PrepareForkParams {
             thread_id: source_thread_id,
             boundary: ForkBoundary::Latest,
+            legacy_source_rollout_path: None,
         })
         .await
         .expect_err("external shared source cannot be referenced by rollout id");
     assert!(matches!(
         error,
-        crate::ThreadStoreError::InvalidRequest { message } if message.contains("must be in Codex home")
+        crate::ThreadStoreError::InvalidRequest { message }
+            if message.contains("must be in a managed Codex sessions directory")
     ));
     store
         .shutdown_thread(source_thread_id)
@@ -1165,6 +1181,7 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_resolution_finishes(
             .prepare_fork(PrepareForkParams {
                 thread_id: source_thread_id,
                 boundary: ForkBoundary::Latest,
+                legacy_source_rollout_path: None,
             })
             .await
     });
@@ -1220,6 +1237,7 @@ async fn prepared_fork_reserves_source_until_child_reference_is_durable() {
         .prepare_fork(PrepareForkParams {
             thread_id: source_thread_id,
             boundary: ForkBoundary::Latest,
+            legacy_source_rollout_path: None,
         })
         .await
         .expect("prepare referenced fork");
@@ -2560,6 +2578,7 @@ async fn prepare_paginated_fork(
         .prepare_fork(PrepareForkParams {
             thread_id,
             boundary,
+            legacy_source_rollout_path: None,
         })
         .await
         .expect("prepare paginated fork")

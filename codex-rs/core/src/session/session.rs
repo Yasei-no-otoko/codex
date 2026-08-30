@@ -689,31 +689,36 @@ impl Session {
             .forked_from_thread_id
             .or_else(|| initial_history.forked_from_id());
         session_configuration.forked_from_thread_id = forked_from_id;
-        let forked_from_ordinal_exclusive = match &fork_persistence {
-            ForkPersistence::Referenced { history_base, .. } => {
-                history_base.map(|position| position.end_ordinal_exclusive)
+        let forked_from_ordinal_exclusive =
+            match (&fork_persistence, session_configuration.history_mode) {
+                (
+                    ForkPersistence::Referenced { history_base, .. },
+                    ThreadHistoryMode::Paginated,
+                ) => history_base.map(|position| position.end_ordinal_exclusive),
+                (ForkPersistence::Referenced { .. }, ThreadHistoryMode::Legacy) => None,
+                (ForkPersistence::Copied, _) => match &initial_history {
+                    InitialHistory::Resumed(resumed) => {
+                        // Both local and CCA thread stores place the resumed thread's
+                        // canonical SessionMeta first. Never inspect inherited metadata:
+                        // an ancestor's history_base describes a different fork boundary.
+                        resumed.history.first().and_then(|item| match item {
+                            RolloutItem::SessionMeta(meta)
+                                if meta.meta.id == resumed.conversation_id =>
+                            {
+                                codex_rollout::forked_from_ordinal_exclusive(
+                                    &meta.meta,
+                                    resumed.rollout_path.as_deref(),
+                                )
+                            }
+                            _ => None,
+                        })
+                    }
+                    InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+                        None
+                    }
+                },
             }
-            ForkPersistence::Copied => match &initial_history {
-                InitialHistory::Resumed(resumed) => {
-                    // Both local and CCA thread stores place the resumed thread's
-                    // canonical SessionMeta first. Never inspect inherited metadata:
-                    // an ancestor's history_base describes a different fork boundary.
-                    resumed.history.first().and_then(|item| match item {
-                        RolloutItem::SessionMeta(meta)
-                            if meta.meta.id == resumed.conversation_id =>
-                        {
-                            codex_rollout::forked_from_ordinal_exclusive(
-                                &meta.meta,
-                                resumed.rollout_path.as_deref(),
-                            )
-                        }
-                        _ => None,
-                    })
-                }
-                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
-            },
-        }
-        .filter(|_| forked_from_id.is_some());
+            .filter(|_| forked_from_id.is_some());
         let parent_thread_id = session_configuration
             .parent_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id());
@@ -1595,6 +1600,10 @@ impl Session {
                 // Keep the source reserved until the child's history reference is durable.
                 sess.try_ensure_rollout_materialized(PersistContext::Standard)
                     .await?;
+                // A reference child has no copied prefix to force a write. Flush its canonical
+                // SessionMeta now so list/read callers can discover the new child immediately.
+                sess.flush_rollout().await?;
+                sess.reconcile_materialized_rollout_metadata().await?;
             }
             {
                 let mut state = sess.state.lock().await;

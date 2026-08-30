@@ -3,6 +3,7 @@ use std::fs;
 use std::fs::FileTimes;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -24,9 +25,65 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::RolloutRecorder;
 use crate::RolloutRecorderParams;
+use crate::ThreadWriterLockCoordinator;
 use crate::append_rollout_item_to_path;
 use crate::read_session_meta_line;
 use crate::search_rollout_matches;
+
+#[test]
+fn compression_and_reference_writer_use_the_same_thread_lock() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(42);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&path, thread_id, "lock race")?;
+    set_old_mtime(&path)?;
+
+    let held = Arc::new(ThreadWriterLockCoordinator::new(home.path())).acquire(thread_id)?;
+    let measurement = super::worker::compress_rollout_if_cold_blocking(
+        path.as_path(),
+        thread_id,
+        Arc::new(ThreadWriterLockCoordinator::new(home.path())),
+    )?;
+    assert_eq!(
+        measurement.outcome,
+        super::worker::CompressionOutcome::SkippedWriterBusy
+    );
+    assert!(path.exists());
+    drop(held);
+    Ok(())
+}
+
+#[test]
+fn compression_of_reverted_rollout_uses_the_logical_thread_lock() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let logical_uuid = Uuid::from_u128(43);
+    let immutable_uuid = Uuid::from_u128(44);
+    let logical_thread_id = ThreadId::from_string(&logical_uuid.to_string())?;
+    let immutable_rollout_id = ThreadId::from_string(&immutable_uuid.to_string())?;
+    let original_path = rollout_path(home.path(), "2025-01-03T12-00-00", logical_uuid);
+    write_rollout(&original_path, logical_thread_id, "reverted lock race")?;
+    let path = original_path.with_file_name(format!(
+        "rollout-2025-01-03T12-00-00-{logical_thread_id}_{immutable_rollout_id}.jsonl"
+    ));
+    fs::rename(&original_path, &path)?;
+    set_old_mtime(&path)?;
+
+    let held =
+        Arc::new(ThreadWriterLockCoordinator::new(home.path())).acquire(logical_thread_id)?;
+    let measurement = super::worker::compress_rollout_if_cold_blocking(
+        path.as_path(),
+        logical_thread_id,
+        Arc::new(ThreadWriterLockCoordinator::new(home.path())),
+    )?;
+    assert_eq!(
+        measurement.outcome,
+        super::worker::CompressionOutcome::SkippedWriterBusy
+    );
+    assert!(path.exists());
+    drop(held);
+    Ok(())
+}
 
 #[tokio::test]
 async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
@@ -343,6 +400,63 @@ async fn worker_waits_for_rollout_maintenance_before_compressing() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn worker_skips_when_rollout_topology_is_busy_without_consuming_run_marker()
+-> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let source_uuid = Uuid::from_u128(27);
+    let source_id = ThreadId::from_string(&source_uuid.to_string())?;
+    let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
+    write_rollout(&source_path, source_id, "referenced source")?;
+    set_old_mtime(&source_path)?;
+
+    let child_uuid = Uuid::from_u128(28);
+    let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+    let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
+    write_rollout(&child_path, child_id, "fork child")?;
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: source_id,
+            end_ordinal_exclusive: 2,
+            end_byte_offset: fs::metadata(source_path.as_path())?.len(),
+        },
+    )?;
+    set_old_mtime(&child_path)?;
+
+    let held = Arc::new(ThreadWriterLockCoordinator::new(home.path())).acquire_topology()?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
+
+    assert!(source_path.exists());
+    assert!(!compressed_rollout_path(&source_path).exists());
+    assert!(child_path.exists());
+    assert!(!compressed_rollout_path(&child_path).exists());
+    assert!(
+        !home
+            .path()
+            .join(".tmp")
+            .join("rollout-compression.lock")
+            .exists()
+    );
+
+    drop(held);
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::IncludeShared,
+    )
+    .await?;
+
+    assert!(!source_path.exists());
+    assert!(compressed_rollout_path(&source_path).exists());
+    assert!(!child_path.exists());
+    assert!(compressed_rollout_path(&child_path).exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn worker_compresses_archived_fork_chain_only_with_shared_mode() -> anyhow::Result<()> {
     for mode in [
         RolloutCompressionMode::Standalone,
@@ -350,16 +464,16 @@ async fn worker_compresses_archived_fork_chain_only_with_shared_mode() -> anyhow
     ] {
         // Each mode gets a fresh home, without bypassing the worker's maintenance cooldown.
         let home = TempDir::new()?;
-        let thread_id = ThreadId::from_string(&Uuid::from_u128(15).to_string())?;
         let source_uuid = Uuid::from_u128(16);
         let source_rollout_id = ThreadId::from_string(&source_uuid.to_string())?;
         let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
-        write_rollout(&source_path, thread_id, "referenced source")?;
+        write_rollout(&source_path, source_rollout_id, "referenced source")?;
         set_old_mtime(&source_path)?;
 
         let child_uuid = Uuid::from_u128(17);
+        let child_id = ThreadId::from_string(&child_uuid.to_string())?;
         let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
-        write_rollout(&child_path, thread_id, "fork child")?;
+        write_rollout(&child_path, child_id, "fork child")?;
         set_history_base(
             child_path.as_path(),
             HistoryPosition {

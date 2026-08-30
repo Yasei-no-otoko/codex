@@ -100,6 +100,8 @@ async fn runtime_enabled_legacy_migration_preserves_cold_resume_model_context() 
     })
     .await??;
 
+    // Observing `Paginated` through `thread/read` is the public readiness boundary: this resume
+    // must not need a retry while background migration finishes its writer handoff.
     let resume_id = secondary
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),

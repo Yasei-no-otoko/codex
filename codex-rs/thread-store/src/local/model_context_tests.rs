@@ -16,9 +16,11 @@ use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
@@ -28,7 +30,9 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
+use crate::ArchiveThreadParams;
 use crate::ThreadStore;
+use crate::ThreadStoreError;
 use crate::local::test_support::test_config;
 use crate::local::test_support::write_session_file_with_history_mode;
 
@@ -82,6 +86,563 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
 }
 
 #[tokio::test]
+async fn loads_latest_legacy_checkpoint_without_window_metadata() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1008);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-07",
+        uuid,
+        [
+            turn_started("turn-1"),
+            legacy_user_message("older turn"),
+            turn_context(home.path(), "turn-1"),
+            legacy_compacted("older checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+            turn_started("turn-2"),
+            legacy_user_message("latest turn"),
+            turn_context(home.path(), "turn-2"),
+            legacy_compacted("latest checkpoint", Some(Vec::new())),
+            turn_complete("turn-2"),
+        ],
+    );
+    let canonical = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read canonical metadata");
+    let mut updated = canonical.clone();
+    updated.meta.memory_mode = Some("enabled".to_string());
+    append_items(path.as_path(), [RolloutItem::SessionMeta(updated)]);
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load legacy model context");
+    assert_eq!(
+        context
+            .items
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::SessionMeta(_)))
+            .count(),
+        1
+    );
+    let Some(RolloutItem::SessionMeta(returned_meta)) = context.items.first() else {
+        panic!("canonical session metadata should be first");
+    };
+    assert_eq!(
+        serde_json::to_value(returned_meta).expect("serialize returned metadata"),
+        serde_json::to_value(canonical).expect("serialize canonical metadata")
+    );
+    assert!(context.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::Compacted(compacted)
+                if compacted.message == "latest checkpoint"
+                    && compacted.window_number == Some(2)
+        )
+    }));
+    assert!(!context.items.iter().any(|item| {
+        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "older checkpoint")
+    }));
+    assert!(context.items.iter().any(|item| {
+        matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
+    }));
+}
+
+#[tokio::test]
+async fn latest_legacy_context_uses_replacement_history_not_pre_compaction_replay() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1015);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let RolloutItem::ResponseItem(replacement_item) = user_message("model-visible summary") else {
+        unreachable!("user_message returns a response item");
+    };
+    write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-14",
+        uuid,
+        [
+            legacy_user_message("obsolete physical history"),
+            legacy_compacted("latest checkpoint", Some(vec![replacement_item.item])),
+            turn_started("current-turn"),
+            legacy_user_message("current suffix"),
+            turn_context(home.path(), "current-turn"),
+        ],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load latest model-visible context");
+
+    assert!(context.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::Compacted(compacted)
+                if compacted.message == "latest checkpoint"
+                    && compacted.replacement_history.as_ref().is_some_and(|history| {
+                        history.iter().any(|item| {
+                            serde_json::to_string(&item.item)
+                                .expect("serialize replacement history item")
+                                .contains("model-visible summary")
+                        })
+                    })
+        )
+    }));
+    assert!(!context.items.iter().any(|item| {
+        serde_json::to_string(item)
+            .expect("serialize model context item")
+            .contains("obsolete physical history")
+    }));
+}
+
+#[tokio::test]
+async fn legacy_reference_context_replays_model_visible_ancestor_for_plain_and_zstd() {
+    let home = TempDir::new().expect("temp dir");
+    let root_uuid = Uuid::from_u128(/*v*/ 1018);
+    let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root thread id");
+    let RolloutItem::ResponseItem(replacement_item) = user_message("ancestor model summary") else {
+        unreachable!("user_message returns a response item");
+    };
+    let root_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-17",
+        root_uuid,
+        [legacy_compacted(
+            "ancestor checkpoint",
+            Some(vec![replacement_item.item]),
+        )],
+    );
+    let root_cutoff = std::fs::metadata(root_path.as_path())
+        .expect("read root metadata")
+        .len();
+
+    let child_uuid = Uuid::from_u128(/*v*/ 1019);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child thread id");
+    let child_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-18",
+        child_uuid,
+        [
+            turn_started("child-turn"),
+            legacy_user_message("child suffix"),
+            turn_context(home.path(), "child-turn"),
+        ],
+    );
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: root_id,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: root_cutoff,
+        },
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    for path in [root_path.as_path(), child_path.as_path()] {
+        let context = store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id: child_id,
+                include_archived: false,
+            })
+            .await
+            .expect("load logical legacy reference context");
+        let serialized = serde_json::to_string(&context.items).expect("serialize model context");
+        assert!(serialized.contains("ancestor model summary"));
+        assert!(serialized.contains("child suffix"));
+
+        let input = std::fs::File::open(path).expect("open rollout");
+        let output = std::fs::File::create(path.with_extension("jsonl.zst"))
+            .expect("create compressed rollout");
+        zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+        std::fs::remove_file(path).expect("remove plain rollout");
+    }
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load compressed logical legacy reference context");
+    let serialized = serde_json::to_string(&context.items).expect("serialize model context");
+    assert!(serialized.contains("ancestor model summary"));
+    assert!(serialized.contains("child suffix"));
+}
+
+#[tokio::test]
+async fn latest_legacy_reference_context_holds_source_and_ancestor_leases_through_scan() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let root_uuid = Uuid::from_u128(/*v*/ 1024);
+    let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root thread id");
+    let root_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-23",
+        root_uuid,
+        [legacy_user_message("ancestor context")],
+    );
+    let root_cutoff = std::fs::metadata(root_path.as_path())
+        .expect("read root metadata")
+        .len();
+
+    let child_uuid = Uuid::from_u128(/*v*/ 1025);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child thread id");
+    let child_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-24",
+        child_uuid,
+        [legacy_user_message("child context")],
+    );
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: root_id,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: root_cutoff,
+        },
+    );
+
+    let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+    let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
+    let (source_guards_acquired, resume_scan) = pause_after_source_guards(child_id);
+    let context_store = store.clone();
+    let context_task = tokio::spawn(async move {
+        context_store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id: child_id,
+                include_archived: false,
+            })
+            .await
+    });
+
+    source_guards_acquired
+        .await
+        .expect("model context acquired source and ancestor guards");
+    for thread_id in [child_id, root_id] {
+        let error = maintenance_store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect_err("model-context lease must block archive mutation");
+        assert!(matches!(error, ThreadStoreError::Conflict { .. }));
+    }
+
+    resume_scan.send(()).expect("resume model-context scan");
+    let context = context_task
+        .await
+        .expect("model-context task should join")
+        .expect("model context should finish after mutation attempts fail");
+    let serialized = serde_json::to_string(&context.items).expect("serialize model context");
+    assert!(serialized.contains("ancestor context"));
+    assert!(serialized.contains("child context"));
+}
+
+#[tokio::test]
+async fn legacy_reference_context_normalizes_ancestor_ghost_snapshot() {
+    let home = TempDir::new().expect("temp dir");
+    let root_uuid = Uuid::from_u128(/*v*/ 1020);
+    let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root thread id");
+    let root_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-19",
+        root_uuid,
+        [legacy_user_message("obsolete root history")],
+    );
+    let RolloutItem::ResponseItem(retained_history) = user_message("retained root history") else {
+        unreachable!("user_message returns a response item");
+    };
+    let checkpoint = RolloutLine {
+        timestamp: "2025-01-03T13:00:01Z".to_string(),
+        ordinal: None,
+        item: legacy_compacted("root checkpoint", Some(vec![retained_history.item])),
+    };
+    let mut checkpoint = serde_json::to_value(checkpoint).expect("serialize checkpoint");
+    checkpoint["payload"]["replacement_history"]
+        .as_array_mut()
+        .expect("replacement history")
+        .push(serde_json::json!({"type": "ghost_snapshot"}));
+    let mut root_file = OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("open root rollout");
+    writeln!(root_file, "{checkpoint}").expect("append root checkpoint");
+    drop(root_file);
+    let root_cutoff = std::fs::metadata(root_path.as_path())
+        .expect("read root metadata")
+        .len();
+
+    let child_uuid = Uuid::from_u128(/*v*/ 1021);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child thread id");
+    let child_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-20",
+        child_uuid,
+        [legacy_user_message("child suffix")],
+    );
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: root_id,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: root_cutoff,
+        },
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load logical legacy reference context");
+    let checkpoint = context
+        .items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) if compacted.message == "root checkpoint" => {
+                Some(compacted)
+            }
+            _ => None,
+        })
+        .expect("root checkpoint");
+    assert_eq!(
+        checkpoint.replacement_history.as_ref().map(Vec::len),
+        Some(1)
+    );
+    let serialized = serde_json::to_string(&context.items).expect("serialize model context");
+    assert!(serialized.contains("retained root history"));
+    assert!(serialized.contains("child suffix"));
+    assert!(!serialized.contains("ghost_snapshot"));
+}
+
+#[tokio::test]
+async fn legacy_model_context_rejects_oversized_record() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1016);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-15",
+        uuid,
+        [legacy_user_message("bounded context")],
+    );
+    append_items(
+        path.as_path(),
+        [legacy_user_message(
+            &"x".repeat(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES + 1),
+        )],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized legacy model-context record must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+
+    let input = std::fs::File::open(path.as_path()).expect("open plain rollout");
+    let output =
+        std::fs::File::create(path.with_extension("jsonl.zst")).expect("create compressed rollout");
+    zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+    std::fs::remove_file(path.as_path()).expect("remove plain rollout");
+
+    let compressed_error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized compressed legacy record must fail closed");
+    assert!(
+        compressed_error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+}
+
+#[tokio::test]
+async fn paginated_model_context_rejects_oversized_plain_and_zstd_records() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1017);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-00-16",
+        uuid,
+        [user_message("bounded context")],
+    );
+    append_items(
+        path.as_path(),
+        [user_message(
+            &"x".repeat(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES + 1),
+        )],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let plain_error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized paginated record must fail closed");
+    assert!(
+        plain_error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+
+    let input = std::fs::File::open(path.as_path()).expect("open plain rollout");
+    let output =
+        std::fs::File::create(path.with_extension("jsonl.zst")).expect("create compressed rollout");
+    zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+    std::fs::remove_file(path.as_path()).expect("remove plain rollout");
+
+    let compressed_error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized compressed paginated record must fail closed");
+    assert!(
+        compressed_error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+}
+
+#[tokio::test]
+async fn normalizes_legacy_ghost_snapshots_during_reverse_scan() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1014);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-13",
+        uuid,
+        [
+            turn_started("turn-1"),
+            legacy_user_message("older turn"),
+            turn_context(home.path(), "turn-1"),
+            legacy_compacted("older checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+            turn_started("turn-2"),
+            legacy_user_message("latest turn"),
+            turn_context(home.path(), "turn-2"),
+        ],
+    );
+    let RolloutItem::ResponseItem(retained_history) = user_message("retained history") else {
+        unreachable!("user_message returns a response item");
+    };
+    let checkpoint = RolloutLine {
+        timestamp: "2025-01-03T13:00:01Z".to_string(),
+        ordinal: None,
+        item: legacy_compacted("latest checkpoint", Some(vec![retained_history.item])),
+    };
+    let mut checkpoint = serde_json::to_value(checkpoint).expect("serialize checkpoint");
+    checkpoint["payload"]["replacement_history"]
+        .as_array_mut()
+        .expect("replacement history")
+        .push(serde_json::json!({"type": "ghost_snapshot"}));
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path.as_path())
+        .expect("open session file");
+    writeln!(file, "{checkpoint}").expect("append legacy checkpoint");
+    drop(file);
+    append_items(path.as_path(), [turn_complete("turn-2")]);
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load legacy model context");
+
+    let latest_checkpoint = context
+        .items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) if compacted.message == "latest checkpoint" => {
+                Some(compacted)
+            }
+            _ => None,
+        })
+        .expect("latest checkpoint");
+    assert_eq!(latest_checkpoint.window_number, Some(2));
+    assert_eq!(
+        latest_checkpoint.replacement_history.as_ref().map(Vec::len),
+        Some(1)
+    );
+    assert!(!context.items.iter().any(|item| {
+        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "older checkpoint")
+    }));
+}
+
+#[tokio::test]
+async fn paginated_checkpoint_without_window_number_falls_back_to_full_history() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1012);
+    let path = write_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-00-11",
+        uuid,
+        [
+            turn_started("turn-1"),
+            user_message("turn"),
+            completed_user_message("turn-1", "turn"),
+            turn_context(home.path(), "turn-1"),
+            legacy_compacted("checkpoint without window number", Some(Vec::new())),
+            turn_complete("turn-1"),
+        ],
+    );
+
+    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+}
+
+#[tokio::test]
+async fn legacy_rollback_after_checkpoint_falls_back_to_full_history() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1010);
+    let path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-09",
+        uuid,
+        [
+            turn_started("turn-1"),
+            legacy_user_message("turn"),
+            turn_context(home.path(), "turn-1"),
+            legacy_compacted("checkpoint", Some(Vec::new())),
+            turn_complete("turn-1"),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ],
+    );
+
+    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+}
+
+#[tokio::test]
 async fn fork_context_excludes_items_after_frozen_cutoff() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1007);
@@ -94,7 +655,12 @@ async fn fork_context_excludes_items_after_frozen_cutoff() {
     );
     let history_base =
         history_position(path.as_path(), thread_id, /*end_ordinal_exclusive*/ 3);
-    append_items(path.as_path(), [user_message("later message")]);
+    append_items(
+        path.as_path(),
+        [user_message(
+            &"x".repeat(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES + 1),
+        )],
+    );
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let lineage = store
         .resolve_rollout_lineage(thread_id)
@@ -429,6 +995,19 @@ fn write_paginated_rollout<const N: usize>(
     path
 }
 
+fn write_legacy_rollout<const N: usize>(
+    home: &Path,
+    timestamp: &str,
+    uuid: Uuid,
+    items: [RolloutItem; N],
+) -> PathBuf {
+    let path =
+        write_session_file_with_history_mode(home, timestamp, uuid, ThreadHistoryMode::Legacy)
+            .expect("write session file");
+    append_items(path.as_path(), items);
+    path
+}
+
 fn write_ordinaled_paginated_rollout<const N: usize>(
     home: &Path,
     timestamp: &str,
@@ -513,7 +1092,7 @@ async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
         .await
         .expect("scan model context")
         .items;
-    let full_items = read_thread::load_history_items(path)
+    let full_items = super::super::read_thread::load_history_items(path)
         .await
         .expect("load full history");
 
@@ -578,6 +1157,13 @@ fn user_message(message: &str) -> RolloutItem {
         }
         .into(),
     )
+}
+
+fn legacy_user_message(message: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        message: message.to_string(),
+        ..Default::default()
+    }))
 }
 
 fn contextual_user_message() -> RolloutItem {
@@ -655,4 +1241,12 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
         previous_window_id: None,
         window_id: None,
     })
+}
+
+fn legacy_compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
+    let RolloutItem::Compacted(mut compacted) = compacted(message, replacement_history) else {
+        unreachable!("compacted helper always returns a compacted item");
+    };
+    compacted.window_number = None;
+    RolloutItem::Compacted(compacted)
 }

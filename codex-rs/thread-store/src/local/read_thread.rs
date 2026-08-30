@@ -5,6 +5,8 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::find_thread_name_by_id;
 use codex_rollout::read_session_meta_line;
@@ -19,6 +21,7 @@ use super::helpers::rollout_path_is_archived;
 use super::helpers::set_thread_name;
 use super::helpers::sqlite_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
+use super::rollout_lineage::RolloutLineage;
 use super::thread_rollout_resolver;
 use crate::ReadThreadParams;
 use crate::StoredThread;
@@ -45,6 +48,7 @@ pub(super) async fn read_thread(
     {
         let metadata_sandbox_policy = metadata.sandbox_policy.clone();
         let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
+        let sqlite_history_mode = thread.history_mode;
         // Paginated history may contain only a suffix, so its display metadata lives in SQLite.
         // Legacy display metadata remains rollout-derived.
         if thread.history_mode == ThreadHistoryMode::Legacy
@@ -71,10 +75,18 @@ pub(super) async fn read_thread(
                 &metadata_sandbox_policy,
                 rollout_thread.cwd.as_path(),
             );
+            rollout_thread.history_mode = sqlite_history_mode;
             thread = rollout_thread;
         }
         reject_paginated_history(&thread, params.include_history)?;
-        attach_history_if_requested(&mut thread, params.include_history).await?;
+        attach_history_if_requested(
+            store,
+            &mut thread,
+            params.include_archived,
+            params.include_history,
+            None,
+        )
+        .await?;
         return Ok(thread);
     }
 
@@ -97,7 +109,14 @@ pub(super) async fn read_thread(
         });
     }
     reject_paginated_history(&thread, params.include_history)?;
-    attach_history_if_requested(&mut thread, params.include_history).await?;
+    attach_history_if_requested(
+        store,
+        &mut thread,
+        params.include_archived,
+        params.include_history,
+        None,
+    )
+    .await?;
     Ok(thread)
 }
 
@@ -132,7 +151,7 @@ pub(super) async fn read_thread_by_rollout_path(
     if let Some(mut metadata) = read_sqlite_metadata(store, thread.thread_id).await {
         if thread.history_mode == ThreadHistoryMode::Paginated {
             // Paginated display metadata lives in SQLite because rollout history may be partial.
-            metadata.rollout_path = path;
+            metadata.rollout_path = path.clone();
             metadata.archived_at = thread.archived_at;
             thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
         } else {
@@ -169,7 +188,14 @@ pub(super) async fn read_thread_by_rollout_path(
         }
     }
     reject_paginated_history(&thread, include_history)?;
-    attach_history_if_requested(&mut thread, include_history).await?;
+    attach_history_if_requested(
+        store,
+        &mut thread,
+        include_archived,
+        include_history,
+        Some(path.as_path()),
+    )
+    .await?;
     Ok(thread)
 }
 
@@ -222,19 +248,23 @@ async fn resolve_requested_rollout_path(
 }
 
 async fn attach_history_if_requested(
+    store: &LocalThreadStore,
     thread: &mut StoredThread,
+    include_archived: bool,
     include_history: bool,
+    requested_path: Option<&std::path::Path>,
 ) -> ThreadStoreResult<()> {
     if !include_history {
         return Ok(());
     }
     let thread_id = thread.thread_id;
-    let Some(path) = thread.rollout_path.clone() else {
+    if thread.rollout_path.is_none() {
         return Err(ThreadStoreError::Internal {
             message: format!("failed to load thread history for thread {thread_id}"),
         });
-    };
-    let items = load_history_items(&path).await?;
+    }
+    let items =
+        load_history_items_for_thread(store, thread_id, include_archived, requested_path).await?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())
 }
@@ -288,6 +318,236 @@ pub(super) async fn load_history_items(
     Ok(items)
 }
 
+/// Load a child's complete logical legacy replay. Roots preserve their physical compatibility
+/// path; reference children follow validated lineage and retain each parent only through its
+/// frozen byte cutoff before adding the child's own delta.
+async fn load_history_items_for_thread(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    include_archived: bool,
+    requested_path: Option<&std::path::Path>,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    // Reserve the source before resolving its physical representation or reading metadata. Keep
+    // both guards alive through the complete replay so archive/delete/compression cannot rename or
+    // remove the source while the lineage is being consumed.
+    let source_guards = store.acquire_fork_source_guards(thread_id).await?;
+    let super::ForkSourceGuards {
+        lifecycle: _source_lifecycle_guard,
+        filesystem: source_filesystem_guard,
+    } = source_guards;
+    let (path, resolved_rollout_id) = if let Some(requested_path) = requested_path {
+        // The caller may have selected a historical immutable rollout. Re-resolve that exact
+        // representation only after the source guards are held; a logical current-rollout lookup
+        // here would silently switch a path-pinned read to a later revert.
+        let path = codex_rollout::existing_rollout_path(requested_path)
+            .await
+            .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "requested rollout path no longer exists: {}",
+                    requested_path.display()
+                ),
+            })?;
+        (path, None)
+    } else {
+        let resolved = (if include_archived {
+            thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
+        } else {
+            thread_rollout_resolver::resolve_current(store, thread_id).await?
+        })
+        .ok_or_else(|| ThreadStoreError::InvalidRequest {
+            message: format!("no rollout found for thread id {thread_id}"),
+        })?;
+        (resolved.path, Some(resolved.rollout_id))
+    };
+    let requested_meta = read_session_meta_line(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {err}", path.display()),
+        })?;
+    let source_rollout_id = match resolved_rollout_id {
+        Some(rollout_id) => rollout_id,
+        None => thread_rollout_resolver::rollout_id_from_path_or_legacy_thread_id(
+            path.as_path(),
+            thread_id,
+            requested_meta.meta.history_mode,
+        )?,
+    };
+    if requested_meta.meta.id != thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!("rollout metadata does not belong to thread {thread_id}"),
+        });
+    }
+    if requested_meta.meta.history_mode != ThreadHistoryMode::Legacy
+        || requested_meta.meta.history_base.is_none()
+    {
+        return load_history_items(path.as_path()).await;
+    }
+
+    let (lineage, ancestor_filesystem_guards) = store
+        .resolve_rollout_lineage_for_reference_from_source_locked_with_source_guard(
+            thread_id,
+            source_rollout_id,
+            path,
+            source_filesystem_guard.clone(),
+        )
+        .await?;
+    let items = load_legacy_lineage_history(lineage, requested_meta).await?;
+    drop(ancestor_filesystem_guards);
+    Ok(items)
+}
+
+async fn load_legacy_lineage_history(
+    lineage: RolloutLineage,
+    requested_meta: SessionMetaLine,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    if lineage.history_mode() != ThreadHistoryMode::Legacy {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "invalid rollout history lineage for {}: source rollout is not legacy",
+                requested_meta.meta.id
+            ),
+        });
+    }
+    let last_segment_index = lineage.segments().len().saturating_sub(1);
+    let mut items = vec![RolloutItem::SessionMeta(requested_meta)];
+    let mut child_head_seen = false;
+    for (segment_index, segment) in lineage.segments().iter().enumerate() {
+        read_legacy_segment_prefix(
+            segment.rollout_path.as_path(),
+            segment.end.map(|end| end.end_byte_offset),
+            segment_index,
+            last_segment_index,
+            &mut child_head_seen,
+            &mut |item| {
+                items.push(item);
+                true
+            },
+        )
+        .await?;
+    }
+    Ok(items)
+}
+
+/// Decode only complete newline-delimited records from a lineage segment. The lineage resolver
+/// validates every requested parent cutoff first; the child's unfinished append tail remains
+/// excluded. Ancestor SessionMeta records are not replayed because the child header is canonical.
+async fn read_legacy_segment_prefix(
+    path: &std::path::Path,
+    end_byte_offset: Option<u64>,
+    segment_index: usize,
+    last_segment_index: usize,
+    child_head_seen: &mut bool,
+    on_item: &mut impl FnMut(RolloutItem) -> bool,
+) -> ThreadStoreResult<bool> {
+    // Keep legacy logical replay bounded for both plain and zstd rollouts. The limit matches the
+    // migration reader's established record bound; oversized records fail closed instead of
+    // allocating an unbounded Vec or silently dropping a valid record.
+    const LEGACY_READ_PAYLOAD_LIMIT: usize = 16 * 1024 * 1024;
+    // RawRolloutLineReader counts the terminating LF in max_bytes.
+    const LEGACY_READ_LINE_LIMIT: usize = LEGACY_READ_PAYLOAD_LIMIT + 1;
+    let mut reader = codex_rollout::open_rollout_raw_line_reader(path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to open rollout {}: {err}", path.display()),
+        })?;
+    let mut offset = 0_u64;
+    loop {
+        if end_byte_offset.is_some_and(|end| offset == end) {
+            // The cutoff is a complete LF boundary. Do not inspect later physical records, which
+            // may have been appended to the ancestor after the child forked.
+            break;
+        }
+        if end_byte_offset.is_some_and(|end| offset > end) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "legacy history cutoff is behind decoded offset {offset} in {}",
+                    path.display()
+                ),
+            });
+        }
+        let Some(record) = reader
+            .next_raw_line_limited(LEGACY_READ_LINE_LIMIT)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to read rollout {}: {err}", path.display()),
+            })?
+        else {
+            break;
+        };
+        let (raw_line, byte_count, terminated) = match record {
+            codex_rollout::RawRolloutLine::Complete(line) => {
+                let byte_count = line.len() as u64;
+                let terminated = line.ends_with(b"\n");
+                (Some(line), byte_count, terminated)
+            }
+            codex_rollout::RawRolloutLine::Oversized {
+                byte_count,
+                terminated,
+            } => {
+                let next_offset = offset.saturating_add(byte_count as u64);
+                if end_byte_offset.is_some_and(|end| next_offset > end) {
+                    return Err(ThreadStoreError::InvalidRequest {
+                        message: format!(
+                            "legacy history cutoff exceeds rollout {} at byte {next_offset}",
+                            path.display()
+                        ),
+                    });
+                }
+                if !terminated {
+                    // A physical EOF partial record is not part of the logical replay. It is
+                    // deliberately excluded without allocating the remainder of the line.
+                    return Ok(true);
+                }
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "legacy rollout payload exceeds {LEGACY_READ_PAYLOAD_LIMIT} bytes: {}",
+                        path.display()
+                    ),
+                });
+            }
+        };
+        let next_offset = offset.saturating_add(byte_count);
+        if end_byte_offset.is_some_and(|end| next_offset > end) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "legacy history cutoff exceeds rollout {} at byte {next_offset}",
+                    path.display()
+                ),
+            });
+        }
+        offset = next_offset;
+        if !terminated {
+            break;
+        }
+        let Some(raw_line) = raw_line else {
+            break;
+        };
+        let mut value = match serde_json::from_slice::<serde_json::Value>(&raw_line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if codex_rollout::strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        let Ok(line) = serde_json::from_value::<RolloutLine>(value) else {
+            continue;
+        };
+        if matches!(&line.item, RolloutItem::SessionMeta(_)) {
+            if segment_index != last_segment_index {
+                continue;
+            }
+            if !*child_head_seen {
+                *child_head_seen = true;
+                continue;
+            }
+        }
+        if !on_item(line.item) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 async fn read_sqlite_metadata(
     store: &LocalThreadStore,
     thread_id: codex_protocol::ThreadId,
@@ -331,10 +591,9 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
     };
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
     let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
-    let history_mode = session_meta
-        .as_ref()
-        .map(|meta| meta.history_mode)
-        .unwrap_or(metadata.history_mode);
+    // SQLite is the public readiness authority for a migration. The physical
+    // rollout can be paginated before the migration has safely published it.
+    let history_mode = metadata.history_mode;
     let name = thread_name_from_metadata(store, &metadata, history_mode).await;
     let mut thread = stored_thread_from_state_metadata(store, metadata, parent_thread_id);
     thread.forked_from_id = forked_from_id;
@@ -781,6 +1040,311 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_thread_replays_compressed_legacy_reference_child_and_ancestor() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+        let maintenance_store = LocalThreadStore::new(config, /*state_db*/ None);
+        let parent_uuid = Uuid::from_u128(213);
+        let child_uuid = Uuid::from_u128(214);
+        let parent_path = write_session_file(home.path(), "2025-01-03T12-00-00", parent_uuid)
+            .expect("parent session file");
+        let parent_bytes = std::fs::read(&parent_path).expect("read parent");
+        let parent_cutoff = parent_bytes.len();
+        let parent_suffix = serde_json::json!({
+            "timestamp": "2025-01-03T12-00-00",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "post-cutoff-secret"},
+        });
+        let mut parent_with_suffix = parent_bytes.clone();
+        parent_with_suffix.extend_from_slice(parent_suffix.to_string().as_bytes());
+        parent_with_suffix.push(b'\n');
+        let parent_compressed = parent_path.with_extension("jsonl.zst");
+        std::fs::write(
+            &parent_compressed,
+            zstd::stream::encode_all(parent_with_suffix.as_slice(), 3).expect("compress parent"),
+        )
+        .expect("write compressed parent");
+        std::fs::remove_file(&parent_path).expect("remove plain parent");
+
+        let child_path = write_session_file(home.path(), "2025-01-03T12-01-00", child_uuid)
+            .expect("child session file");
+        let child_text = std::fs::read_to_string(&child_path).expect("read child");
+        let (child_meta, child_delta) = child_text.split_once('\n').expect("child metadata line");
+        let mut child_meta: serde_json::Value =
+            serde_json::from_str(child_meta).expect("parse child metadata");
+        child_meta["payload"]["history_base"] = serde_json::json!({
+            "thread_id": parent_uuid,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": parent_cutoff,
+        });
+        let child_bytes = format!("{child_meta}\n{child_delta}")
+            .replace("Hello from user", "child compressed delta");
+        std::fs::write(&child_path, child_bytes.as_bytes()).expect("rewrite child metadata");
+        let child_compressed = child_path.with_extension("jsonl.zst");
+        std::fs::write(
+            &child_compressed,
+            zstd::stream::encode_all(child_bytes.as_bytes(), 3).expect("compress child"),
+        )
+        .expect("write compressed child");
+        std::fs::remove_file(&child_path).expect("remove plain child");
+
+        let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id: child_id,
+                include_archived: true,
+                include_history: true,
+            })
+            .await
+            .expect("read compressed reference child");
+        let history = thread.history.expect("logical history");
+        let serialized = serde_json::to_string(&history.items).expect("serialize history");
+        assert!(serialized.contains("Hello from user"));
+        assert!(serialized.contains("child"));
+        assert!(!serialized.contains("post-cutoff-secret"));
+
+        // Keep the source and ancestor guards alive across the complete logical read. The
+        // filesystem lock probe below is the same lock archive/delete use for representation
+        // transitions, so it must still conflict before these locals are dropped.
+        let source_guards = store
+            .acquire_fork_source_guards(child_id)
+            .await
+            .expect("acquire source guards");
+        let crate::local::ForkSourceGuards {
+            lifecycle: _source_lifecycle_guard,
+            filesystem: source_filesystem_guard,
+        } = source_guards;
+        let requested_meta = codex_rollout::read_session_meta_line(&child_compressed)
+            .await
+            .expect("read child metadata");
+        let (lineage, ancestor_filesystem_guards) = store
+            .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+                child_id,
+                source_filesystem_guard.clone(),
+            )
+            .await
+            .expect("resolve guarded lineage");
+        let parent_id = ThreadId::from_string(&parent_uuid.to_string()).expect("parent id");
+        let items = load_legacy_lineage_history(lineage, requested_meta)
+            .await
+            .expect("read guarded lineage");
+        let lock_result = maintenance_store.writer_lock_coordinator.acquire(parent_id);
+        assert!(matches!(
+            lock_result,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        drop(ancestor_filesystem_guards);
+        assert!(
+            serde_json::to_string(&items)
+                .expect("serialize guarded history")
+                .contains("Hello from user")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_thread_by_rollout_path_replays_the_requested_legacy_reference_after_revert() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let parent_uuid = Uuid::from_u128(231);
+        let logical_child_uuid = Uuid::from_u128(232);
+        let historical_rollout_uuid = Uuid::from_u128(233);
+        let replacement_rollout_uuid = Uuid::from_u128(234);
+        let parent_path = write_session_file(home.path(), "2025-01-03T12-00-00", parent_uuid)
+            .expect("parent session file");
+        let parent_cutoff = std::fs::metadata(&parent_path)
+            .expect("parent metadata")
+            .len();
+
+        let historical_path =
+            write_session_file(home.path(), "2025-01-03T12-01-00", historical_rollout_uuid)
+                .expect("historical child session file");
+        let historical_text = std::fs::read_to_string(&historical_path).expect("read child");
+        let (historical_meta, historical_delta) = historical_text
+            .split_once('\n')
+            .expect("child metadata line");
+        let mut historical_meta: serde_json::Value =
+            serde_json::from_str(historical_meta).expect("parse child metadata");
+        historical_meta["payload"]["id"] = serde_json::json!(logical_child_uuid);
+        historical_meta["payload"]["session_id"] = serde_json::json!(logical_child_uuid);
+        historical_meta["payload"]["history_base"] = serde_json::json!({
+            "thread_id": parent_uuid,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": parent_cutoff,
+        });
+        std::fs::write(
+            &historical_path,
+            format!(
+                "{}\n{}",
+                historical_meta,
+                historical_delta.replace("Hello from user", "path-pinned legacy delta")
+            ),
+        )
+        .expect("rewrite historical child");
+        let historical_path = historical_path.with_file_name(format!(
+            "rollout-2025-01-03T12-01-00-{logical_child_uuid}_{historical_rollout_uuid}.jsonl"
+        ));
+        std::fs::rename(
+            home.path().join(format!(
+                "sessions/2025/01/03/rollout-2025-01-03T12-01-00-{historical_rollout_uuid}.jsonl"
+            )),
+            &historical_path,
+        )
+        .expect("rename historical child");
+
+        let replacement_path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T12-02-00",
+            replacement_rollout_uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("replacement session file");
+        let replacement_text =
+            std::fs::read_to_string(&replacement_path).expect("read replacement");
+        let mut replacement_meta: serde_json::Value = serde_json::from_str(
+            replacement_text
+                .strip_suffix('\n')
+                .expect("replacement metadata newline"),
+        )
+        .expect("parse replacement metadata");
+        replacement_meta["payload"]["id"] = serde_json::json!(logical_child_uuid);
+        replacement_meta["payload"]["session_id"] = serde_json::json!(logical_child_uuid);
+        let replacement_marker = serde_json::json!({
+            "timestamp": "2025-01-03T12:02:00",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "current-only replacement delta"},
+        });
+        std::fs::write(
+            &replacement_path,
+            format!("{replacement_meta}\n{replacement_marker}\n"),
+        )
+        .expect("rewrite replacement");
+        let replacement_path = replacement_path.with_file_name(format!(
+            "rollout-2025-01-03T12-02-00-{logical_child_uuid}_{replacement_rollout_uuid}.jsonl"
+        ));
+        std::fs::rename(
+            home.path().join(format!(
+                "sessions/2025/01/03/rollout-2025-01-03T12-02-00-{replacement_rollout_uuid}.jsonl"
+            )),
+            &replacement_path,
+        )
+        .expect("rename replacement");
+
+        let thread_id = ThreadId::from_string(&logical_child_uuid.to_string()).expect("thread id");
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("initialize state database");
+        let mut builder = ThreadMetadataBuilder::new(
+            thread_id,
+            replacement_path.clone(),
+            Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.history_mode = ThreadHistoryMode::Paginated;
+        let metadata = builder.build(config.default_model_provider_id.as_str());
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("select replacement rollout");
+        let store = LocalThreadStore::new(config, Some(runtime));
+
+        let error = store
+            .prepare_fork(crate::PrepareForkParams {
+                thread_id,
+                boundary: crate::ForkBoundary::Latest,
+                legacy_source_rollout_path: Some(replacement_path),
+            })
+            .await
+            .expect_err("reject paginated source passed to legacy path-pinned fork");
+        assert!(matches!(
+            error,
+            crate::ThreadStoreError::InvalidRequest { message }
+                if message == "path-pinned legacy fork source must use legacy history"
+        ));
+
+        let prepared = store
+            .prepare_fork(crate::PrepareForkParams {
+                thread_id,
+                boundary: crate::ForkBoundary::Latest,
+                legacy_source_rollout_path: Some(historical_path.clone()),
+            })
+            .await
+            .expect("prepare fork from requested historical rollout");
+        let source_history_base = prepared.history_base.expect("source history base");
+        assert_eq!(
+            source_history_base.thread_id,
+            ThreadId::from_string(&historical_rollout_uuid.to_string())
+                .expect("historical rollout id")
+        );
+        assert_ne!(
+            source_history_base.thread_id,
+            ThreadId::from_string(&replacement_rollout_uuid.to_string())
+                .expect("replacement rollout id")
+        );
+        let prepared_history =
+            serde_json::to_string(prepared.model_context.as_ref()).expect("serialize fork history");
+        assert!(prepared_history.contains("Hello from user"));
+        assert!(prepared_history.contains("path-pinned legacy delta"));
+        assert!(!prepared_history.contains("current-only replacement delta"));
+        drop(prepared);
+
+        let thread = store
+            .read_thread_by_rollout_path(
+                historical_path,
+                /*include_archived*/ true,
+                /*include_history*/ true,
+            )
+            .await
+            .expect("read requested historical rollout");
+        let history = serde_json::to_string(&thread.history.expect("logical history").items)
+            .expect("serialize history");
+        assert!(history.contains("Hello from user"));
+        assert!(history.contains("path-pinned legacy delta"));
+        assert!(!history.contains(&replacement_rollout_uuid.to_string()));
+    }
+
+    #[tokio::test]
+    async fn plain_legacy_ancestor_stops_before_post_cutoff_append() {
+        let home = TempDir::new().expect("temp dir");
+        let ancestor_uuid = Uuid::from_u128(215);
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", ancestor_uuid)
+            .expect("ancestor session file");
+        let cutoff = std::fs::metadata(&path).expect("ancestor metadata").len();
+        let suffix = serde_json::json!({
+            "timestamp": "2025-01-03T12-00-00",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "post-cutoff-secret"},
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open ancestor for append");
+        writeln!(file, "{suffix}").expect("append ancestor suffix");
+
+        let mut items = Vec::new();
+        let mut child_head_seen = false;
+        read_legacy_segment_prefix(
+            &path,
+            Some(cutoff),
+            0,
+            0,
+            &mut child_head_seen,
+            &mut |item| {
+                items.push(item);
+                true
+            },
+        )
+        .await
+        .expect("read plain ancestor cutoff");
+        let serialized = serde_json::to_string(&items).expect("serialize ancestor history");
+        assert!(serialized.contains("Hello from user"));
+        assert!(!serialized.contains("post-cutoff-secret"));
+    }
+
+    #[tokio::test]
     async fn read_thread_applies_sqlite_thread_name() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
@@ -913,6 +1477,63 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_thread_keeps_sqlite_history_mode_while_loading_legacy_display_metadata() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(229);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let rollout_path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T12-00-00",
+            uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("session file");
+        codex_rollout::append_rollout_item_to_path(
+            &rollout_path,
+            &RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                    text: "Rollout user message".to_string(),
+                    text_elements: Vec::new(),
+                }])),
+                started_at_ms: Some(0),
+                completed_at_ms: 0,
+            })),
+        )
+        .await
+        .expect("append rollout user message");
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        let mut builder =
+            ThreadMetadataBuilder::new(thread_id, rollout_path, Utc::now(), SessionSource::Cli);
+        builder.history_mode = ThreadHistoryMode::Legacy;
+        builder.model_provider = Some(config.default_model_provider_id.clone());
+        runtime
+            .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should succeed");
+
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read thread");
+
+        assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
+        assert_eq!(thread.preview, "Rollout user message");
     }
 
     #[tokio::test]

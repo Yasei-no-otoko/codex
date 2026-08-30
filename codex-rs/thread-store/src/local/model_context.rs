@@ -1,4 +1,6 @@
 use std::io;
+use std::path::Path;
+use std::path::PathBuf;
 
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMetaLine;
@@ -10,8 +12,12 @@ use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use codex_rollout::ScanOutcome;
 
+const MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES: usize =
+    codex_rollout::MAX_ROLLOUT_RECORD_PAYLOAD_BYTES;
+const OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE: &str =
+    "model context contains an oversized JSONL record";
+
 use super::LocalThreadStore;
-use super::read_thread;
 use super::rollout_lineage::RolloutLineage;
 use super::thread_rollout_resolver;
 use crate::LoadThreadHistoryParams;
@@ -23,31 +29,97 @@ use crate::ThreadStoreResult;
 #[path = "model_context_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
+#[cfg(test)]
+use tokio::sync::oneshot;
+
+#[cfg(test)]
+struct SourceGuardPause {
+    acquired: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static SOURCE_GUARD_PAUSES: OnceLock<Mutex<HashMap<codex_protocol::ThreadId, SourceGuardPause>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn source_guard_pauses() -> &'static Mutex<HashMap<codex_protocol::ThreadId, SourceGuardPause>> {
+    SOURCE_GUARD_PAUSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn pause_after_source_guards(
+    thread_id: codex_protocol::ThreadId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (acquired_sender, acquired) = oneshot::channel();
+    let (resume, resume_receiver) = oneshot::channel();
+    let previous = source_guard_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            thread_id,
+            SourceGuardPause {
+                acquired: acquired_sender,
+                resume: resume_receiver,
+            },
+        );
+    assert!(previous.is_none(), "source-guard pause already installed");
+    (acquired, resume)
+}
+
+#[cfg(test)]
+async fn pause_after_source_guards_if_requested(thread_id: codex_protocol::ThreadId) {
+    let pause = source_guard_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&thread_id);
+    if let Some(SourceGuardPause { acquired, resume }) = pause {
+        let _ = acquired.send(());
+        let _ = resume.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn pause_after_source_guards_if_requested(_thread_id: codex_protocol::ThreadId) {}
+
 /// Loads rollout items needed to reconstruct the latest model-visible context.
 ///
-/// Paginated JSONL rollouts use a reverse scan. When it finds both a usable replacement-
-/// history checkpoint and the completed user-turn context needed for resume metadata, the returned
-/// replay starts with the canonical `SessionMeta` followed by that newest suffix. When no
-/// bounded cutoff is available, the scan continues to the beginning and returns the complete
-/// replay it already accumulated.
+/// Plain Legacy JSONL rollouts use a reverse scan. When it finds both a usable replacement-history
+/// checkpoint and the completed user-turn context needed for resume metadata, the returned replay
+/// starts with the canonical head `SessionMeta` followed by that newest suffix. When no bounded
+/// cutoff is available, the scan continues to the beginning and returns the complete replay it
+/// already accumulated.
 ///
-/// Compressed segments are decoded before applying their original JSONL offsets. Legacy rollouts
-/// keep the existing full-history path.
+/// Both plain and compressed Legacy rollouts use the same bounded, ghost-normalizing reverse
+/// scan. Paginated rollouts retain their typed lineage-aware reverse scan.
 pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
 ) -> ThreadStoreResult<StoredModelContext> {
+    // Retain the source lifecycle and filesystem leases before resolving its current
+    // representation. Reference lineages add matching stable filesystem guards for every
+    // ancestor, so archive/delete/compression cannot race the complete context scan.
+    let source_guards = store.acquire_fork_source_guards(params.thread_id).await?;
+    let super::ForkSourceGuards {
+        lifecycle: _source_lifecycle_guard,
+        filesystem: source_filesystem_guard,
+    } = source_guards;
     let resolved = if params.include_archived {
         thread_rollout_resolver::resolve_current_including_archived(store, params.thread_id).await?
     } else {
         thread_rollout_resolver::resolve_current(store, params.thread_id).await?
     };
-    let path =
-        resolved
-            .map(|resolved| resolved.path)
-            .ok_or_else(|| ThreadStoreError::InvalidRequest {
-                message: format!("no rollout found for thread id {}", params.thread_id),
-            })?;
+    let resolved = resolved.ok_or_else(|| ThreadStoreError::InvalidRequest {
+        message: format!("no rollout found for thread id {}", params.thread_id),
+    })?;
+    let source_rollout_id = resolved.rollout_id;
+    let path = resolved.path;
 
     let session_meta = codex_rollout::read_session_meta_line(path.as_path())
         .await
@@ -65,17 +137,84 @@ pub(super) async fn load_latest_model_context(
         });
     }
 
-    let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated) {
-        let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
-        scan_model_context_from_lineage(lineage, session_meta).await?
-    } else {
-        read_thread::load_history_items(path.as_path()).await?
+    let items = match session_meta.meta.history_mode {
+        // A reference child inherits an immutable prefix. Its physical suffix alone is not its
+        // model-visible context, including when one or more segments currently have zstd
+        // siblings.
+        ThreadHistoryMode::Legacy if session_meta.meta.history_base.is_some() => {
+            let (lineage, _ancestor_filesystem_guards) = store
+                .resolve_rollout_lineage_for_reference_attachment_from_source_locked_with_source_guard(
+                    params.thread_id,
+                    source_rollout_id,
+                    path.clone(),
+                    source_filesystem_guard.clone(),
+                )
+                .await?;
+            pause_after_source_guards_if_requested(params.thread_id).await;
+            scan_model_context_from_lineage(lineage, session_meta).await?
+        }
+        ThreadHistoryMode::Legacy => {
+            pause_after_source_guards_if_requested(params.thread_id).await;
+            scan_model_context_from_rollout(path, session_meta, None).await?
+        }
+        ThreadHistoryMode::Paginated => {
+            let (lineage, _ancestor_filesystem_guards) = store
+                .resolve_rollout_lineage_for_reference_attachment_from_source_locked_with_source_guard(
+                    params.thread_id,
+                    source_rollout_id,
+                    path.clone(),
+                    source_filesystem_guard.clone(),
+                )
+                .await?;
+            pause_after_source_guards_if_requested(params.thread_id).await;
+            scan_model_context_from_lineage(lineage, session_meta).await?
+        }
     };
 
     Ok(StoredModelContext {
         thread_id: params.thread_id,
         items,
     })
+}
+
+async fn scan_model_context_from_rollout(
+    rollout_path: PathBuf,
+    session_meta: SessionMetaLine,
+    end_byte_offset: Option<u64>,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_model_context_from_rollout_blocking(
+            rollout_path.as_path(),
+            session_meta,
+            end_byte_offset,
+        )
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to join model context scan: {err}"),
+    })?;
+    match scan {
+        Ok(items) => Ok(items),
+        Err(err) => Err(ThreadStoreError::Internal {
+            message: format!("failed to scan legacy model context rollout: {err}"),
+        }),
+    }
+}
+
+/// Loads the frozen Legacy prefix selected by a complete JSONL-record cutoff.
+pub(super) async fn load_legacy_fork_context(
+    rollout_path: PathBuf,
+    end_byte_offset: u64,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
+    let session_meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to read session metadata {}: {err}",
+                rollout_path.display()
+            ),
+        })?;
+    scan_model_context_from_rollout(rollout_path, session_meta, Some(end_byte_offset)).await
 }
 
 /// Loads startup context from a fork's frozen inherited prefix.
@@ -130,14 +269,32 @@ fn scan_model_context_from_lineage_blocking(
     lineage: &RolloutLineage,
     session_meta: SessionMetaLine,
 ) -> io::Result<Vec<RolloutItem>> {
-    let mut scan = ModelContextScan::default();
+    let mut scan = ModelContextScan::new(lineage.history_mode());
+    if lineage.history_mode() == ThreadHistoryMode::Legacy {
+        for segment in lineage.segments().iter().rev() {
+            let complete = scan_model_context_segment(
+                &mut scan,
+                segment.rollout_path.as_path(),
+                segment.end.map(|end| end.end_byte_offset),
+            )?;
+            if complete {
+                break;
+            }
+        }
+        return Ok(finish_model_context_scan(scan, session_meta));
+    }
+
     'segments: for segment in lineage.segments().iter().rev() {
         let file = codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
         let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
             Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
             None => ReverseJsonlScanner::new(file)?,
-        };
+        }
+        .with_max_record_bytes(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES);
         while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
+            if scanner.skipped_oversized_record() {
+                return Err(oversized_model_context_record_error());
+            }
             let ScanOutcome::Parsed(line) = outcome else {
                 continue;
             };
@@ -151,12 +308,80 @@ fn scan_model_context_from_lineage_blocking(
                 ModelContextScanProgress::Complete => break 'segments,
             }
         }
+        if scanner.skipped_oversized_record() {
+            return Err(oversized_model_context_record_error());
+        }
     }
 
+    Ok(finish_model_context_scan(scan, session_meta))
+}
+
+fn scan_model_context_from_rollout_blocking(
+    rollout_path: &Path,
+    session_meta: SessionMetaLine,
+    end_byte_offset: Option<u64>,
+) -> io::Result<Vec<RolloutItem>> {
+    let mut scan = ModelContextScan::new(ThreadHistoryMode::Legacy);
+    scan_model_context_segment(&mut scan, rollout_path, end_byte_offset)?;
+
+    Ok(finish_model_context_scan(scan, session_meta))
+}
+
+fn scan_model_context_segment(
+    scan: &mut ModelContextScan,
+    rollout_path: &Path,
+    end_byte_offset: Option<u64>,
+) -> io::Result<bool> {
+    let file = codex_rollout::open_rollout_seekable_reader(rollout_path)?;
+    let mut scanner = match end_byte_offset {
+        Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
+        None => ReverseJsonlScanner::new(file)?,
+    }
+    .with_max_record_bytes(MAX_MODEL_CONTEXT_RECORD_PAYLOAD_BYTES);
+    while let Some(outcome) = scanner.scan_next::<serde_json::Value>()? {
+        if scanner.skipped_oversized_record() {
+            return Err(oversized_model_context_record_error());
+        }
+        let ScanOutcome::Parsed(mut value) = outcome else {
+            continue;
+        };
+        if codex_rollout::strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        let Ok(line) = serde_json::from_value::<RolloutLine>(value) else {
+            continue;
+        };
+        // Metadata updates can append SessionMeta records at the physical tail. Ignore every
+        // segment marker; the requested thread's canonical head metadata is injected after replay.
+        if matches!(&line.item, RolloutItem::SessionMeta(_)) {
+            continue;
+        }
+        match scan.push(line.item) {
+            ModelContextScanProgress::Continue => {}
+            ModelContextScanProgress::Complete => return Ok(true),
+        }
+    }
+    if scanner.skipped_oversized_record() {
+        return Err(oversized_model_context_record_error());
+    }
+    Ok(false)
+}
+
+fn oversized_model_context_record_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE,
+    )
+}
+
+fn finish_model_context_scan(
+    scan: ModelContextScan,
+    session_meta: SessionMetaLine,
+) -> Vec<RolloutItem> {
     let canonical_meta = session_meta.clone();
     let mut items = scan.finish(session_meta);
     if !matches!(items.first(), Some(RolloutItem::SessionMeta(_))) {
         items.insert(0, RolloutItem::SessionMeta(canonical_meta));
     }
-    Ok(items)
+    items
 }

@@ -84,6 +84,8 @@ use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
+use codex_thread_store::WriteReferenceLogicalAttachmentOutcome;
+use codex_thread_store::WriteReferenceLogicalAttachmentParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -825,6 +827,28 @@ impl ThreadManager {
         self.state.get_thread(thread_id).await
     }
 
+    /// Load the complete logical replay history for a persisted thread.
+    ///
+    /// Reference-backed threads are reconstructed through the thread store, so callers never
+    /// mistake a child's physical rollout suffix for its complete conversation history.
+    pub async fn read_stored_thread_history(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> CodexResult<Vec<RolloutItem>> {
+        self.state
+            .read_stored_thread_history(thread_id, include_archived)
+            .await
+    }
+
+    /// Writes a bounded, read-only logical history attachment for feedback upload.
+    pub async fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> CodexResult<WriteReferenceLogicalAttachmentOutcome> {
+        self.state.write_reference_logical_attachment(params).await
+    }
+
     /// Updates metadata for loaded and cold threads through one entrypoint.
     ///
     /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered
@@ -1510,6 +1534,78 @@ impl ThreadManagerState {
                     }
                 }
                 err => CodexErr::Fatal(format!("failed to read stored thread {thread_id}: {err}")),
+            })
+    }
+
+    /// Return complete logical history from persistence. Paginated storage exposes this through
+    /// its model-context loader, which resolves reference lineage rather than a child suffix.
+    pub(crate) async fn read_stored_thread_history(
+        &self,
+        thread_id: ThreadId,
+        include_archived: bool,
+    ) -> CodexResult<Vec<RolloutItem>> {
+        match self
+            .thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived,
+                include_history: true,
+            })
+            .await
+        {
+            Ok(stored_thread) => stored_thread
+                .history
+                .map(|history| history.items)
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "stored thread {thread_id} did not include persisted history"
+                    ))
+                }),
+            Err(ThreadStoreError::Unsupported {
+                operation: "paginated_threads",
+            }) => self
+                .thread_store
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived,
+                })
+                .await
+                .map(|context| context.items)
+                .map_err(|err| match err {
+                    ThreadStoreError::ThreadNotFound { thread_id } => {
+                        CodexErr::ThreadNotFound(thread_id)
+                    }
+                    ThreadStoreError::InvalidRequest { message } => {
+                        CodexErr::InvalidRequest(message)
+                    }
+                    err => CodexErr::Fatal(format!(
+                        "failed to load paginated model context for {thread_id}: {err}"
+                    )),
+                }),
+            Err(ThreadStoreError::ThreadNotFound { thread_id }) => {
+                Err(CodexErr::ThreadNotFound(thread_id))
+            }
+            Err(ThreadStoreError::InvalidRequest { message }) => Err(CodexErr::Fatal(format!(
+                "failed to read stored thread {thread_id}: invalid thread-store request: {message}"
+            ))),
+            Err(err) => Err(CodexErr::Fatal(format!(
+                "failed to read stored thread {thread_id}: {err}"
+            ))),
+        }
+    }
+
+    pub(crate) async fn write_reference_logical_attachment(
+        &self,
+        params: WriteReferenceLogicalAttachmentParams,
+    ) -> CodexResult<WriteReferenceLogicalAttachmentOutcome> {
+        let thread_id = params.thread_id;
+        self.thread_store
+            .write_reference_logical_attachment(params)
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "failed to write logical feedback history for {thread_id}: {err}"
+                ))
             })
     }
 
