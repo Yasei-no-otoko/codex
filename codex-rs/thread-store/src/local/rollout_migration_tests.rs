@@ -441,7 +441,7 @@ async fn assert_dry_run_rejects_oversized_rollout(
     assert_eq!(
         (
             outcome.thread_id,
-            &outcome.rollout_path,
+            outcome.rollout_path.as_path(),
             outcome.status,
             outcome.failure_reason,
             outcome.message.as_deref(),
