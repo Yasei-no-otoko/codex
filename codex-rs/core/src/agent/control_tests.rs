@@ -195,7 +195,8 @@ fn legacy_turn_complete(turn_id: &str) -> RolloutItem {
 fn legacy_compacted(message: &str, replacement_text: &str) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: message.to_string(),
-        replacement_history: Some(vec![user_text_message(replacement_text)]),
+        replacement_history: Some(vec![user_text_message(replacement_text).into()]),
+        mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
@@ -1223,16 +1224,16 @@ async fn spawn_agent_last_n_from_legacy_parent_keeps_turns_before_compaction() {
         .session
         .persist_rollout_items(&[
             legacy_turn_started("older-turn"),
-            RolloutItem::ResponseItem(user_text_message("first parent turn")),
+            RolloutItem::ResponseItem(user_text_message("first parent turn").into()),
             legacy_user_message_event("first parent turn"),
             RolloutItem::TurnContext(older_turn_context),
             legacy_compacted("checkpoint", "first turn summary"),
             legacy_turn_complete("older-turn"),
             legacy_turn_started(&latest_turn_id),
-            RolloutItem::ResponseItem(user_text_message("second parent turn")),
+            RolloutItem::ResponseItem(user_text_message("second parent turn").into()),
             legacy_user_message_event("second parent turn"),
             RolloutItem::TurnContext(latest_turn_context),
-            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
+            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id).into()),
             legacy_turn_complete(&latest_turn_id),
         ])
         .await;
@@ -1275,11 +1276,17 @@ async fn spawn_agent_last_n_from_legacy_parent_keeps_turns_before_compaction() {
     })
     .collect::<Vec<_>>();
     assert!(
-        history_contains_text(&response_items, "first parent turn"),
+        history_contains_text(
+            response_items.iter().map(|item| &item.item),
+            "first parent turn",
+        ),
         "legacy last-N fork should load turns that precede the latest compaction"
     );
     assert!(
-        history_contains_text(&response_items, "second parent turn"),
+        history_contains_text(
+            response_items.iter().map(|item| &item.item),
+            "second parent turn",
+        ),
         "legacy last-N fork should retain the newest requested turn"
     );
 }
