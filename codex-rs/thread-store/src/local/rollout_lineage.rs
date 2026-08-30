@@ -277,16 +277,25 @@ async fn validate_cutoff_bounds(
     if history_mode == ThreadHistoryMode::Legacy {
         let validation_path = path.clone();
         let complete_envelope = tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&validation_path)?;
-            let mut scanner = codex_rollout::ReverseJsonlScanner::new_at(file, end_byte_offset)?;
-            let Some(codex_rollout::ScanOutcome::Parsed(value)) =
-                scanner.scan_next::<serde_json::Value>()?
-            else {
+            let bytes = std::fs::read(&validation_path)?;
+            let end = usize::try_from(end_byte_offset)
+                .ok()
+                .filter(|end| *end <= bytes.len());
+            let Some(end) = end else {
                 return Ok::<_, std::io::Error>(false);
             };
-            Ok(scanner.last_record_end_offset() == Some(end_byte_offset)
-                && scanner.last_record_terminated_by_newline() == Some(true)
-                && value.get("timestamp").is_some_and(serde_json::Value::is_string)
+            if end == 0 || bytes[end - 1] != b'\n' {
+                return Ok(false);
+            }
+            let start = bytes[..end - 1]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes[start..end - 1])
+            else {
+                return Ok(false);
+            };
+            Ok(value.get("timestamp").is_some_and(serde_json::Value::is_string)
                 && value.get("type").is_some_and(serde_json::Value::is_string)
                 && value.get("payload").is_some_and(serde_json::Value::is_object))
         })

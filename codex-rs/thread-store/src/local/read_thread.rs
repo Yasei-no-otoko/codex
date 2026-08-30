@@ -2,11 +2,11 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::find_thread_name_by_id;
 use codex_rollout::read_session_meta_line;
@@ -80,7 +80,7 @@ pub(super) async fn read_thread(
             thread = rollout_thread;
         }
         reject_paginated_history(&thread, params.include_history)?;
-        attach_history_if_requested(&mut thread, params.include_history).await?;
+        attach_history_if_requested(store, &mut thread, params.include_history).await?;
         return Ok(thread);
     }
 
@@ -103,7 +103,7 @@ pub(super) async fn read_thread(
         });
     }
     reject_paginated_history(&thread, params.include_history)?;
-    attach_history_if_requested(&mut thread, params.include_history).await?;
+    attach_history_if_requested(store, &mut thread, params.include_history).await?;
     Ok(thread)
 }
 
@@ -175,7 +175,7 @@ pub(super) async fn read_thread_by_rollout_path(
         }
     }
     reject_paginated_history(&thread, include_history)?;
-    attach_history_if_requested(&mut thread, include_history).await?;
+    attach_history_if_requested(store, &mut thread, include_history).await?;
     Ok(thread)
 }
 
@@ -228,6 +228,7 @@ async fn resolve_requested_rollout_path(
 }
 
 async fn attach_history_if_requested(
+    store: &LocalThreadStore,
     thread: &mut StoredThread,
     include_history: bool,
 ) -> ThreadStoreResult<()> {

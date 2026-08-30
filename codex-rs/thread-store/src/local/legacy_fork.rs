@@ -2,8 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use codex_protocol::protocol::HistoryPosition;
-use codex_rollout::ReverseJsonlScanner;
-use codex_rollout::ScanOutcome;
 use serde::Deserialize;
 
 use super::LocalThreadStore;
@@ -89,34 +87,31 @@ async fn last_complete_rollout_envelope_offset(path: &Path) -> ThreadStoreResult
         .len();
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(path.as_path()).map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to open source rollout {}: {err}", path.display()),
+        let bytes = std::fs::read(path.as_path()).map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read source rollout {}: {err}", path.display()),
         })?;
-        let mut scanner = ReverseJsonlScanner::new_at(file, file_len).map_err(|err| {
-            ThreadStoreError::Internal {
-                message: format!("failed to scan source rollout {}: {err}", path.display()),
-            }
+        let capped_len = usize::try_from(file_len).map_err(|err| ThreadStoreError::Internal {
+            message: format!("invalid source rollout length {}: {err}", path.display()),
         })?;
-        loop {
-            match scanner
-                .scan_next::<RolloutEnvelopeBoundary>()
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to scan source rollout {}: {err}", path.display()),
-                })?
-            {
-                Some(ScanOutcome::Parsed(envelope))
-                    if scanner.last_record_terminated_by_newline() == Some(true) => {
-                        let _ = (envelope.timestamp, envelope.item_type, envelope.payload);
-                        return scanner.last_record_end_offset().ok_or_else(|| {
-                            ThreadStoreError::Internal {
-                                message: format!("source rollout scanner lost offset {}", path.display()),
-                            }
-                        });
-                    }
-                Some(ScanOutcome::Parsed(_)) | Some(ScanOutcome::Rejected(_)) => {}
-                None => return Ok(0),
-            }
+        let complete_end = bytes[..capped_len]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        if complete_end == 0 {
+            return Ok(0);
         }
+        let start = bytes[..complete_end.saturating_sub(1)]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let envelope = serde_json::from_slice::<RolloutEnvelopeBoundary>(&bytes[start..complete_end - 1])
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to parse source rollout envelope {}: {err}", path.display()),
+            })?;
+        let _ = (envelope.timestamp, envelope.item_type, envelope.payload);
+        u64::try_from(complete_end).map_err(|err| ThreadStoreError::Internal {
+            message: format!("source rollout cutoff overflow {}: {err}", path.display()),
+        })
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {

@@ -177,7 +177,7 @@ async fn normalizes_legacy_ghost_snapshots_during_reverse_scan() {
     let checkpoint = RolloutLine {
         timestamp: "2025-01-03T13:00:01Z".to_string(),
         ordinal: None,
-        item: legacy_compacted("latest checkpoint", Some(vec![retained_history])),
+        item: legacy_compacted("latest checkpoint", Some(vec![retained_history.item])),
     };
     let mut checkpoint = serde_json::to_value(checkpoint).expect("serialize checkpoint");
     checkpoint["payload"]["replacement_history"]
