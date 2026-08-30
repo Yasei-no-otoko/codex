@@ -113,3 +113,7 @@ async fn last_complete_rollout_envelope_offset(path: &Path) -> ThreadStoreResult
         message: format!("failed to join source rollout scan: {err}"),
     })?
 }
+
+#[cfg(test)]
+#[path = "legacy_fork_tests.rs"]
+mod tests;
