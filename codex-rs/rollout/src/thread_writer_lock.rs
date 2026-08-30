@@ -13,20 +13,26 @@ use std::sync::atomic::Ordering;
 use codex_protocol::ThreadId;
 use tracing::warn;
 
+/// Directory below Codex home containing cross-process rollout writer locks.
 pub const THREAD_WRITER_LOCK_DIR: &str = "thread-writer-locks";
+/// Short-lived mutex used when creating or removing a per-thread lock file.
 pub const THREAD_WRITER_COORDINATION_LOCK_FILE: &str = ".coordination.lock";
+/// Global barrier for reference-index scans and topology-changing rollout moves.
 pub const THREAD_WRITER_TOPOLOGY_LOCK_FILE: &str = ".reference-topology.lock";
 
+/// Coordinates cloneable per-thread locks and the global rollout topology barrier.
 pub struct ThreadWriterLockCoordinator {
     directory: PathBuf,
     cleanup_attempted: AtomicBool,
 }
 
+/// A cloneable cross-process lock for a single thread's rollout representation.
 #[derive(Clone)]
 pub struct ThreadWriterLockGuard {
     inner: Arc<ThreadWriterLockGuardInner>,
 }
 
+/// A cross-process barrier for scans and renames that change rollout topology.
 pub struct ThreadWriterTopologyLockGuard {
     _file: File,
 }
