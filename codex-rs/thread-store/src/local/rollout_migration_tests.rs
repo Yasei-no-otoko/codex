@@ -43,6 +43,8 @@ use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::fs::File;
+use tokio::io::BufReader;
 
 use super::LocalThreadStore;
 use super::RolloutMigrationFailureReason;
@@ -54,6 +56,7 @@ use super::RolloutMigrationStatus;
 #[cfg(unix)]
 use super::decompress_rollout_to_path;
 use super::migration_journal_path;
+use super::staged_rollout_path;
 use super::telemetry::RolloutMigrationTrigger;
 use super::thread_history;
 use super::write_migration_journal;
@@ -335,6 +338,45 @@ fn assert_failed_with_reason(
     assert_eq!(
         (outcome.status, outcome.failure_reason),
         (RolloutMigrationStatus::Failed, Some(failure_reason))
+    );
+}
+
+#[tokio::test]
+async fn migration_record_limit_accepts_exactly_16_mib_and_rejects_16_mib_plus_one() {
+    let home = TempDir::new().expect("create Codex home");
+    let exact_path = home.path().join("exact.jsonl");
+    let mut exact_record = b"{}".to_vec();
+    exact_record.resize(super::MAX_ROLLOUT_LINE_BYTES - 1, b' ');
+    exact_record.push(b'\n');
+    fs::write(&exact_path, &exact_record).expect("write exact-limit record");
+
+    let mut exact_reader = BufReader::new(File::open(&exact_path).await.expect("open record"));
+    let mut bytes = Vec::new();
+    let record = super::read_rollout_record(&mut exact_reader, &mut bytes)
+        .await
+        .expect("read exact-limit record")
+        .expect("exact-limit record is present");
+    assert_eq!(record.byte_count, super::MAX_ROLLOUT_LINE_BYTES as u64);
+    assert!(record.line.is_none());
+
+    let oversized_path = home.path().join("oversized.jsonl");
+    exact_record.insert(super::MAX_ROLLOUT_LINE_BYTES - 1, b' ');
+    fs::write(&oversized_path, exact_record).expect("write oversized record");
+    let mut oversized_reader = BufReader::new(
+        File::open(&oversized_path)
+            .await
+            .expect("open oversized record"),
+    );
+    let error = match super::read_rollout_record(&mut oversized_reader, &mut bytes).await {
+        Ok(_) => panic!("reject 16 MiB plus one record"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "thread-store internal error: rollout migration failed: {}",
+            super::OVERSIZED_ROLLOUT_RECORD_MESSAGE
+        )
     );
 }
 
@@ -1517,14 +1559,10 @@ async fn migration_fails_without_replacing_oversized_bounded_subagent_record() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
     let mut items = bounded_subagent_items(home.path());
-    items.push(RolloutItem::Compacted(CompactedItem {
-        message: "x".repeat(super::MAX_ROLLOUT_LINE_BYTES),
-        replacement_history: Some(Vec::new()),
-        window_number: Some(3),
-        first_window_id: None,
-        previous_window_id: None,
-        window_id: None,
-    }));
+    items.push(compacted(vec![input_response_message(
+        "user",
+        &"x".repeat(super::MAX_ROLLOUT_LINE_BYTES),
+    )]));
     items.push(agent_message("valid record after oversized checkpoint"));
     let path = write_rollout(
         home.path(),
@@ -1552,6 +1590,17 @@ async fn migration_fails_without_replacing_oversized_bounded_subagent_record() {
         original
     );
     assert!(!migration_journal_path(home.path(), thread_id).exists());
+    assert!(
+        !staged_rollout_path(&path)
+            .expect("build staged rollout path")
+            .exists()
+    );
+    assert!(
+        thread_history::projection_state(&store, thread_id)
+            .await
+            .expect("read SQLite projection")
+            .is_none()
+    );
     assert_eq!(
         store
             .state_db
@@ -2325,17 +2374,33 @@ async fn migration_fails_without_replacing_oversized_jsonl_records() {
         .expect("migrate oversized rollout record");
 
     assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Failed);
+    assert_eq!(
+        report.outcomes[0].failure_reason,
+        Some(RolloutMigrationFailureReason::LegacyRolloutConversionFailed)
+    );
     assert!(
         report.outcomes[0]
             .message
             .as_deref()
             .is_some_and(|message| message.contains(super::OVERSIZED_ROLLOUT_RECORD_MESSAGE))
     );
+    assert!(
+        !report.outcomes[0]
+            .message
+            .as_deref()
+            .expect("failure message")
+            .contains(&oversized_output)
+    );
     assert_eq!(
         fs::read(&path).expect("read rollout after failure"),
         original
     );
     assert!(!migration_journal_path(home.path(), thread_id).exists());
+    assert!(
+        !staged_rollout_path(&path)
+            .expect("build staged rollout path")
+            .exists()
+    );
     assert_eq!(
         store
             .state_db
