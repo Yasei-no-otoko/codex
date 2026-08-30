@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,7 +18,6 @@ const OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE: &str =
     "model context contains an oversized JSONL record";
 
 use super::LocalThreadStore;
-use super::read_thread;
 use super::rollout_lineage::RolloutLineage;
 use super::thread_rollout_resolver;
 use crate::LoadThreadHistoryParams;
@@ -39,8 +37,8 @@ mod tests;
 /// cutoff is available, the scan continues to the beginning and returns the complete replay it
 /// already accumulated.
 ///
-/// Compressed Legacy rollouts keep the full-history path. Paginated rollouts retain their
-/// lineage-aware reverse scan, including decoded compressed segments.
+/// Both plain and compressed Legacy rollouts use the same bounded, ghost-normalizing reverse
+/// scan. Paginated rollouts retain their typed lineage-aware reverse scan.
 pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
@@ -73,19 +71,13 @@ pub(super) async fn load_latest_model_context(
         });
     }
 
-    let is_compressed = path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"));
     let items = match session_meta.meta.history_mode {
-        // A legacy reference child inherits an immutable prefix. Its physical suffix alone is
-        // not its model-visible context, including when the child currently has a zstd sibling.
+        // A reference child inherits an immutable prefix. Its physical suffix alone is not its
+        // model-visible context, including when one or more segments currently have zstd
+        // siblings.
         ThreadHistoryMode::Legacy if session_meta.meta.history_base.is_some() => {
             let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
             scan_model_context_from_lineage(lineage, session_meta).await?
-        }
-        ThreadHistoryMode::Legacy if is_compressed => {
-            read_thread::load_history_items(path.as_path()).await?
         }
         ThreadHistoryMode::Legacy => {
             scan_model_context_from_rollout(path, session_meta, None).await?
@@ -195,6 +187,20 @@ fn scan_model_context_from_lineage_blocking(
     session_meta: SessionMetaLine,
 ) -> io::Result<Vec<RolloutItem>> {
     let mut scan = ModelContextScan::new(lineage.history_mode());
+    if lineage.history_mode() == ThreadHistoryMode::Legacy {
+        for segment in lineage.segments().iter().rev() {
+            let complete = scan_model_context_segment(
+                &mut scan,
+                segment.rollout_path.as_path(),
+                segment.end.map(|end| end.end_byte_offset),
+            )?;
+            if complete {
+                break;
+            }
+        }
+        return Ok(finish_model_context_scan(scan, session_meta));
+    }
+
     'segments: for segment in lineage.segments().iter().rev() {
         let file = codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
         let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
@@ -243,7 +249,7 @@ fn scan_model_context_segment(
     rollout_path: &Path,
     end_byte_offset: Option<u64>,
 ) -> io::Result<bool> {
-    let file = File::open(rollout_path)?;
+    let file = codex_rollout::open_rollout_seekable_reader(rollout_path)?;
     let mut scanner = match end_byte_offset {
         Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
         None => ReverseJsonlScanner::new(file)?,

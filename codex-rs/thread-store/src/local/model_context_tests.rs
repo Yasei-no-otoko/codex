@@ -275,6 +275,85 @@ async fn legacy_reference_context_replays_model_visible_ancestor_for_plain_and_z
 }
 
 #[tokio::test]
+async fn legacy_reference_context_normalizes_ancestor_ghost_snapshot() {
+    let home = TempDir::new().expect("temp dir");
+    let root_uuid = Uuid::from_u128(/*v*/ 1020);
+    let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root thread id");
+    let root_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-19",
+        root_uuid,
+        [legacy_user_message("obsolete root history")],
+    );
+    let RolloutItem::ResponseItem(retained_history) = user_message("retained root history") else {
+        unreachable!("user_message returns a response item");
+    };
+    let checkpoint = RolloutLine {
+        timestamp: "2025-01-03T13:00:01Z".to_string(),
+        ordinal: None,
+        item: legacy_compacted("root checkpoint", Some(vec![retained_history.item])),
+    };
+    let mut checkpoint = serde_json::to_value(checkpoint).expect("serialize checkpoint");
+    checkpoint["payload"]["replacement_history"]
+        .as_array_mut()
+        .expect("replacement history")
+        .push(serde_json::json!({"type": "ghost_snapshot"}));
+    let mut root_file = OpenOptions::new()
+        .append(true)
+        .open(root_path.as_path())
+        .expect("open root rollout");
+    writeln!(root_file, "{checkpoint}").expect("append root checkpoint");
+    drop(root_file);
+    let root_cutoff = std::fs::metadata(root_path.as_path())
+        .expect("read root metadata")
+        .len();
+
+    let child_uuid = Uuid::from_u128(/*v*/ 1021);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child thread id");
+    let child_path = write_legacy_rollout(
+        home.path(),
+        "2025-01-03T13-00-20",
+        child_uuid,
+        [legacy_user_message("child suffix")],
+    );
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: root_id,
+            end_ordinal_exclusive: 0,
+            end_byte_offset: root_cutoff,
+        },
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load logical legacy reference context");
+    let checkpoint = context
+        .items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) if compacted.message == "root checkpoint" => {
+                Some(compacted)
+            }
+            _ => None,
+        })
+        .expect("root checkpoint");
+    assert_eq!(
+        checkpoint.replacement_history.as_ref().map(Vec::len),
+        Some(1)
+    );
+    let serialized = serde_json::to_string(context.items).expect("serialize model context");
+    assert!(serialized.contains("retained root history"));
+    assert!(serialized.contains("child suffix"));
+    assert!(!serialized.contains("ghost_snapshot"));
+}
+
+#[tokio::test]
 async fn legacy_model_context_rejects_oversized_record() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1016);
@@ -302,6 +381,25 @@ async fn legacy_model_context_rejects_oversized_record() {
         .expect_err("oversized legacy model-context record must fail closed");
     assert!(
         error
+            .to_string()
+            .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
+    );
+
+    let input = std::fs::File::open(path.as_path()).expect("open plain rollout");
+    let output =
+        std::fs::File::create(path.with_extension("jsonl.zst")).expect("create compressed rollout");
+    zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+    std::fs::remove_file(path.as_path()).expect("remove plain rollout");
+
+    let compressed_error = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("oversized compressed legacy record must fail closed");
+    assert!(
+        compressed_error
             .to_string()
             .contains(OVERSIZED_MODEL_CONTEXT_RECORD_MESSAGE)
     );
