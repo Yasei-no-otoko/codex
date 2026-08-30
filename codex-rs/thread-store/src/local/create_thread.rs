@@ -46,6 +46,10 @@ pub(super) async fn create_thread(
             params
                 .forked_from_id
                 .and(params.history_base)
+                .filter(|_| {
+                    params.history_mode
+                        == codex_protocol::protocol::ThreadHistoryMode::Paginated
+                })
                 .map(|base| base.end_ordinal_exclusive),
         )
         .with_subagent_history_start_ordinal(params.subagent_history_start_ordinal)

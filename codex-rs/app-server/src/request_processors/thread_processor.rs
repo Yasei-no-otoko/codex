@@ -4817,6 +4817,7 @@ impl ThreadRequestProcessor {
                     })?,
             )
         };
+        let reference_backed_legacy_fork = prepared_fork.is_some() && !paginated_source;
         let history_cwd = Some(source_thread.cwd.clone());
 
         // Persist Windows sandbox mode.
@@ -5110,6 +5111,9 @@ impl ThreadRequestProcessor {
                     &history.items,
                     /*active_turn*/ None,
                 );
+            }
+            if reference_backed_legacy_fork {
+                thread.preview = preview_from_rollout_items(&history_items);
             }
             let token_usage_turn_id = include_turns.then(|| {
                 restored_token_usage_turn_id(
