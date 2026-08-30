@@ -119,6 +119,7 @@ struct HeadTailSummary {
     cli_version: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
+    has_history_base: bool,
 }
 
 /// Hard cap to bound worst‑case work per request.
@@ -808,8 +809,10 @@ async fn build_thread_item(
     {
         return None;
     }
-    // Apply filters: must have session meta and a discoverable preview.
-    if summary.saw_session_meta && summary.preview.is_some() {
+    // A reference child stores inherited history behind its SessionMeta.history_base, so its
+    // local delta can legitimately have no user-message preview. Keep that child discoverable;
+    // callers enrich the empty summary from its StateDB metadata.
+    if summary.saw_session_meta && (summary.preview.is_some() || summary.has_history_base) {
         let HeadTailSummary {
             thread_id,
             first_user_message,
@@ -1162,6 +1165,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                         .and_then(|git| git.repository_url.clone());
                     summary.cli_version = Some(session_meta_line.meta.cli_version);
                     summary.created_at = Some(session_meta_line.meta.timestamp.clone());
+                    summary.has_history_base = session_meta_line.meta.history_base.is_some();
                     summary.saw_session_meta = true;
                 }
             }

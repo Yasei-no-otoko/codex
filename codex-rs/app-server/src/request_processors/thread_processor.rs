@@ -5049,6 +5049,32 @@ impl ThreadRequestProcessor {
                 .await
                 .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
         }
+        if !paginated_source
+            && let (Some(rollout_path), Some(state_db)) = (
+                session_configured.rollout_path.as_deref(),
+                forked_thread.state_db().or_else(|| self.state_db.clone()),
+            )
+        {
+            // Publish the fork's local rollout before returning so immediate StateDB-only
+            // discovery sees the same thread as the fork response. This never follows the
+            // history reference, so reference-backed forks only inspect their child delta.
+            codex_rollout::state_db::read_repair_rollout_path(
+                Some(state_db.as_ref()),
+                Some(thread_id),
+                /*archived_only*/ None,
+                rollout_path,
+            )
+            .await;
+            let preview = preview_from_rollout_items(&history_items);
+            if !preview.is_empty()
+                && let Err(err) = state_db.set_thread_preview_if_empty(thread_id, &preview).await
+            {
+                warn!(
+                    %thread_id,
+                    "failed to publish fork preview to StateDB before response: {err}"
+                );
+            }
+        }
         let inherited_goal = if defer_goal_continuation
             && session_configured.rollout_path.is_some()
             && goals_enabled

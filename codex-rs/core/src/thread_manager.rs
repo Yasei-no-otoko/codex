@@ -1403,6 +1403,12 @@ impl ThreadManager {
             InitialHistory::Forked(_) => history.forked_from_id(),
             InitialHistory::New | InitialHistory::Cleared => None,
         };
+        // Forks inherit the persisted session source rather than the source of the process
+        // issuing the fork request. The child is immediately discoverable through source-filtered
+        // thread listings, and its durable SessionMeta stays consistent with its parent.
+        let (session_source, resumed_thread_source) = history
+            .get_resumed_session_sources()
+            .unwrap_or_else(|| (self.state.session_source.clone(), None));
         let multi_agent_version = self
             .state
             .effective_multi_agent_version_for_spawn(
@@ -1419,7 +1425,8 @@ impl ThreadManager {
         let agent_control = self.agent_control_for_config(&config);
         let options = StartThreadOptions {
             initial_history: history,
-            thread_source,
+            session_source: Some(session_source),
+            thread_source: thread_source.or(resumed_thread_source),
             parent_trace,
             client_mcp_extensions,
             reserved_thread_id,

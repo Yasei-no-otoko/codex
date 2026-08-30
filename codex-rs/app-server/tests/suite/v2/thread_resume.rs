@@ -1040,7 +1040,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
         ),
     )?;
 
-    let (thread_id, rollout_path) = {
+    let (thread_id, rollout_path, source_rollout_path) = {
         let mut mcp = TestAppServer::builder()
             .with_codex_home(codex_home.path())
             .build_initialized()
@@ -1055,6 +1055,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
             .await?;
         let ThreadStartResponse { thread, .. } =
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+        let source_rollout_path = thread.path.clone().expect("source rollout path");
 
         let turn_id = mcp
             .send_turn_start_request(TurnStartParams {
@@ -1130,7 +1131,11 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
             Some(&read.cwd)
         );
 
-        (thread.id, read.path.expect("materialized rollout path"))
+        (
+            thread.id,
+            read.path.expect("materialized rollout path"),
+            source_rollout_path,
+        )
     };
 
     let mut mcp = TestAppServer::builder()
@@ -1184,7 +1189,7 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
 
     // Older rollouts can retain a frozen turn context after an accepted settings update.
-    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&source_rollout_path).await?;
     let frozen_context = items
         .into_iter()
         .find(|item| matches!(item, RolloutItem::TurnContext(_)))
