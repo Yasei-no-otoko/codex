@@ -115,12 +115,11 @@ pub(super) async fn load_latest_model_context(
     } else {
         thread_rollout_resolver::resolve_current(store, params.thread_id).await?
     };
-    let path =
-        resolved
-            .map(|resolved| resolved.path)
-            .ok_or_else(|| ThreadStoreError::InvalidRequest {
-                message: format!("no rollout found for thread id {}", params.thread_id),
-            })?;
+    let resolved = resolved.ok_or_else(|| ThreadStoreError::InvalidRequest {
+        message: format!("no rollout found for thread id {}", params.thread_id),
+    })?;
+    let source_rollout_id = resolved.rollout_id;
+    let path = resolved.path;
 
     let session_meta = codex_rollout::read_session_meta_line(path.as_path())
         .await
@@ -144,8 +143,10 @@ pub(super) async fn load_latest_model_context(
         // siblings.
         ThreadHistoryMode::Legacy if session_meta.meta.history_base.is_some() => {
             let (lineage, _ancestor_filesystem_guards) = store
-                .resolve_rollout_lineage_for_reference_attachment(
+                .resolve_rollout_lineage_for_reference_attachment_from_source_locked_with_source_guard(
                     params.thread_id,
+                    source_rollout_id,
+                    path.clone(),
                     source_filesystem_guard.clone(),
                 )
                 .await?;
@@ -158,8 +159,10 @@ pub(super) async fn load_latest_model_context(
         }
         ThreadHistoryMode::Paginated => {
             let (lineage, _ancestor_filesystem_guards) = store
-                .resolve_rollout_lineage_for_reference_attachment(
+                .resolve_rollout_lineage_for_reference_attachment_from_source_locked_with_source_guard(
                     params.thread_id,
+                    source_rollout_id,
+                    path.clone(),
                     source_filesystem_guard.clone(),
                 )
                 .await?;
