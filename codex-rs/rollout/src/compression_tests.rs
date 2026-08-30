@@ -400,6 +400,63 @@ async fn worker_waits_for_rollout_maintenance_before_compressing() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn worker_skips_when_rollout_topology_is_busy_without_consuming_run_marker()
+-> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let source_uuid = Uuid::from_u128(27);
+    let source_id = ThreadId::from_string(&source_uuid.to_string())?;
+    let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
+    write_rollout(&source_path, source_id, "referenced source")?;
+    set_old_mtime(&source_path)?;
+
+    let child_uuid = Uuid::from_u128(28);
+    let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+    let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
+    write_rollout(&child_path, child_id, "fork child")?;
+    set_history_base(
+        child_path.as_path(),
+        HistoryPosition {
+            thread_id: source_id,
+            end_ordinal_exclusive: 2,
+            end_byte_offset: fs::metadata(source_path.as_path())?.len(),
+        },
+    )?;
+    set_old_mtime(&child_path)?;
+
+    let held = Arc::new(ThreadWriterLockCoordinator::new(home.path())).acquire_topology()?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
+
+    assert!(source_path.exists());
+    assert!(!compressed_rollout_path(&source_path).exists());
+    assert!(child_path.exists());
+    assert!(!compressed_rollout_path(&child_path).exists());
+    assert!(
+        !home
+            .path()
+            .join(".tmp")
+            .join("rollout-compression.lock")
+            .exists()
+    );
+
+    drop(held);
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::IncludeShared,
+    )
+    .await?;
+
+    assert!(!source_path.exists());
+    assert!(compressed_rollout_path(&source_path).exists());
+    assert!(!child_path.exists());
+    assert!(compressed_rollout_path(&child_path).exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn worker_compresses_archived_fork_chain_only_with_shared_mode() -> anyhow::Result<()> {
     for mode in [
         RolloutCompressionMode::Standalone,

@@ -541,6 +541,22 @@ pub(super) mod worker {
             );
             return Ok(());
         };
+        let writer_locks = Arc::new(ThreadWriterLockCoordinator::new(codex_home.as_path()));
+        let topology_guard = match writer_locks.acquire_topology() {
+            Ok(guard) => guard,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                metrics::run("skipped_topology_busy");
+                debug!(
+                    "rollout topology is busy; skipping compression for {}",
+                    codex_home.display()
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                metrics::run("failed");
+                return Err(err);
+            }
+        };
         let marker = match CompressionRunMarker::try_claim(codex_home.as_path()) {
             Ok(Some(marker)) => marker,
             Ok(None) => {
@@ -560,17 +576,17 @@ pub(super) mod worker {
         metrics::run("started");
         let started_at = Instant::now();
         let result = async {
-            cleanup_stale_temps(codex_home.as_path()).await?;
-            let Some(reference_index) = RolloutReferenceIndex::scan_until(
+            let reference_index = RolloutReferenceIndex::scan_until(
                 codex_home.as_path(),
                 started_at,
                 WORKER_MAX_RUNTIME,
             )
-            .await?
-            else {
+            .await?;
+            drop(topology_guard);
+            cleanup_stale_temps(codex_home.as_path()).await?;
+            let Some(reference_index) = reference_index else {
                 return Ok(CompressionStats::default());
             };
-            let writer_locks = Arc::new(ThreadWriterLockCoordinator::new(codex_home.as_path()));
             let mut stats = CompressionStats::default();
             for root in [
                 codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
