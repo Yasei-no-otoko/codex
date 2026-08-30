@@ -217,6 +217,77 @@ async fn rejects_missing_cycles_and_out_of_bounds_offsets() {
 }
 
 #[tokio::test]
+async fn paginated_cutoff_requires_complete_lf_boundary_for_plain_and_zstd() {
+    let home = TempDir::new().expect("temp dir");
+    let first = b"first-json-record\n";
+    let second = b"post-cutoff-record\n";
+    let mut decoded = first.to_vec();
+    decoded.extend_from_slice(second);
+    let cutoff = first.len() as u64;
+    for compressed in [false, true] {
+        let path = home.path().join(if compressed {
+            "rollout-2026-07-16T00-00-00-00000000-0000-0000-0000-000000000001.jsonl.zst"
+        } else {
+            "rollout-2026-07-16T00-00-00-00000000-0000-0000-0000-000000000002.jsonl"
+        });
+        let bytes = if compressed {
+            zstd::stream::encode_all(decoded.as_slice(), 3).expect("compress rollout")
+        } else {
+            decoded.clone()
+        };
+        fs::write(&path, bytes).expect("write rollout");
+        let thread_id = ThreadId::default();
+        super::validate_raw_rollout_cutoff(thread_id, &path, cutoff, ThreadHistoryMode::Paginated)
+            .await
+            .expect("complete LF cutoff");
+        assert!(
+            super::validate_raw_rollout_cutoff(
+                thread_id,
+                &path,
+                cutoff - 1,
+                ThreadHistoryMode::Paginated,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            super::validate_raw_rollout_cutoff(
+                thread_id,
+                &path,
+                decoded.len() as u64,
+                ThreadHistoryMode::Paginated,
+            )
+            .await
+            .is_ok()
+        );
+        let partial_decoded = [first.as_slice(), b"partial"].concat();
+        let partial = partial_decoded.len() as u64;
+        let partial_path = path.with_file_name(if compressed {
+            "partial.jsonl.zst"
+        } else {
+            "partial.jsonl"
+        });
+        let partial_bytes = if compressed {
+            zstd::stream::encode_all(partial_decoded.as_slice(), 3)
+                .expect("compress partial rollout")
+        } else {
+            partial_decoded
+        };
+        fs::write(&partial_path, partial_bytes).expect("write partial rollout");
+        assert!(
+            super::validate_raw_rollout_cutoff(
+                thread_id,
+                &partial_path,
+                partial,
+                ThreadHistoryMode::Paginated,
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
 async fn reference_lineage_rejects_mismatched_leaf_and_ancestor_metadata() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);

@@ -413,7 +413,6 @@ async fn validate_cutoff_bounds(
     history_mode: ThreadHistoryMode,
 ) -> ThreadStoreResult<()> {
     let end_byte_offset = end.end_byte_offset;
-    let path = rollout_path.to_path_buf();
     if history_mode == ThreadHistoryMode::Legacy {
         // A shared legacy ancestor may already be compressed. Validate its decoded byte cutoff
         // through the raw reader; the plain-file reverse scanner cannot interpret zstd bytes.
@@ -430,7 +429,7 @@ async fn validate_cutoff_bounds(
             )
             .await;
         }
-        let validation_path = path.clone();
+        let validation_path = rollout_path.to_path_buf();
         let complete_envelope = tokio::task::spawn_blocking(move || {
             legacy_envelope::validate_rollout_envelope_cutoff(
                 validation_path.as_path(),
@@ -455,26 +454,16 @@ async fn validate_cutoff_bounds(
         }
         return Ok(());
     }
-    let contains_prefix = tokio::task::spawn_blocking(move || {
-        codex_rollout::rollout_contains_prefix(&path, end_byte_offset)
-    })
+    // Paginated cutoffs are physical decoded JSONL offsets too. Requiring a complete LF record
+    // here keeps plain and zstd lineages equivalent and rejects both mid-line and EOF-partial
+    // positions without materializing the rollout.
+    validate_raw_rollout_cutoff(
+        requested_thread_id,
+        rollout_path,
+        end_byte_offset,
+        history_mode,
+    )
     .await
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to join rollout prefix validation: {err}"),
-    })?
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!(
-            "failed to read lineage metadata {}: {err}",
-            rollout_path.display()
-        ),
-    })?;
-    if !contains_prefix {
-        return Err(malformed_lineage(
-            requested_thread_id,
-            "cutoff byte offset is past the source rollout",
-        ));
-    }
-    Ok(())
 }
 
 /// Validate a raw JSONL cutoff without materializing a compressed rollout into a plain file.

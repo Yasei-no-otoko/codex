@@ -423,20 +423,36 @@ impl FeedbackRequestProcessor {
         conversation_id: ThreadId,
         state_db_ctx: Option<&StateDbHandle>,
     ) -> Option<PathBuf> {
-        if let Ok(conversation) = self.thread_manager.get_thread(conversation_id).await
+        let candidate = if let Ok(conversation) =
+            self.thread_manager.get_thread(conversation_id).await
             && let Some(rollout_path) = conversation.rollout_path()
         {
-            return Some(rollout_path);
-        }
+            Some(rollout_path)
+        } else {
+            let state_db_ctx = state_db_ctx?;
+            state_db_ctx
+                .find_rollout_path_by_id(conversation_id, /*archived_only*/ None)
+                .await
+                .unwrap_or_else(|err| {
+                    warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
+                    None
+                })
+        }?;
 
-        let state_db_ctx = state_db_ctx?;
-        state_db_ctx
-            .find_rollout_path_by_id(conversation_id, /*archived_only*/ None)
-            .await
-            .unwrap_or_else(|err| {
-                warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
+        // A loaded thread or SQLite row may retain the logical `.jsonl` path after compression.
+        // Resolve the physical representation once so metadata, turn tags, and attachment paths
+        // all observe the same plain/zstd file without materializing it.
+        match codex_rollout::existing_rollout_path(candidate.as_path()).await {
+            Some(path) => Some(path),
+            None => {
+                warn!(
+                    thread_id = %conversation_id,
+                    path = %candidate.display(),
+                    "resolved rollout path is missing or unreadable"
+                );
                 None
-            })
+            }
+        }
     }
 }
 
