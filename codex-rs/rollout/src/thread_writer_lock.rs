@@ -7,6 +7,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -32,6 +33,12 @@ pub struct ThreadWriterLockGuard {
     inner: Arc<ThreadWriterLockGuardInner>,
 }
 
+/// A non-owning handle that can reuse an in-process thread writer lock while it remains held.
+#[derive(Clone)]
+pub struct ThreadWriterLockWeakGuard {
+    inner: Weak<ThreadWriterLockGuardInner>,
+}
+
 /// A cross-process barrier for scans and renames that change rollout topology.
 pub struct ThreadWriterTopologyLockGuard {
     _file: File,
@@ -49,6 +56,24 @@ impl std::fmt::Debug for ThreadWriterLockGuard {
             .debug_struct("ThreadWriterLockGuard")
             .field("path", &self.inner.path)
             .finish_non_exhaustive()
+    }
+}
+
+impl ThreadWriterLockGuard {
+    /// Downgrade this guard so callers can share an existing lock without extending its lifetime.
+    pub fn downgrade(&self) -> ThreadWriterLockWeakGuard {
+        ThreadWriterLockWeakGuard {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+}
+
+impl ThreadWriterLockWeakGuard {
+    /// Return a clone of the active guard, if its last owner has not released the lock.
+    pub fn upgrade(&self) -> Option<ThreadWriterLockGuard> {
+        self.inner
+            .upgrade()
+            .map(|inner| ThreadWriterLockGuard { inner })
     }
 }
 

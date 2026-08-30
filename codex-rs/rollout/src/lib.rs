@@ -156,6 +156,7 @@ pub use thread_writer_lock::THREAD_WRITER_LOCK_DIR;
 pub use thread_writer_lock::THREAD_WRITER_TOPOLOGY_LOCK_FILE;
 pub use thread_writer_lock::ThreadWriterLockCoordinator;
 pub use thread_writer_lock::ThreadWriterLockGuard;
+pub use thread_writer_lock::ThreadWriterLockWeakGuard;
 pub use thread_writer_lock::ThreadWriterTopologyLockGuard;
 
 #[cfg(test)]

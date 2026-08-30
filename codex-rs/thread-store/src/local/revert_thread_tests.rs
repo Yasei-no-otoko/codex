@@ -134,6 +134,8 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         })
         .await
         .expect("revert before first turn");
+    // Reverting into the root-owned prefix deliberately collapses the logical lineage. The
+    // immutable replacement files still remain on disk for older references and maintenance.
     assert_eq!(
         store
             .resolve_rollout_lineage(thread_id)
@@ -141,7 +143,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
             .expect("resolve twice-reverted lineage")
             .segments()
             .len(),
-        3
+        1
     );
     store
         .load_latest_model_context(LoadThreadHistoryParams {

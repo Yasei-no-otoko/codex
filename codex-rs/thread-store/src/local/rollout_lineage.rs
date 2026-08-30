@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -149,6 +150,10 @@ impl LocalThreadStore {
         let mut end: Option<HistoryPosition> = None;
         let mut history_mode = None;
         let mut ancestor_guards = Vec::new();
+        let mut held_filesystem_guards = HashMap::new();
+        if let Some(source_guard) = preheld_source_guard.as_ref() {
+            held_filesystem_guards.insert(requested_thread_id, source_guard.clone());
+        }
 
         loop {
             // A history base names an immutable rollout ID, while every mutator/compressor uses
@@ -182,28 +187,33 @@ impl LocalThreadStore {
             let _filesystem_guard = match representation {
                 LineageRepresentation::Existing => None,
                 LineageRepresentation::PlainForReference
-                | LineageRepresentation::ReadOnlyForAttachment
-                    if next_rollout_id.is_none() =>
-                {
-                    let guard = match preheld_source_guard.as_ref() {
-                        Some(guard) => guard.clone(),
-                        // This branch has no external caller retaining a source guard; acquire
-                        // one for the resolver itself and retain it through its path reads.
-                        None => self
-                            .writer_lock_coordinator
-                            .acquire(ancestor_logical_thread_id)?,
-                    };
-                    Some(guard)
-                }
-                LineageRepresentation::PlainForReference
                 | LineageRepresentation::ReadOnlyForAttachment => {
-                    let guard = match self.existing_writer_lock(ancestor_logical_thread_id).await {
-                        Some(guard) => guard,
-                        None => self
-                            .writer_lock_coordinator
-                            .acquire(ancestor_logical_thread_id)?,
+                    let guard = match held_filesystem_guards.get(&ancestor_logical_thread_id) {
+                        Some(guard) => guard.clone(),
+                        None if next_rollout_id.is_none() => {
+                            match preheld_source_guard.as_ref() {
+                                Some(guard) => guard.clone(),
+                                // This branch has no external caller retaining a source guard;
+                                // acquire one for the resolver itself and retain it through its
+                                // path reads.
+                                None => self
+                                    .writer_lock_coordinator
+                                    .acquire_source(ancestor_logical_thread_id)?,
+                            }
+                        }
+                        None => match self.existing_writer_lock(ancestor_logical_thread_id).await {
+                            Some(guard) => guard,
+                            None => self
+                                .writer_lock_coordinator
+                                .acquire_source(ancestor_logical_thread_id)?,
+                        },
                     };
-                    ancestor_guards.push(guard.clone());
+                    held_filesystem_guards
+                        .entry(ancestor_logical_thread_id)
+                        .or_insert_with(|| guard.clone());
+                    if next_rollout_id.is_some() {
+                        ancestor_guards.push(guard.clone());
+                    }
                     Some(guard)
                 }
             };

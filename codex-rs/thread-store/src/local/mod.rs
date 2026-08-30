@@ -346,7 +346,7 @@ impl LocalThreadStore {
         let lifecycle = self.live_writer_locks.reserve_lifecycle(thread_id).await;
         let filesystem = match self.existing_writer_lock(thread_id).await {
             Some(guard) => guard,
-            None => self.writer_lock_coordinator.acquire(thread_id)?,
+            None => self.writer_lock_coordinator.acquire_source(thread_id)?,
         };
         Ok(ForkSourceGuards {
             lifecycle,
@@ -551,6 +551,13 @@ impl ThreadStore for LocalThreadStore {
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move {
             let source_guards = self.acquire_fork_source_guards(params.thread_id).await?;
+            match live_writer::persist_thread(self, params.thread_id).await {
+                Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+            // A different LocalThreadStore can share this source lease, but it cannot flush that
+            // store's unpersisted recorder. Resolution below therefore remains fail-closed when
+            // no durable rollout exists; only an owning store can persist an empty live source.
             let source =
                 thread_rollout_resolver::resolve_current_including_archived(self, params.thread_id)
                     .await?
@@ -1763,7 +1770,12 @@ mod tests {
             })
             .await
             .expect_err("external rollouts cannot be referenced by thread id");
-        assert!(error.to_string().contains("must be in Codex home"));
+        assert!(matches!(
+            error,
+            ThreadStoreError::Unsupported {
+                operation: "unmanaged legacy reference source"
+            }
+        ));
     }
 
     #[tokio::test]
