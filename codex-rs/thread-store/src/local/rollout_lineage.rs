@@ -111,10 +111,12 @@ impl LocalThreadStore {
                         rollout_path.display()
                     ),
                 })?;
-            if next_rollout_id.is_none() && meta.meta.id != requested_thread_id {
+            if meta.meta.id != rollout_id
+                || codex_rollout::rollout_id_from_path(rollout_path.as_path()) != Some(rollout_id)
+            {
                 return Err(malformed_lineage(
                     requested_thread_id,
-                    "source rollout belongs to another thread",
+                    "source rollout path or metadata belongs to another thread",
                 ));
             }
             if history_mode
