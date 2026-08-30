@@ -518,10 +518,12 @@ async fn validate_raw_rollout_cutoff(
     end_byte_offset: u64,
     history_mode: ThreadHistoryMode,
 ) -> ThreadStoreResult<()> {
-    // Cutoff validation only needs physical byte counts. Keep this bounded even when a legacy
-    // record contains an arbitrarily large payload; attachment streaming will independently
-    // discard that record when it exceeds its output budget.
-    const CUTOFF_LINE_LIMIT: usize = 4 * 1024 * 1024;
+    // Legacy replay uses a 16 MiB payload bound, consistent with the migration record bound. A
+    // cutoff reader must retain that same bounded range to validate an envelope, plus its
+    // terminating LF. Anything larger is drained without allocation and cannot become a Legacy
+    // history boundary.
+    const LEGACY_CUTOFF_PAYLOAD_LIMIT: usize = 16 * 1024 * 1024;
+    const CUTOFF_LINE_LIMIT: usize = LEGACY_CUTOFF_PAYLOAD_LIMIT + 1;
     let mut reader = codex_rollout::open_rollout_raw_line_reader(rollout_path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
@@ -546,16 +548,16 @@ async fn validate_raw_rollout_cutoff(
             }
             break;
         };
-        let (line, byte_count, terminated, oversized) = match record {
+        let (line, byte_count, terminated) = match record {
             codex_rollout::RawRolloutLine::Complete(line) => {
                 let byte_count = line.len();
                 let terminated = line.ends_with(b"\n");
-                (Some(line), byte_count, terminated, false)
+                (Some(line), byte_count, terminated)
             }
             codex_rollout::RawRolloutLine::Oversized {
                 byte_count,
                 terminated,
-            } => (None, byte_count, terminated, true),
+            } => (None, byte_count, terminated),
         };
         let next = offset.saturating_add(byte_count as u64);
         if next > end_byte_offset {
@@ -573,7 +575,7 @@ async fn validate_raw_rollout_cutoff(
             break;
         }
         last_complete = offset;
-        if history_mode == ThreadHistoryMode::Paginated || oversized {
+        if history_mode == ThreadHistoryMode::Paginated {
             last_valid = offset;
         } else if line.as_deref().is_some_and(valid_legacy_envelope) {
             last_valid = offset;

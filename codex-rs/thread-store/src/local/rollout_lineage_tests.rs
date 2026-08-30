@@ -304,6 +304,58 @@ async fn paginated_cutoff_requires_complete_lf_boundary_for_plain_and_zstd() {
 }
 
 #[tokio::test]
+async fn legacy_zstd_cutoff_rejects_malformed_and_oversized_records() {
+    const LEGACY_PAYLOAD_LIMIT: usize = 16 * 1024 * 1024;
+    let home = TempDir::new().expect("temp dir");
+    let path = home.path().join("legacy.jsonl.zst");
+    let valid = b"{\"timestamp\":\"2026-07-16T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{}}\n";
+    let malformed = b"{\"timestamp\":\"2026-07-16T00:00:01Z\",\"type\":\"event_msg\"}\n";
+    let mut decoded = valid.to_vec();
+    decoded.extend_from_slice(malformed);
+    let malformed_cutoff = decoded.len() as u64;
+    decoded.extend(std::iter::repeat_n(b'x', LEGACY_PAYLOAD_LIMIT + 1));
+    decoded.push(b'\n');
+    let oversized_cutoff = decoded.len() as u64;
+    fs::write(
+        &path,
+        zstd::stream::encode_all(decoded.as_slice(), 3).expect("compress rollout"),
+    )
+    .expect("write rollout");
+
+    let thread_id = ThreadId::default();
+    super::validate_raw_rollout_cutoff(
+        thread_id,
+        &path,
+        valid.len() as u64,
+        ThreadHistoryMode::Legacy,
+    )
+    .await
+    .expect("valid bounded legacy envelope is a cutoff");
+    assert!(
+        super::validate_raw_rollout_cutoff(
+            thread_id,
+            &path,
+            malformed_cutoff,
+            ThreadHistoryMode::Legacy,
+        )
+        .await
+        .is_err(),
+        "a malformed complete line cannot become a legacy HistoryPosition"
+    );
+    assert!(
+        super::validate_raw_rollout_cutoff(
+            thread_id,
+            &path,
+            oversized_cutoff,
+            ThreadHistoryMode::Legacy,
+        )
+        .await
+        .is_err(),
+        "an oversized complete line cannot become a legacy HistoryPosition"
+    );
+}
+
+#[tokio::test]
 async fn reference_lineage_rejects_mismatched_leaf_and_ancestor_metadata() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
