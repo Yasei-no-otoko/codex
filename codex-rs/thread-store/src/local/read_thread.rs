@@ -334,11 +334,18 @@ async fn load_history_items_for_thread(
         filesystem: source_filesystem_guard,
     } = source_guards;
     let (path, resolved_rollout_id) = if let Some(requested_path) = requested_path {
+        // The caller may have selected a historical immutable rollout. Re-resolve that exact
+        // representation only after the source guards are held; a logical current-rollout lookup
+        // here would silently switch a path-pinned read to a later revert.
         let path = codex_rollout::existing_rollout_path(requested_path)
             .await
-            .unwrap_or_else(|| requested_path.to_path_buf());
-        let rollout_id = codex_rollout::rollout_id_from_path(path.as_path());
-        (path, rollout_id)
+            .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "requested rollout path no longer exists: {}",
+                    requested_path.display()
+                ),
+            })?;
+        (path, None)
     } else {
         let resolved = (if include_archived {
             thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
@@ -355,12 +362,15 @@ async fn load_history_items_for_thread(
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to read session metadata {}: {err}", path.display()),
         })?;
-    if requested_meta.meta.id != thread_id
-        || resolved_rollout_id.is_some_and(|rollout_id| {
-            codex_rollout::rollout_id_from_path(path.as_path())
-                .is_some_and(|path_rollout_id| path_rollout_id != rollout_id)
-        })
-    {
+    let source_rollout_id = match resolved_rollout_id {
+        Some(rollout_id) => rollout_id,
+        None => thread_rollout_resolver::rollout_id_from_path_or_legacy_thread_id(
+            path.as_path(),
+            thread_id,
+            requested_meta.meta.history_mode,
+        )?,
+    };
+    if requested_meta.meta.id != thread_id {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!("rollout metadata does not belong to thread {thread_id}"),
         });
@@ -372,8 +382,10 @@ async fn load_history_items_for_thread(
     }
 
     let (lineage, ancestor_filesystem_guards) = store
-        .resolve_rollout_lineage_for_reference_locked_with_source_guard(
+        .resolve_rollout_lineage_for_reference_from_source_locked_with_source_guard(
             thread_id,
+            source_rollout_id,
+            path,
             source_filesystem_guard.clone(),
         )
         .await?;
@@ -1124,6 +1136,118 @@ mod tests {
                 .expect("serialize guarded history")
                 .contains("Hello from user")
         );
+    }
+
+    #[tokio::test]
+    async fn read_thread_by_rollout_path_replays_the_requested_legacy_reference_after_revert() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let parent_uuid = Uuid::from_u128(231);
+        let logical_child_uuid = Uuid::from_u128(232);
+        let historical_rollout_uuid = Uuid::from_u128(233);
+        let replacement_rollout_uuid = Uuid::from_u128(234);
+        let parent_path = write_session_file(home.path(), "2025-01-03T12-00-00", parent_uuid)
+            .expect("parent session file");
+        let parent_cutoff = std::fs::metadata(&parent_path)
+            .expect("parent metadata")
+            .len();
+
+        let historical_path =
+            write_session_file(home.path(), "2025-01-03T12-01-00", historical_rollout_uuid)
+                .expect("historical child session file");
+        let historical_text = std::fs::read_to_string(&historical_path).expect("read child");
+        let (historical_meta, historical_delta) = historical_text
+            .split_once('\n')
+            .expect("child metadata line");
+        let mut historical_meta: serde_json::Value =
+            serde_json::from_str(historical_meta).expect("parse child metadata");
+        historical_meta["payload"]["id"] = serde_json::json!(logical_child_uuid);
+        historical_meta["payload"]["session_id"] = serde_json::json!(logical_child_uuid);
+        historical_meta["payload"]["history_base"] = serde_json::json!({
+            "thread_id": parent_uuid,
+            "end_ordinal_exclusive": 2,
+            "end_byte_offset": parent_cutoff,
+        });
+        std::fs::write(
+            &historical_path,
+            format!(
+                "{}\n{}",
+                historical_meta,
+                historical_delta.replace("Hello from user", "path-pinned legacy delta")
+            ),
+        )
+        .expect("rewrite historical child");
+        let historical_path = historical_path.with_file_name(format!(
+            "rollout-2025-01-03T12-01-00-{logical_child_uuid}_{historical_rollout_uuid}.jsonl"
+        ));
+        std::fs::rename(
+            home.path().join(format!(
+                "sessions/2025/01/03/rollout-2025-01-03T12-01-00-{historical_rollout_uuid}.jsonl"
+            )),
+            &historical_path,
+        )
+        .expect("rename historical child");
+
+        let replacement_path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T12-02-00",
+            replacement_rollout_uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("replacement session file");
+        let replacement_text =
+            std::fs::read_to_string(&replacement_path).expect("read replacement");
+        let mut replacement_meta: serde_json::Value = serde_json::from_str(
+            replacement_text
+                .strip_suffix('\n')
+                .expect("replacement metadata newline"),
+        )
+        .expect("parse replacement metadata");
+        replacement_meta["payload"]["id"] = serde_json::json!(logical_child_uuid);
+        replacement_meta["payload"]["session_id"] = serde_json::json!(logical_child_uuid);
+        std::fs::write(&replacement_path, format!("{replacement_meta}\n"))
+            .expect("rewrite replacement");
+        let replacement_path = replacement_path.with_file_name(format!(
+            "rollout-2025-01-03T12-02-00-{logical_child_uuid}_{replacement_rollout_uuid}.jsonl"
+        ));
+        std::fs::rename(
+            home.path().join(format!(
+                "sessions/2025/01/03/rollout-2025-01-03T12-02-00-{replacement_rollout_uuid}.jsonl"
+            )),
+            &replacement_path,
+        )
+        .expect("rename replacement");
+
+        let thread_id = ThreadId::from_string(&logical_child_uuid.to_string()).expect("thread id");
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("initialize state database");
+        let mut builder =
+            ThreadMetadataBuilder::new(thread_id, replacement_path, Utc::now(), SessionSource::Cli);
+        builder.history_mode = ThreadHistoryMode::Paginated;
+        let metadata = builder.build(config.default_model_provider_id.as_str());
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("select replacement rollout");
+        let store = LocalThreadStore::new(config, Some(runtime));
+
+        let thread = store
+            .read_thread_by_rollout_path(
+                historical_path,
+                /*include_archived*/ true,
+                /*include_history*/ true,
+            )
+            .await
+            .expect("read requested historical rollout");
+        let history = serde_json::to_string(&thread.history.expect("logical history").items)
+            .expect("serialize history");
+        assert!(history.contains("Hello from user"));
+        assert!(history.contains("path-pinned legacy delta"));
+        assert!(!history.contains(&replacement_rollout_uuid.to_string()));
     }
 
     #[tokio::test]

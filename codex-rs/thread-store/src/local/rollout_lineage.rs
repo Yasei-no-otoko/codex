@@ -58,6 +58,7 @@ impl LocalThreadStore {
                 requested_thread_id,
                 LineageRepresentation::PlainForReference,
                 None,
+                None,
             )
             .await?;
         Ok(lineage)
@@ -75,6 +76,29 @@ impl LocalThreadStore {
             requested_thread_id,
             LineageRepresentation::PlainForReference,
             Some(source_guard),
+            None,
+        )
+        .await
+    }
+
+    /// Resolve a reference lineage from an already selected immutable source. Unlike a logical
+    /// thread read, this preserves the caller's exact rollout rather than resolving the thread's
+    /// current selected rollout again (which may have changed after a revert).
+    pub(super) async fn resolve_rollout_lineage_for_reference_from_source_locked_with_source_guard(
+        &self,
+        requested_thread_id: ThreadId,
+        source_rollout_id: ThreadId,
+        source_rollout_path: PathBuf,
+        source_guard: WriterLockGuard,
+    ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
+        self.resolve_rollout_lineage_with_representation_and_guards(
+            requested_thread_id,
+            LineageRepresentation::PlainForReference,
+            Some(source_guard),
+            Some(LineageSource {
+                rollout_id: source_rollout_id,
+                path: source_rollout_path,
+            }),
         )
         .await
     }
@@ -91,6 +115,7 @@ impl LocalThreadStore {
             requested_thread_id,
             LineageRepresentation::ReadOnlyForAttachment,
             Some(source_guard),
+            None,
         )
         .await
     }
@@ -105,6 +130,7 @@ impl LocalThreadStore {
                 requested_thread_id,
                 representation,
                 None,
+                None,
             )
             .await?;
         Ok(lineage)
@@ -115,6 +141,7 @@ impl LocalThreadStore {
         requested_thread_id: ThreadId,
         representation: LineageRepresentation,
         preheld_source_guard: Option<WriterLockGuard>,
+        source: Option<LineageSource>,
     ) -> ThreadStoreResult<(RolloutLineage, Vec<WriterLockGuard>)> {
         let mut segments = Vec::new();
         let mut seen = HashSet::new();
@@ -187,17 +214,20 @@ impl LocalThreadStore {
                         .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
                     (rollout_id, rollout_path)
                 }
-                None => {
-                    let resolved = thread_rollout_resolver::resolve_current_including_archived(
-                        self,
-                        requested_thread_id,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        malformed_lineage(requested_thread_id, "missing source rollout")
-                    })?;
-                    (resolved.rollout_id, resolved.path)
-                }
+                None => match source.as_ref() {
+                    Some(source) => (source.rollout_id, source.path.clone()),
+                    None => {
+                        let resolved = thread_rollout_resolver::resolve_current_including_archived(
+                            self,
+                            requested_thread_id,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            malformed_lineage(requested_thread_id, "missing source rollout")
+                        })?;
+                        (resolved.rollout_id, resolved.path)
+                    }
+                },
             };
             if !seen.insert(rollout_id) {
                 return Err(malformed_lineage(requested_thread_id, "cycle detected"));
@@ -324,6 +354,11 @@ impl LocalThreadStore {
             ancestor_guards,
         ))
     }
+}
+
+struct LineageSource {
+    rollout_id: ThreadId,
+    path: PathBuf,
 }
 
 async fn resolve_rollout_path_by_id(
